@@ -1,7 +1,12 @@
+// Load environment variables from .env file
+require('dotenv').config();
+
 // watch-mhaifa.js - Refactored & Improved
 const { chromium } = require("playwright");
 const fs = require("fs");
 const path = require("path");
+
+
 
 // ============================================================================
 // Configuration from Environment Variables
@@ -241,14 +246,15 @@ async function findUsernameField(page) {
   return null;
 }
 
-async function performLogin(page) {
+async function performLogin(page, skipGoto = false) {
   if (!LOGIN_USERNAME || !LOGIN_PASSWORD) {
     if (DEBUG) console.log("⚠️  אין פרטי התחברות - מדלג על login");
     return false;
   }
 
   try {
-    if (LOGIN_URL) {
+    // Only go to login page if not already there
+    if (LOGIN_URL && !skipGoto) {
       await new Promise((r) => setTimeout(r, 1000 + Math.random() * 1000));
       await page.goto(LOGIN_URL, { waitUntil: "networkidle", timeout: 30_000 });
       await page.waitForTimeout(2000);
@@ -256,6 +262,8 @@ async function performLogin(page) {
 
     const passwordField = page.locator('input[type="password"]').first();
     const passwordCount = await passwordField.count();
+    
+    if (DEBUG) console.log(`   נמצאו ${passwordCount} שדות סיסמה`);
     
     if (passwordCount === 0) {
       if (DEBUG) console.log("⚠️  לא נמצא שדה סיסמה - כנראה כבר מחובר");
@@ -266,9 +274,16 @@ async function performLogin(page) {
 
     if (!usernameField || (await usernameField.count()) === 0) {
       console.log("❌ לא נמצא שדה שם משתמש");
+      if (DEBUG) {
+        const currentUrl = await page.url();
+        console.log(`   URL נוכחי: ${currentUrl}`);
+        const allInputs = await page.locator('input').count();
+        console.log(`   סך הכל ${allInputs} שדות input בדף`);
+      }
       return false;
     }
 
+    if (DEBUG) console.log("   ממלא פרטי התחברות...");
     await usernameField.fill(LOGIN_USERNAME);
     await page.waitForTimeout(500);
     await passwordField.fill(LOGIN_PASSWORD);
@@ -288,16 +303,18 @@ async function performLogin(page) {
       try {
         const btn = page.locator(selector).first();
         if ((await btn.count()) > 0) {
+          if (DEBUG) console.log(`   לוחץ על כפתור: ${selector}`);
           await btn.click();
           submitted = true;
           break;
         }
       } catch (e) {
-        // continue
+        if (DEBUG) console.log(`   נכשל ב-selector ${selector}: ${e?.message || e}`);
       }
     }
 
     if (!submitted) {
+      if (DEBUG) console.log("   לא נמצא כפתור - מנסה Enter");
       await passwordField.press('Enter');
     }
 
@@ -338,15 +355,31 @@ async function ensureLoggedIn(page, context) {
     return true; // No login needed
   }
 
+  // Go directly to login page to check/login
+  try {
+    await page.goto(LOGIN_URL, { waitUntil: "networkidle", timeout: 30_000 });
+    await page.waitForTimeout(2000);
+  } catch (e) {
+    console.log(`⚠️  שגיאה בטעינת דף התחברות: ${e?.message || e}`);
+  }
+
   const hasPasswordField = (await page.locator('input[type="password"]').count()) > 0;
   if (!hasPasswordField) {
+    console.log("✅ נראה שכבר מחובר (אין שדה סיסמה)");
     return true; // Already logged in
   }
 
   console.log("🔐 מנסה להתחבר...");
-  const success = await performLogin(page);
+  if (DEBUG) {
+    console.log(`   Username: ${LOGIN_USERNAME}`);
+    console.log(`   Login URL: ${LOGIN_URL}`);
+  }
+  const success = await performLogin(page, true); // skipGoto = true because we already navigated
   if (success) {
     await saveStorageState(context);
+    console.log("✅ התחברות הושלמה בהצלחה!");
+  } else {
+    console.log("❌ התחברות נכשלה");
   }
   return success;
 }
