@@ -6,6 +6,17 @@ const { chromium } = require("playwright");
 const fs = require("fs");
 const path = require("path");
 
+// Try to use playwright-extra with stealth if available
+let playwrightExtra = null;
+let stealthPlugin = null;
+try {
+  playwrightExtra = require("playwright-extra");
+  stealthPlugin = require("playwright-extra-plugin-stealth");
+  playwrightExtra.use(stealthPlugin());
+} catch (e) {
+  // playwright-extra not installed, using standard Playwright
+}
+
 
 
 // ============================================================================
@@ -27,6 +38,8 @@ const INTERVAL_MS = Number(process.env.INTERVAL_MS || 10_000);
 // Notifications
 const NTFY_TOPIC = process.env.NTFY_TOPIC || "";
 const WEBHOOK_URL = process.env.WEBHOOK_URL || "";
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN || "";
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
 
 // Login credentials
 const LOGIN_USERNAME = process.env.LOGIN_USERNAME || "";
@@ -40,7 +53,17 @@ const DEVICE_SCALE_FACTOR = Number(process.env.DEVICE_SCALE_FACTOR || 1);
 
 // Session storage
 const STORAGE_STATE_PATH = process.env.STORAGE_STATE_PATH || "./state.json";
+// Category name (for filtering sections)
+const CATEGORY_NAME = process.env.CATEGORY_NAME || "יציע אבי רן עליון";
 
+// Proxy support
+const PROXY_SERVER = process.env.PROXY_SERVER || ""; // e.g., "http://proxy.example.com:8080"
+const PROXY_USERNAME = process.env.PROXY_USERNAME || "";
+const PROXY_PASSWORD = process.env.PROXY_PASSWORD || "";
+
+// API monitoring
+let apiDataCache = null;
+const API_MONITORING_ENABLED = process.env.API_MONITORING !== "0"; // default: true
 // ============================================================================
 // Node.js Version Check & Fetch Setup
 // ============================================================================
@@ -100,7 +123,7 @@ async function notifyRemote(message) {
           content: `🔥 **${message}**`,
           embeds: [
             {
-              title: "כרטיסים זמינים!",
+              title: "Tickets available!",
               description: message,
               color: 0xff0000,
               url: URL,
@@ -109,6 +132,27 @@ async function notifyRemote(message) {
           ],
         }),
       }).catch((e) => DEBUG && console.log("webhook notify failed:", e?.message || e))
+    );
+  }
+
+  if (TELEGRAM_TOKEN && TELEGRAM_CHAT_ID) {
+    const telegramUrl = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
+    const telegramMessage = `🔥 ${message}\n\n${URL}`;
+    
+    tasks.push(
+      fetch(telegramUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chat_id: TELEGRAM_CHAT_ID,
+          text: telegramMessage,
+          parse_mode: "HTML",
+          disable_web_page_preview: false,
+        }),
+      }).catch((e) => {
+        if (DEBUG) console.log("telegram notify failed:", e?.message || e);
+        else console.log("⚠️  Telegram notification failed");
+      })
     );
   }
 
@@ -266,14 +310,14 @@ async function performLogin(page, skipGoto = false) {
     if (DEBUG) console.log(`   נמצאו ${passwordCount} שדות סיסמה`);
     
     if (passwordCount === 0) {
-      if (DEBUG) console.log("⚠️  לא נמצא שדה סיסמה - כנראה כבר מחובר");
+      if (DEBUG) console.log("⚠️  Password field not found - probably already logged in");
       return false;
     }
 
     const usernameField = await findUsernameField(page);
 
     if (!usernameField || (await usernameField.count()) === 0) {
-      console.log("❌ לא נמצא שדה שם משתמש");
+      console.log("❌ Username field not found");
       if (DEBUG) {
         const currentUrl = await page.url();
         console.log(`   URL נוכחי: ${currentUrl}`);
@@ -309,12 +353,12 @@ async function performLogin(page, skipGoto = false) {
           break;
         }
       } catch (e) {
-        if (DEBUG) console.log(`   נכשל ב-selector ${selector}: ${e?.message || e}`);
+        if (DEBUG) console.log(`   Failed selector ${selector}: ${e?.message || e}`);
       }
     }
 
     if (!submitted) {
-      if (DEBUG) console.log("   לא נמצא כפתור - מנסה Enter");
+      if (DEBUG) console.log("   Button not found - trying Enter");
       await passwordField.press('Enter');
     }
 
@@ -323,7 +367,7 @@ async function performLogin(page, skipGoto = false) {
     const currentUrl = await page.url();
     const isStillOnLoginPage = currentUrl.includes('auth.mhaifafc.com') || currentUrl.includes('/login');
     const stillHasPassword = (await page.locator('input[type="password"]').count()) > 0;
-    const hasError = await page.locator('text=/שגיאה|error|נכשל/i').count() > 0;
+    const hasError = await page.locator('text=/error|error|failed/i').count() > 0;
     
     if (isStillOnLoginPage && stillHasPassword && !hasError) {
       await page.waitForTimeout(2000);
@@ -332,20 +376,20 @@ async function performLogin(page, skipGoto = false) {
       const isStillOnLoginPage2 = currentUrl2.includes('auth.mhaifafc.com') || currentUrl2.includes('/login');
       
       if (isStillOnLoginPage2 && stillHasPassword2) {
-        console.log("⚠️  נראה שההתחברות נכשלה");
+        console.log("⚠️  It seems that the connection failed.");
         return false;
       }
     }
     
     if (hasError) {
-      console.log("⚠️  נראה שיש הודעת שגיאה בדף");
+      console.log("⚠️  There seems to be an error message on the page.");
       return false;
     }
 
-    console.log("✅ התחברות הצליחה!");
+    console.log("✅ Login successful!");
     return true;
   } catch (e) {
-    console.log(`❌ שגיאה בהתחברות: ${e?.message || e}`);
+    console.log(`❌ Connection error: ${e?.message || e}`);
     return false;
   }
 }
@@ -365,11 +409,11 @@ async function ensureLoggedIn(page, context) {
 
   const hasPasswordField = (await page.locator('input[type="password"]').count()) > 0;
   if (!hasPasswordField) {
-    console.log("✅ נראה שכבר מחובר (אין שדה סיסמה)");
+    console.log("✅ It appears you are already logged in (no password field)");
     return true; // Already logged in
   }
 
-  console.log("🔐 מנסה להתחבר...");
+  console.log("🔐 Trying to connect...");
   if (DEBUG) {
     console.log(`   Username: ${LOGIN_USERNAME}`);
     console.log(`   Login URL: ${LOGIN_URL}`);
@@ -377,9 +421,9 @@ async function ensureLoggedIn(page, context) {
   const success = await performLogin(page, true); // skipGoto = true because we already navigated
   if (success) {
     await saveStorageState(context);
-    console.log("✅ התחברות הושלמה בהצלחה!");
+    console.log("✅ Login successful!");
   } else {
-    console.log("❌ התחברות נכשלה");
+    console.log("❌ Connection error");
   }
   return success;
 }
@@ -535,74 +579,138 @@ async function confirmHitByClick(page, section) {
 }
 
 async function scanSections(page) {
-  const results = [];
-  let foundCount = 0;
-  let notFoundCount = 0;
-  let nullCount = 0;
-  let availableCount = 0;
+  // Find the category "יציע אבי רן עליון"
+  const categoryTexts = [
+    CATEGORY_NAME,
+    CATEGORY_NAME.replace("יציע ", ""),
+    CATEGORY_NAME.replace(" עליון", ""),
+  ].filter((text, index, self) => self.indexOf(text) === index);
 
-  for (const sec of SECTIONS) {
-    const loc = page.getByText(sec, { exact: true }).first();
-    const count = await loc.count();
-    
-    if (count === 0) {
-      results.push({ sec, found: false, avail: false });
-      notFoundCount++;
-      continue;
+  let categoryFound = false;
+  let categoryElement = null;
+
+  // Try to find the category
+  for (const categoryText of categoryTexts) {
+    try {
+      const categoryLoc = page.getByText(categoryText, { exact: false }).first();
+      const categoryCount = await categoryLoc.count();
+      
+      if (categoryCount > 0) {
+        categoryElement = categoryLoc;
+        categoryFound = true;
+        if (DEBUG) console.log(`✅ Found category: "${categoryText}"`);
+        break;
+      }
+    } catch (e) {
+      if (DEBUG) console.log(`⚠️  Error finding category "${categoryText}": ${e?.message || e}`);
     }
+  }
 
-    foundCount++;
+  if (!categoryFound) {
+    console.log(`⚠️  Category '${CATEGORY_NAME}' not found!`);
+    return [{ sec: 'category', found: false, avail: false }];
+  }
 
-    const meta = await loc.evaluate((el) => {
-      const parent = el.closest("[class], [aria-disabled], [disabled]") || el;
-      const cs = window.getComputedStyle(parent);
-      return {
-        text: el.textContent?.trim() || "",
-        className: parent.className || "",
-        ariaDisabled: parent.getAttribute("aria-disabled"),
-        disabled: parent.hasAttribute("disabled"),
-        style: `display:${cs.display}; visibility:${cs.visibility}; opacity:${cs.opacity}; pointer-events:${cs.pointerEvents}`,
-      };
+  // Check for availability within the category
+  let hasAvailability = false;
+  let availabilityDetails = null;
+
+  try {
+    // Get the container element and check for available seats
+    const availabilityCheck = await categoryElement.evaluate((el) => {
+      // Find the container (parent element that contains the seats)
+      let container = el;
+      for (let i = 0; i < 10; i++) {
+        if (!container) break;
+        const tag = container.tagName?.toLowerCase();
+        const className = container.className || "";
+        
+        if (tag === 'div' || tag === 'section' || tag === 'article' || 
+            className.includes('section') || className.includes('category') ||
+            className.includes('stand') || className.includes('tribune') ||
+            className.includes('area') || className.includes('zone')) {
+          break;
+        }
+        container = container.parentElement;
+      }
+      
+      if (!container) container = el.parentElement || el;
+      
+      // Look for clickable elements that might indicate availability
+      const clickableElements = container.querySelectorAll('button, a, [role="button"], [onclick], [class*="click"], [class*="select"], [class*="seat"]');
+      
+      for (const el of clickableElements) {
+        const style = window.getComputedStyle(el);
+        const className = el.className || "";
+        const ariaDisabled = el.getAttribute('aria-disabled');
+        const disabled = el.hasAttribute('disabled');
+        const pointerEvents = style.pointerEvents;
+        const cursor = style.cursor;
+        const opacity = parseFloat(style.opacity);
+        
+        // Check if element is available (not disabled, visible, clickable)
+        if (ariaDisabled !== 'true' && !disabled && 
+            pointerEvents !== 'none' && opacity > 0.5 &&
+            (cursor === 'pointer' || className.toLowerCase().includes('avail') ||
+             className.toLowerCase().includes('select') || className.toLowerCase().includes('enabled'))) {
+          
+          // Check if it's NOT sold/disabled
+          const text = el.textContent?.toLowerCase() || "";
+          const hay = `${className} ${text}`.toLowerCase();
+          
+          if (!hay.includes('sold') && !hay.includes('unavail') && 
+              !hay.includes('disabled') && !hay.includes('lock') &&
+              !hay.includes('תפוס')) {
+            return {
+              available: true,
+              element: el.tagName,
+              className: className,
+              text: el.textContent?.trim().substring(0, 50) || ""
+            };
+          }
+        }
+      }
+      
+      // Also check for "מקום פנוי" or similar text in the container
+      const text = container.textContent || "";
+      if (text.includes('פנוי') || text.includes('available') || text.includes('זמין')) {
+        // But make sure it's not about "מקום תפוס"
+        if (!text.includes('תפוס') && !text.includes('sold out')) {
+          return { available: true, reason: 'text_indicator' };
+        }
+      }
+      
+      return { available: false };
     });
 
-    let avail = looksAvailable(meta);
-    
-    // If uncertain, try clicking to confirm (only in HEADFUL mode)
-    if (avail === null && HEADFUL) {
-      const confirmed = await confirmHitByClick(page, sec);
-      if (confirmed) {
-        avail = true;
+    hasAvailability = availabilityCheck.available === true;
+    availabilityDetails = availabilityCheck;
+
+    if (DEBUG) {
+      console.log(`📊 Category availability check: ${hasAvailability}`);
+      if (availabilityDetails && availabilityDetails.available) {
+        console.log(`   Details: ${JSON.stringify(availabilityDetails)}`);
       }
     }
 
-    if (avail === null) {
-      nullCount++;
-    } else if (avail === true) {
-      availableCount++;
-    }
-
-    results.push({ sec, found: true, avail, meta });
+  } catch (e) {
+    console.log(`⚠️  Error checking availability: ${e?.message || e}`);
+    hasAvailability = false;
   }
 
-  // Warning if most sections not found
-  if (notFoundCount > SECTIONS.length * 0.7) {
-    console.log(`⚠️  WARNING: ${notFoundCount}/${SECTIONS.length} sections NOT FOUND. Map may not be loaded or blocked.`);
-  }
+  // Return result in the same format as before for compatibility
+  const result = {
+    sec: 'category',
+    found: true,
+    avail: hasAvailability,
+    details: availabilityDetails
+  };
 
   if (DEBUG) {
-    console.log(`📊 Scan results: Found=${foundCount}, Not Found=${notFoundCount}, Null=${nullCount}, Available=${availableCount}`);
-    console.log("---- DEBUG SNAPSHOT ----");
-    for (const r of results) {
-      if (!r.found) {
-        console.log(`${r.sec}: NOT FOUND`);
-        continue;
-      }
-      console.log(`${r.sec}: avail=${r.avail} class="${r.meta.className}" aria-disabled=${r.meta.ariaDisabled}`);
-    }
-    console.log("------------------------");
+    console.log(`📊 Scan result: Category '${CATEGORY_NAME}' - Available: ${hasAvailability}`);
   }
 
-  return results;
+  return [result];
 }
 
 // ============================================================================
@@ -610,10 +718,8 @@ async function scanSections(page) {
 // ============================================================================
 
 async function handleHit(page, results, context) {
-  const availableSection = results.find((r) => r.avail === true);
-  const msg = availableSection 
-    ? `נראית זמינות בבלוק ${availableSection.sec}! פתח מהר: ${URL}`
-    : `נראית זמינות ב-${SECTIONS[0]}–${SECTIONS[SECTIONS.length - 1]}! פתח מהר: ${URL}`;
+  const availableResult = results.find((r) => r.avail === true);
+  const msg = `נראית זמינות ב${CATEGORY_NAME}! פתח מהר: ${URL}`;
   
   process.stdout.write("\u0007"); // beep
   console.log(`🔥 ${msg}`);
@@ -625,42 +731,75 @@ async function handleHit(page, results, context) {
     } catch {}
   }
 
-  // Navigate to section and click
-  if (availableSection && availableSection.found) {
+  // Navigate to category and try to click on available element
+  if (availableResult && availableResult.found) {
     try {
-      console.log(`📍 מעבר לבלוק ${availableSection.sec}...`);
-      const sectionElement = page.getByText(availableSection.sec, { exact: true }).first();
-      const elementCount = await sectionElement.count();
+      console.log(`📍 מעבר ל${CATEGORY_NAME}...`);
       
-      if (elementCount > 0) {
-        await sectionElement.scrollIntoViewIfNeeded();
-        await page.waitForTimeout(500);
-        
-        await sectionElement.evaluate((el) => {
-          let current = el;
-          for (let i = 0; i < 5; i++) {
-            if (!current) break;
-            const tag = current.tagName?.toLowerCase();
-            const style = window.getComputedStyle(current);
-            const cursor = style.cursor;
-            const pointerEvents = style.pointerEvents;
+      // Find the category and scroll to it
+      const categoryTexts = [
+        CATEGORY_NAME,
+        CATEGORY_NAME.replace("יציע ", ""),
+        CATEGORY_NAME.replace(" עליון", ""),
+      ];
+      
+      for (const categoryText of categoryTexts) {
+        try {
+          const categoryLoc = page.getByText(categoryText, { exact: false }).first();
+          const count = await categoryLoc.count();
+          
+          if (count > 0) {
+            await categoryLoc.scrollIntoViewIfNeeded();
+            await page.waitForTimeout(500);
             
-            if (tag === 'button' || tag === 'a' || 
-                cursor === 'pointer' || 
-                (pointerEvents !== 'none' && current.onclick)) {
-              current.click();
-              return;
+            // Try to find and click an available element within the category
+            const clicked = await categoryLoc.evaluate((el) => {
+              // Find the container
+              let container = el;
+              for (let i = 0; i < 10; i++) {
+                if (!container) break;
+                const tag = container.tagName?.toLowerCase();
+                const className = container.className || "";
+                if (tag === 'div' || tag === 'section' || tag === 'article' || 
+                    className.includes('section') || className.includes('category') ||
+                    className.includes('stand') || className.includes('tribune')) {
+                  break;
+                }
+                container = container.parentElement;
+              }
+              if (!container) container = el.parentElement || el;
+              
+              // Find first clickable available element
+              const clickableElements = container.querySelectorAll('button, a, [role="button"], [onclick]');
+              for (const btn of clickableElements) {
+                const style = window.getComputedStyle(btn);
+                if (style.pointerEvents !== 'none' && style.opacity > 0.5) {
+                  const className = btn.className || "";
+                  const hay = className.toLowerCase();
+                  if (!hay.includes('sold') && !hay.includes('disabled') && 
+                      !hay.includes('unavail') && !hay.includes('תפוס')) {
+                    btn.click();
+                    return true;
+                  }
+                }
+              }
+              return false;
+            });
+            
+            if (clicked) {
+              await page.waitForTimeout(1000);
+              console.log(`✅ לחצתי על אלמנט זמין ב${CATEGORY_NAME}`);
+            } else {
+              console.log(`📍 הגעתי ל${CATEGORY_NAME} - לחץ ידנית על מקום זמין`);
             }
-            current = current.parentElement;
+            break;
           }
-          el.click();
-        });
-        
-        await page.waitForTimeout(1000);
-        console.log(`✅ לחצתי על בלוק ${availableSection.sec}`);
+        } catch (e) {
+          // Continue to next variation
+        }
       }
     } catch (e) {
-      console.log(`⚠️  שגיאה במעבר לבלוק: ${e?.message || e}`);
+      console.log(`⚠️  שגיאה במעבר לקטגוריה: ${e?.message || e}`);
     }
   }
 
@@ -700,7 +839,7 @@ async function monitorAvailability(page, context) {
 }
 
 // ============================================================================
-// Error Handling & Backoff
+// Error Handling & Backof
 // ============================================================================
 
 let consecutiveErrors = 0;
@@ -734,9 +873,15 @@ async function handleError(error, currentInterval) {
   let isLoggedIn = false;
   let currentInterval = INTERVAL_MS;
 
-  console.log(`🚀 Starting monitor for sections: ${SECTIONS.join(", ")}`);
+  console.log(`🚀 Starting monitor for category: ${CATEGORY_NAME}`);
   console.log(`📅 Checking every ${INTERVAL_MS / 1000} seconds`);
   console.log(`🌐 URL: ${URL}`);
+  if (TELEGRAM_TOKEN && TELEGRAM_CHAT_ID) {
+    console.log(`📱 Telegram notifications: Enabled`);
+  }
+  if (WEBHOOK_URL) {
+    console.log(`💬 Discord notifications: Enabled`);
+  }
 
   while (true) {
     try {
