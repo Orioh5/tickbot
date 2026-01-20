@@ -34,7 +34,7 @@ const SECTIONS_ENV = process.env.SECTIONS;
 const SECTIONS = SECTIONS_ENV 
   ? SECTIONS_ENV.split(",").map(s => s.trim())
   : Array.from({ length: 12 }, (_, i) => String(201 + i)); // 201..212 default
-const INTERVAL_MS = Number(process.env.INTERVAL_MS || 10_000);
+const INTERVAL_MS = Number(process.env.INTERVAL_MS || 4_000);
 
 // Notifications
 const NTFY_TOPIC = process.env.NTFY_TOPIC || "";
