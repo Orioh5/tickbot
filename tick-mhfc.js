@@ -1,39 +1,30 @@
 // Load environment variables from .env file
-require('dotenv').config();
+require("dotenv").config();
 
 // watch-mhaifa.js - Refactored & Improved
-const { chromium } = require("playwright");
 const fs = require("fs");
 const path = require("path");
-
-// Try to use playwright-extra with stealth if available
-let playwrightExtra = null;
-let stealthPlugin = null;
-try {
-  playwrightExtra = require("playwright-extra");
-  stealthPlugin = require("playwright-extra-plugin-stealth");
-  playwrightExtra.use(stealthPlugin());
-} catch (e) {
-  // playwright-extra not installed, using standard Playwright
-}
-
-
+const { chromium } = require("playwright-extra");
 
 // ============================================================================
 // Configuration from Environment Variables
 // ============================================================================
 
+// DEBUG flag (supports: 1/true/yes/on)
 const DEBUG = process.env.DEBUG === "1";
+String(process.env.DEBUG || "").toLowerCase();
+
 const HEADFUL = process.env.HEADFUL === "1";
 const PAUSE_ON_HIT = process.env.PAUSE_ON_HIT !== "0"; // default: true
 
 // Event URL and sections
-const URL = process.env.URL || "https://tickets.mhaifafc.com/Stadium/Index?eventId=5065";
+const URL =
+  process.env.URL || "https://tickets.mhaifafc.com/Stadium/Index?eventId=5230";
 const SECTIONS_ENV = process.env.SECTIONS;
-const SECTIONS = SECTIONS_ENV 
-  ? SECTIONS_ENV.split(",").map(s => s.trim())
+const SECTIONS = SECTIONS_ENV
+  ? SECTIONS_ENV.split(",").map((s) => s.trim())
   : Array.from({ length: 12 }, (_, i) => String(201 + i)); // 201..212 default
-const INTERVAL_MS = Number(process.env.INTERVAL_MS || 10_000);
+const INTERVAL_MS = Number(process.env.INTERVAL_MS || 1_000);
 
 // Notifications
 const NTFY_TOPIC = process.env.NTFY_TOPIC || "";
@@ -53,6 +44,7 @@ const DEVICE_SCALE_FACTOR = Number(process.env.DEVICE_SCALE_FACTOR || 1);
 
 // Session storage
 const STORAGE_STATE_PATH = process.env.STORAGE_STATE_PATH || "./state.json";
+
 // Category name (for filtering sections)
 const CATEGORY_NAME = process.env.CATEGORY_NAME || "יציע אבי רן עליון";
 
@@ -64,26 +56,50 @@ const PROXY_PASSWORD = process.env.PROXY_PASSWORD || "";
 // API monitoring
 let apiDataCache = null;
 const API_MONITORING_ENABLED = process.env.API_MONITORING !== "0"; // default: true
+
+// ============================================================================
+// Playwright / playwright-extra selection
+// ============================================================================
+
+let pw;
+
+try {
+  const playwrightExtra = require("playwright-extra");
+  const stealthPlugin = require("playwright-extra-plugin-stealth");
+  playwrightExtra.use(stealthPlugin());
+  pw = playwrightExtra;
+
+  if (DEBUG) console.log("✅ Using playwright-extra with stealth plugin");
+} catch (e) {
+  pw = require("playwright");
+  if (DEBUG)
+    console.log("⚠️ playwright-extra not installed, using standard Playwright");
+}
+
 // ============================================================================
 // Node.js Version Check & Fetch Setup
 // ============================================================================
 
 function checkNodeVersion() {
   const nodeVersion = process.version;
-  const major = parseInt(nodeVersion.slice(1).split(".")[0]);
-  
+  const major = parseInt(nodeVersion.slice(1).split(".")[0], 10);
+
   if (major < 18) {
     console.log("⚠️  Node.js < 18 detected. Installing node-fetch...");
     try {
       require("node-fetch");
     } catch (e) {
-      console.error("❌ node-fetch is required for Node < 18. Install it: npm install node-fetch");
+      console.error(
+        "❌ node-fetch is required for Node < 18. Install it: npm install node-fetch",
+      );
       process.exit(1);
     }
   } else {
     // Node >= 18 has global fetch
     if (typeof fetch === "undefined") {
-      console.error("❌ fetch is not available. Please use Node.js >= 18 or install node-fetch");
+      console.error(
+        "❌ fetch is not available. Please use Node.js >= 18 or install node-fetch",
+      );
       process.exit(1);
     }
   }
@@ -104,13 +120,15 @@ async function notifyRemote(message) {
       fetch(url, {
         method: "POST",
         headers: {
-          "Title": "MHFC Tickets",
-          "Priority": "5",
-          "Tags": "ticket,alert",
-          "Click": URL,
+          Title: "MHFC Tickets",
+          Priority: "5",
+          Tags: "ticket,alert",
+          Click: URL,
         },
         body: message,
-      }).catch((e) => DEBUG && console.log("ntfy notify failed:", e?.message || e))
+      }).catch(
+        (e) => DEBUG && console.log("ntfy notify failed:", e?.message || e),
+      ),
     );
   }
 
@@ -131,14 +149,16 @@ async function notifyRemote(message) {
             },
           ],
         }),
-      }).catch((e) => DEBUG && console.log("webhook notify failed:", e?.message || e))
+      }).catch(
+        (e) => DEBUG && console.log("webhook notify failed:", e?.message || e),
+      ),
     );
   }
 
   if (TELEGRAM_TOKEN && TELEGRAM_CHAT_ID) {
     const telegramUrl = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
     const telegramMessage = `🔥 ${message}\n\n${URL}`;
-    
+
     tasks.push(
       fetch(telegramUrl, {
         method: "POST",
@@ -146,17 +166,115 @@ async function notifyRemote(message) {
         body: JSON.stringify({
           chat_id: TELEGRAM_CHAT_ID,
           text: telegramMessage,
-          parse_mode: "HTML",
           disable_web_page_preview: false,
         }),
-      }).catch((e) => {
-        if (DEBUG) console.log("telegram notify failed:", e?.message || e);
-        else console.log("⚠️  Telegram notification failed");
       })
+        .then(async (response) => {
+          const data = await response.json();
+          if (!response.ok || !data.ok) {
+            console.log(
+              `❌ Telegram error: ${data.description || response.statusText}`,
+            );
+            if (data.error_code) {
+              if (data.error_code === 401) {
+                console.log("   ⚠️  Invalid bot token - check TELEGRAM_TOKEN");
+              } else if (data.error_code === 400) {
+                console.log("   ⚠️  Invalid chat ID or message format!");
+              } else if (data.error_code === 403) {
+                console.log(
+                  "   ⚠️  Bot blocked or chat not found - make sure you've started a conversation with the bot",
+                );
+              }
+            }
+            if (DEBUG)
+              console.log(`   Full response: ${JSON.stringify(data, null, 2)}`);
+          } else {
+            console.log("✅ Telegram message sent successfully");
+          }
+          return data;
+        })
+        .catch((e) => {
+          console.log(`❌ Telegram notify failed: ${e?.message || e}`);
+          if (DEBUG) {
+            console.log(`   URL: ${telegramUrl.substring(0, 50)}...`);
+            console.log(`   Chat ID: ${TELEGRAM_CHAT_ID}`);
+          }
+        }),
     );
+  } else {
+    if (DEBUG) {
+      console.log("⚠️  Telegram not configured:");
+      if (!TELEGRAM_TOKEN) console.log("   - TELEGRAM_TOKEN is missing");
+      if (!TELEGRAM_CHAT_ID) console.log("   - TELEGRAM_CHAT_ID is missing");
+    }
   }
 
   await Promise.all(tasks);
+}
+
+// ============================================================================
+// Telegram Test Function
+// ============================================================================
+
+async function testTelegram() {
+  if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) {
+    console.log("⚠️  Telegram not configured - skipping test");
+    return false;
+  }
+
+  try {
+    const telegramUrl = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
+    const testMessage = `🧪 בדיקת בוט MHFC\n\nהבוט מוכן ומחפש כרטיסים ב${CATEGORY_NAME}`;
+
+    console.log(`   Sending test message to chat ${TELEGRAM_CHAT_ID}...`);
+
+    const response = await fetch(telegramUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: TELEGRAM_CHAT_ID,
+        text: testMessage,
+      }),
+    });
+
+    const data = await response.json();
+
+    if (response.ok && data.ok) {
+      console.log("✅ Telegram test message sent successfully!");
+      console.log(
+        `   Check your Telegram - you should have received a test message`,
+      );
+      return true;
+    } else {
+      console.log(
+        `❌ Telegram test failed: ${data.description || response.statusText}`,
+      );
+      if (data.error_code === 401) {
+        console.log("   ⚠️  Invalid bot token - check TELEGRAM_TOKEN");
+        console.log(
+          "   Make sure the token starts with a number and contains a colon",
+        );
+      } else if (data.error_code === 400) {
+        console.log("   ⚠️  Invalid chat ID - check TELEGRAM_CHAT_ID");
+        console.log(
+          "   Make sure you've started a conversation with the bot first",
+        );
+      } else if (data.error_code === 403) {
+        console.log("   ⚠️  Bot blocked or chat not found");
+        console.log("   Make sure you've started a conversation with the bot");
+      }
+      if (DEBUG) {
+        console.log(`   Full error response: ${JSON.stringify(data, null, 2)}`);
+      }
+      return false;
+    }
+  } catch (e) {
+    console.log(`❌ Telegram test error: ${e?.message || e}`);
+    if (DEBUG) {
+      console.log(`   Stack: ${e.stack}`);
+    }
+    return false;
+  }
 }
 
 // ============================================================================
@@ -164,40 +282,53 @@ async function notifyRemote(message) {
 // ============================================================================
 
 async function createBrowserAndContext() {
-  const browser = await chromium.launch({ 
+  const launchOpts = {
     headless: !HEADFUL,
     args: [
-      '--disable-blink-features=AutomationControlled',
-      '--disable-dev-shm-usage',
-      '--no-sandbox',
-    ]
-  });
-  
+      "--disable-blink-features=AutomationControlled",
+      "--disable-dev-shm-usage",
+      "--no-sandbox",
+    ],
+  };
+
+  // Optional proxy
+  if (PROXY_SERVER) {
+    launchOpts.proxy = {
+      server: PROXY_SERVER,
+      username: PROXY_USERNAME || undefined,
+      password: PROXY_PASSWORD || undefined,
+    };
+  }
+
+  const browser = await pw.chromium.launch(launchOpts);
+
   // Load storage state if exists
-  const storageState = fs.existsSync(STORAGE_STATE_PATH) 
-    ? JSON.parse(fs.readFileSync(STORAGE_STATE_PATH, 'utf8'))
+  const storageState = fs.existsSync(STORAGE_STATE_PATH)
+    ? JSON.parse(fs.readFileSync(STORAGE_STATE_PATH, "utf8"))
     : undefined;
-  
+
   const context = await browser.newContext({
     viewport: { width: VIEWPORT_W, height: VIEWPORT_H },
     deviceScaleFactor: DEVICE_SCALE_FACTOR,
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    locale: 'he-IL',
-    timezoneId: 'Asia/Jerusalem',
-    permissions: ['geolocation'],
-    storageState, // Load saved session if exists
+    userAgent:
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    locale: "he-IL",
+    timezoneId: "Asia/Jerusalem",
+    permissions: ["geolocation"],
+    storageState,
     extraHTTPHeaders: {
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-      'Accept-Language': 'he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7',
-      'Accept-Encoding': 'gzip, deflate, br',
-      'DNT': '1',
-      'Connection': 'keep-alive',
-      'Upgrade-Insecure-Requests': '1',
-      'Sec-Fetch-Dest': 'document',
-      'Sec-Fetch-Mode': 'navigate',
-      'Sec-Fetch-Site': 'none',
-      'Sec-Fetch-User': '?1',
-      'Cache-Control': 'max-age=0',
+      Accept:
+        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+      "Accept-Language": "he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7",
+      "Accept-Encoding": "gzip, deflate, br",
+      DNT: "1",
+      Connection: "keep-alive",
+      "Upgrade-Insecure-Requests": "1",
+      "Sec-Fetch-Dest": "document",
+      "Sec-Fetch-Mode": "navigate",
+      "Sec-Fetch-Site": "none",
+      "Sec-Fetch-User": "?1",
+      "Cache-Control": "max-age=0",
     },
   });
 
@@ -205,42 +336,42 @@ async function createBrowserAndContext() {
 }
 
 function applyStealth(page) {
+  // גם אם יש stealth plugin, זה לא מזיק להשאיר (ואם אין - זה עוזר)
   return page.addInitScript(() => {
-    Object.defineProperty(navigator, 'webdriver', {
+    Object.defineProperty(navigator, "webdriver", {
       get: () => undefined,
     });
-    
+
     window.chrome = {
       runtime: {},
-      loadTimes: function() {},
-      csi: function() {},
-      app: {}
+      loadTimes: function () {},
+      csi: function () {},
+      app: {},
     };
-    
-    Object.defineProperty(navigator, 'plugins', {
+
+    Object.defineProperty(navigator, "plugins", {
       get: () => [1, 2, 3, 4, 5],
     });
-    
-    Object.defineProperty(navigator, 'languages', {
-      get: () => ['he-IL', 'he', 'en-US', 'en'],
+
+    Object.defineProperty(navigator, "languages", {
+      get: () => ["he-IL", "he", "en-US", "en"],
     });
-    
+
     const originalQuery = window.navigator.permissions.query;
-    window.navigator.permissions.query = (parameters) => (
-      parameters.name === 'notifications' ?
-        Promise.resolve({ state: Notification.permission }) :
-        originalQuery(parameters)
-    );
-    
-    Object.defineProperty(navigator, 'platform', {
-      get: () => 'Win32',
+    window.navigator.permissions.query = (parameters) =>
+      parameters.name === "notifications"
+        ? Promise.resolve({ state: Notification.permission })
+        : originalQuery(parameters);
+
+    Object.defineProperty(navigator, "platform", {
+      get: () => "Win32",
     });
-    
-    Object.defineProperty(navigator, 'hardwareConcurrency', {
+
+    Object.defineProperty(navigator, "hardwareConcurrency", {
       get: () => 8,
     });
-    
-    Object.defineProperty(navigator, 'deviceMemory', {
+
+    Object.defineProperty(navigator, "deviceMemory", {
       get: () => 8,
     });
   });
@@ -272,18 +403,15 @@ async function findUsernameField(page) {
 
   for (const selector of usernameSelectors) {
     const field = page.locator(selector).first();
-    if ((await field.count()) > 0) {
-      return field;
-    }
+    if ((await field.count()) > 0) return field;
   }
 
-  // FIXED: Use for loop instead of findIndex(async)
-  const allInputs = await page.locator('input').all();
+  const allInputs = await page.locator("input").all();
   for (let i = 0; i < allInputs.length; i++) {
     const inp = allInputs[i];
-    const type = await inp.getAttribute('type');
-    if (type === 'password' && i > 0) {
-      return page.locator('input').nth(i - 1);
+    const type = await inp.getAttribute("type");
+    if (type === "password" && i > 0) {
+      return page.locator("input").nth(i - 1);
     }
   }
 
@@ -297,20 +425,22 @@ async function performLogin(page, skipGoto = false) {
   }
 
   try {
-    // Only go to login page if not already there
     if (LOGIN_URL && !skipGoto) {
-      await new Promise((r) => setTimeout(r, 1000 + Math.random() * 1000));
+      await page.waitForTimeout(1000 + Math.random() * 1000);
       await page.goto(LOGIN_URL, { waitUntil: "networkidle", timeout: 30_000 });
       await page.waitForTimeout(2000);
     }
 
     const passwordField = page.locator('input[type="password"]').first();
     const passwordCount = await passwordField.count();
-    
+
     if (DEBUG) console.log(`   נמצאו ${passwordCount} שדות סיסמה`);
-    
+
     if (passwordCount === 0) {
-      if (DEBUG) console.log("⚠️  Password field not found - probably already logged in");
+      if (DEBUG)
+        console.log(
+          "⚠️  Password field not found - probably already logged in",
+        );
       return false;
     }
 
@@ -321,8 +451,8 @@ async function performLogin(page, skipGoto = false) {
       if (DEBUG) {
         const currentUrl = await page.url();
         console.log(`   URL נוכחי: ${currentUrl}`);
-        const allInputs = await page.locator('input').count();
-        console.log(`   סך הכל ${allInputs} שדות input בדף`);
+        const allInputsCount = await page.locator("input").count();
+        console.log(`   סך הכל ${allInputsCount} שדות input בדף`);
       }
       return false;
     }
@@ -339,7 +469,7 @@ async function performLogin(page, skipGoto = false) {
       'button:has-text("Login")',
       'button:has-text("כניסה")',
       'input[type="submit"]',
-      'form button',
+      "form button",
     ];
 
     let submitted = false;
@@ -353,34 +483,40 @@ async function performLogin(page, skipGoto = false) {
           break;
         }
       } catch (e) {
-        if (DEBUG) console.log(`   Failed selector ${selector}: ${e?.message || e}`);
+        if (DEBUG)
+          console.log(`   Failed selector ${selector}: ${e?.message || e}`);
       }
     }
 
     if (!submitted) {
       if (DEBUG) console.log("   Button not found - trying Enter");
-      await passwordField.press('Enter');
+      await passwordField.press("Enter");
     }
 
     await page.waitForTimeout(3000);
-    
+
     const currentUrl = await page.url();
-    const isStillOnLoginPage = currentUrl.includes('auth.mhaifafc.com') || currentUrl.includes('/login');
-    const stillHasPassword = (await page.locator('input[type="password"]').count()) > 0;
-    const hasError = await page.locator('text=/error|error|failed/i').count() > 0;
-    
+    const isStillOnLoginPage =
+      currentUrl.includes("auth.mhaifafc.com") || currentUrl.includes("/login");
+    const stillHasPassword =
+      (await page.locator('input[type="password"]').count()) > 0;
+    const hasError = (await page.locator("text=/error|failed/i").count()) > 0;
+
     if (isStillOnLoginPage && stillHasPassword && !hasError) {
       await page.waitForTimeout(2000);
-      const stillHasPassword2 = (await page.locator('input[type="password"]').count()) > 0;
+      const stillHasPassword2 =
+        (await page.locator('input[type="password"]').count()) > 0;
       const currentUrl2 = await page.url();
-      const isStillOnLoginPage2 = currentUrl2.includes('auth.mhaifafc.com') || currentUrl2.includes('/login');
-      
+      const isStillOnLoginPage2 =
+        currentUrl2.includes("auth.mhaifafc.com") ||
+        currentUrl2.includes("/login");
+
       if (isStillOnLoginPage2 && stillHasPassword2) {
         console.log("⚠️  It seems that the connection failed.");
         return false;
       }
     }
-    
+
     if (hasError) {
       console.log("⚠️  There seems to be an error message on the page.");
       return false;
@@ -395,11 +531,8 @@ async function performLogin(page, skipGoto = false) {
 }
 
 async function ensureLoggedIn(page, context) {
-  if (!LOGIN_USERNAME || !LOGIN_PASSWORD) {
-    return true; // No login needed
-  }
+  if (!LOGIN_USERNAME || !LOGIN_PASSWORD) return true;
 
-  // Go directly to login page to check/login
   try {
     await page.goto(LOGIN_URL, { waitUntil: "networkidle", timeout: 30_000 });
     await page.waitForTimeout(2000);
@@ -407,10 +540,11 @@ async function ensureLoggedIn(page, context) {
     console.log(`⚠️  שגיאה בטעינת דף התחברות: ${e?.message || e}`);
   }
 
-  const hasPasswordField = (await page.locator('input[type="password"]').count()) > 0;
+  const hasPasswordField =
+    (await page.locator('input[type="password"]').count()) > 0;
   if (!hasPasswordField) {
     console.log("✅ It appears you are already logged in (no password field)");
-    return true; // Already logged in
+    return true;
   }
 
   console.log("🔐 Trying to connect...");
@@ -418,7 +552,8 @@ async function ensureLoggedIn(page, context) {
     console.log(`   Username: ${LOGIN_USERNAME}`);
     console.log(`   Login URL: ${LOGIN_URL}`);
   }
-  const success = await performLogin(page, true); // skipGoto = true because we already navigated
+
+  const success = await performLogin(page, true);
   if (success) {
     await saveStorageState(context);
     console.log("✅ Login successful!");
@@ -433,27 +568,26 @@ async function ensureLoggedIn(page, context) {
 // ============================================================================
 
 async function waitForMapReady(page) {
-  // Try to wait for map elements instead of fixed timeout
   const mapSelectors = [
-    'canvas',
-    'svg',
+    "canvas",
+    "svg",
     '[class*="map"]',
     '[id*="map"]',
     '[class*="stadium"]',
     '[id*="stadium"]',
-    'iframe',
+    "iframe",
   ];
 
   try {
     await Promise.race([
-      Promise.all(mapSelectors.map(sel => 
-        page.waitForSelector(sel, { timeout: 5000 }).catch(() => null)
-      )),
-      new Promise(resolve => setTimeout(resolve, 3000)) // Fallback timeout
+      Promise.all(
+        mapSelectors.map((sel) =>
+          page.waitForSelector(sel, { timeout: 3000 }).catch(() => null),
+        ),
+      ),
+      new Promise((resolve) => setTimeout(resolve, 3000)),
     ]);
-  } catch (e) {
-    // Continue anyway
-  }
+  } catch {}
 }
 
 async function interactWithPage(page) {
@@ -467,17 +601,15 @@ async function interactWithPage(page) {
 }
 
 async function openEventPage(page) {
-  await new Promise((r) => setTimeout(r, 1000 + Math.random() * 2000));
+  await new Promise((r) => setTimeout(r, 200 + Math.random() * 400));
   await page.goto(URL, { waitUntil: "networkidle", timeout: 60_000 });
   await interactWithPage(page);
   await waitForMapReady(page);
-  
+
   try {
     await page.mouse.click(400, 300);
     await page.waitForTimeout(1000);
-  } catch (e) {
-    // Continue
-  }
+  } catch {}
 }
 
 // ============================================================================
@@ -485,28 +617,33 @@ async function openEventPage(page) {
 // ============================================================================
 
 function looksAvailable(meta) {
-  const hay = `${meta.className} ${meta.ariaDisabled} ${meta.disabled} ${meta.style}`.toLowerCase();
+  const hay =
+    `${meta.className} ${meta.ariaDisabled} ${meta.disabled} ${meta.style}`.toLowerCase();
 
-  if (hay.includes("sold") || hay.includes("unavail") || hay.includes("disabled") || hay.includes("lock")) {
+  if (
+    hay.includes("sold") ||
+    hay.includes("unavail") ||
+    hay.includes("disabled") ||
+    hay.includes("lock")
+  ) {
     return false;
   }
-  if (meta.ariaDisabled === "true" || meta.disabled === true) {
-    return false;
-  }
-
-  if (hay.includes("avail") || hay.includes("select") || hay.includes("enabled")) {
+  if (meta.ariaDisabled === "true" || meta.disabled === true) return false;
+  if (
+    hay.includes("avail") ||
+    hay.includes("select") ||
+    hay.includes("enabled")
+  )
     return true;
-  }
 
-  return null; // Unknown
+  return null;
 }
 
-// Selectors for success indicators after clicking a section
 const SUCCESS_INDICATORS = [
   'button:has-text("הוסף לעגלה")',
   'button:has-text("המשך")',
   'button:has-text("Continue")',
-  'input[type="number"]', // Quantity selector
+  'input[type="number"]',
   '[class*="quantity"]',
   '[class*="seat"]',
   '[class*="modal"]',
@@ -516,23 +653,15 @@ const SUCCESS_INDICATORS = [
 ];
 
 async function confirmHitByClick(page, section) {
-  if (!HEADFUL) {
-    // In headless mode, we can't safely click without seeing the result
-    return false;
-  }
+  if (!HEADFUL) return false;
 
   try {
     const sectionElement = page.getByText(section, { exact: true }).first();
-    const count = await sectionElement.count();
-    
-    if (count === 0) {
-      return false;
-    }
+    if ((await sectionElement.count()) === 0) return false;
 
     await sectionElement.scrollIntoViewIfNeeded();
     await page.waitForTimeout(500);
 
-    // Click the section
     await sectionElement.evaluate((el) => {
       let current = el;
       for (let i = 0; i < 5; i++) {
@@ -541,10 +670,13 @@ async function confirmHitByClick(page, section) {
         const style = window.getComputedStyle(current);
         const cursor = style.cursor;
         const pointerEvents = style.pointerEvents;
-        
-        if (tag === 'button' || tag === 'a' || 
-            cursor === 'pointer' || 
-            (pointerEvents !== 'none' && current.onclick)) {
+
+        if (
+          tag === "button" ||
+          tag === "a" ||
+          cursor === "pointer" ||
+          (pointerEvents !== "none" && current.onclick)
+        ) {
           current.click();
           return;
         }
@@ -555,7 +687,6 @@ async function confirmHitByClick(page, section) {
 
     await page.waitForTimeout(1500);
 
-    // Check for success indicators
     for (const selector of SUCCESS_INDICATORS) {
       try {
         const element = page.locator(selector).first();
@@ -566,9 +697,7 @@ async function confirmHitByClick(page, section) {
             return true;
           }
         }
-      } catch (e) {
-        // Continue checking other selectors
-      }
+      } catch {}
     }
 
     return false;
@@ -578,12 +707,16 @@ async function confirmHitByClick(page, section) {
   }
 }
 
+  let notifiedCategoryFound = false;
+
 async function scanSections(page) {
   // Find the category "יציע אבי רן עליון"
   const categoryTexts = [
     CATEGORY_NAME,
     CATEGORY_NAME.replace("יציע ", ""),
     CATEGORY_NAME.replace(" עליון", ""),
+    "אבי רן עליון",
+    "אבי רן",
   ].filter((text, index, self) => self.indexOf(text) === index);
 
   let categoryFound = false;
@@ -592,23 +725,34 @@ async function scanSections(page) {
   // Try to find the category
   for (const categoryText of categoryTexts) {
     try {
-      const categoryLoc = page.getByText(categoryText, { exact: false }).first();
+      const categoryLoc = page
+        .getByText(categoryText, { exact: false })
+        .first();
       const categoryCount = await categoryLoc.count();
-      
+
       if (categoryCount > 0) {
         categoryElement = categoryLoc;
         categoryFound = true;
         if (DEBUG) console.log(`✅ Found category: "${categoryText}"`);
+
+        if (!notifiedCategoryFound) {
+          await notifyRemote(`✅ יש כרטיסים ב "${CATEGORY_NAME}" `);
+          notifiedCategoryFound = true;
+        }
+
         break;
       }
     } catch (e) {
-      if (DEBUG) console.log(`⚠️  Error finding category "${categoryText}": ${e?.message || e}`);
+      if (DEBUG)
+        console.log(
+          `⚠️  Error finding category "${categoryText}": ${e?.message || e}`,
+        );
     }
   }
 
   if (!categoryFound) {
     console.log(`⚠️  Category '${CATEGORY_NAME}' not found!`);
-    return [{ sec: 'category', found: false, avail: false }];
+    return [{ sec: "category", found: false, avail: false }];
   }
 
   // Check for availability within the category
@@ -624,62 +768,98 @@ async function scanSections(page) {
         if (!container) break;
         const tag = container.tagName?.toLowerCase();
         const className = container.className || "";
-        
-        if (tag === 'div' || tag === 'section' || tag === 'article' || 
-            className.includes('section') || className.includes('category') ||
-            className.includes('stand') || className.includes('tribune') ||
-            className.includes('area') || className.includes('zone')) {
+
+        if (
+          tag === "div" ||
+          tag === "section" ||
+          tag === "article" ||
+          className.includes("section") ||
+          className.includes("category") ||
+          className.includes("stand") ||
+          className.includes("tribune") ||
+          className.includes("area") ||
+          className.includes("zone") ||
+          className.includes("block") ||
+          className.includes("box")
+        ) {
           break;
         }
         container = container.parentElement;
       }
-      
+
       if (!container) container = el.parentElement || el;
-      
+
       // Look for clickable elements that might indicate availability
-      const clickableElements = container.querySelectorAll('button, a, [role="button"], [onclick], [class*="click"], [class*="select"], [class*="seat"]');
-      
+      const clickableElements = container.querySelectorAll(
+        'button, a, [role="button"], [onclick], [class*="click"], [class*="select"], [class*="seat"], [class*="ticket"], [class*="available"]',
+      );
+
       for (const el of clickableElements) {
         const style = window.getComputedStyle(el);
         const className = el.className || "";
-        const ariaDisabled = el.getAttribute('aria-disabled');
-        const disabled = el.hasAttribute('disabled');
+        const ariaDisabled = el.getAttribute("aria-disabled");
+        const disabled = el.hasAttribute("disabled");
         const pointerEvents = style.pointerEvents;
         const cursor = style.cursor;
         const opacity = parseFloat(style.opacity);
-        
+        const display = style.display;
+
         // Check if element is available (not disabled, visible, clickable)
-        if (ariaDisabled !== 'true' && !disabled && 
-            pointerEvents !== 'none' && opacity > 0.5 &&
-            (cursor === 'pointer' || className.toLowerCase().includes('avail') ||
-             className.toLowerCase().includes('select') || className.toLowerCase().includes('enabled'))) {
-          
+        if (
+          display !== "none" &&
+          ariaDisabled !== "true" &&
+          !disabled &&
+          pointerEvents !== "none" &&
+          opacity > 0.5 &&
+          (cursor === "pointer" ||
+            className.toLowerCase().includes("avail") ||
+            className.toLowerCase().includes("select") ||
+            className.toLowerCase().includes("enabled") ||
+            className.toLowerCase().includes("active") ||
+            className.toLowerCase().includes("open"))
+        ) {
           // Check if it's NOT sold/disabled
           const text = el.textContent?.toLowerCase() || "";
           const hay = `${className} ${text}`.toLowerCase();
-          
-          if (!hay.includes('sold') && !hay.includes('unavail') && 
-              !hay.includes('disabled') && !hay.includes('lock') &&
-              !hay.includes('תפוס')) {
+
+          if (
+            !hay.includes("sold") &&
+            !hay.includes("unavail") &&
+            !hay.includes("disabled") &&
+            !hay.includes("lock") &&
+            !hay.includes("תפוס") &&
+            !hay.includes("סגור") &&
+            !hay.includes("unavailable") &&
+            !hay.includes("closed")
+          ) {
             return {
               available: true,
               element: el.tagName,
               className: className,
-              text: el.textContent?.trim().substring(0, 50) || ""
+              text: el.textContent?.trim().substring(0, 50) || "",
             };
           }
         }
       }
-      
+
       // Also check for "מקום פנוי" or similar text in the container
       const text = container.textContent || "";
-      if (text.includes('פנוי') || text.includes('available') || text.includes('זמין')) {
+      if (
+        text.includes("פנוי") ||
+        text.includes("available") ||
+        text.includes("זמין") ||
+        text.includes("בחר")
+      ) {
         // But make sure it's not about "מקום תפוס"
-        if (!text.includes('תפוס') && !text.includes('sold out')) {
-          return { available: true, reason: 'text_indicator' };
+        if (
+          !text.includes("תפוס") &&
+          !text.includes("sold out") &&
+          !text.includes("אין מקומות")
+        ) {
+          return { available: true, reason: "text_indicator" };
         }
       }
-      
+
       return { available: false };
     });
 
@@ -692,22 +872,24 @@ async function scanSections(page) {
         console.log(`   Details: ${JSON.stringify(availabilityDetails)}`);
       }
     }
-
   } catch (e) {
     console.log(`⚠️  Error checking availability: ${e?.message || e}`);
+    if (DEBUG) console.log(`   Stack: ${e.stack}`);
     hasAvailability = false;
   }
 
   // Return result in the same format as before for compatibility
   const result = {
-    sec: 'category',
+    sec: "category",
     found: true,
     avail: hasAvailability,
-    details: availabilityDetails
+    details: availabilityDetails,
   };
 
   if (DEBUG) {
-    console.log(`📊 Scan result: Category '${CATEGORY_NAME}' - Available: ${hasAvailability}`);
+    console.log(
+      `📊 Scan result: Category '${CATEGORY_NAME}' - Available: ${hasAvailability}`,
+    );
   }
 
   return [result];
@@ -720,7 +902,7 @@ async function scanSections(page) {
 async function handleHit(page, results, context) {
   const availableResult = results.find((r) => r.avail === true);
   const msg = `נראית זמינות ב${CATEGORY_NAME}! פתח מהר: ${URL}`;
-  
+
   process.stdout.write("\u0007"); // beep
   console.log(`🔥 ${msg}`);
   await notifyRemote(msg);
@@ -735,23 +917,27 @@ async function handleHit(page, results, context) {
   if (availableResult && availableResult.found) {
     try {
       console.log(`📍 מעבר ל${CATEGORY_NAME}...`);
-      
+
       // Find the category and scroll to it
       const categoryTexts = [
         CATEGORY_NAME,
         CATEGORY_NAME.replace("יציע ", ""),
         CATEGORY_NAME.replace(" עליון", ""),
+        "אבי רן עליון",
+        "אבי רן",
       ];
-      
+
       for (const categoryText of categoryTexts) {
         try {
-          const categoryLoc = page.getByText(categoryText, { exact: false }).first();
+          const categoryLoc = page
+            .getByText(categoryText, { exact: false })
+            .first();
           const count = await categoryLoc.count();
-          
+
           if (count > 0) {
             await categoryLoc.scrollIntoViewIfNeeded();
             await page.waitForTimeout(500);
-            
+
             // Try to find and click an available element within the category
             const clicked = await categoryLoc.evaluate((el) => {
               // Find the container
@@ -760,24 +946,40 @@ async function handleHit(page, results, context) {
                 if (!container) break;
                 const tag = container.tagName?.toLowerCase();
                 const className = container.className || "";
-                if (tag === 'div' || tag === 'section' || tag === 'article' || 
-                    className.includes('section') || className.includes('category') ||
-                    className.includes('stand') || className.includes('tribune')) {
+                if (
+                  tag === "div" ||
+                  tag === "section" ||
+                  tag === "article" ||
+                  className.includes("section") ||
+                  className.includes("category") ||
+                  className.includes("stand") ||
+                  className.includes("tribune")
+                ) {
                   break;
                 }
                 container = container.parentElement;
               }
               if (!container) container = el.parentElement || el;
-              
+
               // Find first clickable available element
-              const clickableElements = container.querySelectorAll('button, a, [role="button"], [onclick]');
+              const clickableElements = container.querySelectorAll(
+                'button, a, [role="button"], [onclick]',
+              );
               for (const btn of clickableElements) {
                 const style = window.getComputedStyle(btn);
-                if (style.pointerEvents !== 'none' && style.opacity > 0.5) {
+                if (
+                  style.pointerEvents !== "none" &&
+                  style.opacity > 0.5 &&
+                  style.display !== "none"
+                ) {
                   const className = btn.className || "";
                   const hay = className.toLowerCase();
-                  if (!hay.includes('sold') && !hay.includes('disabled') && 
-                      !hay.includes('unavail') && !hay.includes('תפוס')) {
+                  if (
+                    !hay.includes("sold") &&
+                    !hay.includes("disabled") &&
+                    !hay.includes("unavail") &&
+                    !hay.includes("תפוס")
+                  ) {
                     btn.click();
                     return true;
                   }
@@ -785,12 +987,14 @@ async function handleHit(page, results, context) {
               }
               return false;
             });
-            
+
             if (clicked) {
               await page.waitForTimeout(1000);
               console.log(`✅ לחצתי על אלמנט זמין ב${CATEGORY_NAME}`);
             } else {
-              console.log(`📍 הגעתי ל${CATEGORY_NAME} - לחץ ידנית על מקום זמין`);
+              console.log(
+                `📍 הגעתי ל${CATEGORY_NAME} - לחץ ידנית על מקום זמין`,
+              );
             }
             break;
           }
@@ -803,14 +1007,14 @@ async function handleHit(page, results, context) {
     }
   }
 
-  // FIXED: PAUSE_ON_HIT logic
   if (PAUSE_ON_HIT) {
-    console.log("⏸️  עצרתי כאן כדי שתוכל להוסיף לעגלה / להמשיך באתר ידנית. להמשך: Ctrl+C או סגור חלון.");
-    await new Promise(() => {}); // Wait forever
-    return; // Don't enter monitor mode
+    console.log(
+      "⏸️  עצרתי כאן כדי שתוכל להוסיף לעגלה / להמשיך באתר ידנית. להמשך: Ctrl+C או סגור חלון.",
+    );
+    await new Promise(() => {}); // wait forever
+    return;
   }
 
-  // If PAUSE_ON_HIT=false, enter monitor mode
   console.log("⏸️  נכנס למצב מעקב - בודק אם הזמינות עדיין קיימת...");
   await monitorAvailability(page, context);
 }
@@ -819,19 +1023,22 @@ async function monitorAvailability(page, context) {
   let stillAvailable = true;
   while (stillAvailable) {
     await new Promise((r) => setTimeout(r, INTERVAL_MS));
-    
+
     try {
       await openEventPage(page);
       await ensureLoggedIn(page, context);
-      
+
       const checkResults = await scanSections(page);
       stillAvailable = checkResults.some((r) => r.avail === true);
-      
-      if (stillAvailable) {
-        console.log(`✅ הזמינות עדיין קיימת | ${new Date().toLocaleTimeString("he-IL")}`);
-      } else {
-        console.log(`❌ הזמינות נעלמה - חוזר לבדיקה רגילה | ${new Date().toLocaleTimeString("he-IL")}`);
-      }
+
+      if (stillAvailable)
+        console.log(
+          `✅ הזמינות עדיין קיימת | ${new Date().toLocaleTimeString("he-IL")}`,
+        );
+      else
+        console.log(
+          `❌ הזמינות נעלמה - חוזר לבדיקה רגילה | ${new Date().toLocaleTimeString("he-IL")}`,
+        );
     } catch (e) {
       console.log(`⚠️  שגיאה במעקב: ${e?.message || e}`);
     }
@@ -839,21 +1046,25 @@ async function monitorAvailability(page, context) {
 }
 
 // ============================================================================
-// Error Handling & Backof
+// Error Handling & Backoff
 // ============================================================================
 
 let consecutiveErrors = 0;
 const MAX_CONSECUTIVE_ERRORS = 3;
-const BACKOFF_DELAY = 60_000; // 60 seconds
+const BACKOFF_DELAY = 60_000;
 
 async function handleError(error, currentInterval) {
   consecutiveErrors++;
-  console.log(`Error (${consecutiveErrors}/${MAX_CONSECUTIVE_ERRORS}): ${error?.message || error}`);
+  console.log(
+    `Error (${consecutiveErrors}/${MAX_CONSECUTIVE_ERRORS}): ${error?.message || error}`,
+  );
 
   if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-    console.log(`⚠️  ${MAX_CONSECUTIVE_ERRORS} consecutive errors. Backing off for ${BACKOFF_DELAY / 1000} seconds...`);
+    console.log(
+      `⚠️  ${MAX_CONSECUTIVE_ERRORS} consecutive errors. Backing off for ${BACKOFF_DELAY / 1000} seconds...`,
+    );
     await new Promise((r) => setTimeout(r, BACKOFF_DELAY));
-    consecutiveErrors = 0; // Reset after backoff
+    consecutiveErrors = 0;
     return BACKOFF_DELAY;
   }
 
@@ -876,31 +1087,34 @@ async function handleError(error, currentInterval) {
   console.log(`🚀 Starting monitor for category: ${CATEGORY_NAME}`);
   console.log(`📅 Checking every ${INTERVAL_MS / 1000} seconds`);
   console.log(`🌐 URL: ${URL}`);
+
+  // Test Telegram connection
   if (TELEGRAM_TOKEN && TELEGRAM_CHAT_ID) {
-    console.log(`📱 Telegram notifications: Enabled`);
+    console.log(`📱 Testing Telegram connection...`);
+    await testTelegram();
+  } else {
+    console.log(
+      `⚠️  Telegram not configured (TELEGRAM_TOKEN or TELEGRAM_CHAT_ID missing)`,
+    );
   }
-  if (WEBHOOK_URL) {
-    console.log(`💬 Discord notifications: Enabled`);
-  }
+
+
 
   while (true) {
     try {
-      // Ensure logged in
       if (!isLoggedIn && LOGIN_USERNAME && LOGIN_PASSWORD) {
         isLoggedIn = await ensureLoggedIn(page, context);
-        if (isLoggedIn) {
-          await saveStorageState(context);
-        } else if (HEADFUL) {
+        if (isLoggedIn) await saveStorageState(context);
+        else if (HEADFUL) {
           console.log("⚠️  התחברות נכשלה - נסה להתחבר ידנית בחלון הדפדפן");
-          await new Promise((r) => setTimeout(r, 10000));
+          await new Promise((r) => setTimeout(r, 10_000));
         }
       }
 
-      // Open event page
       await openEventPage(page);
 
-      // Check if re-login needed
-      const needsLogin = (await page.locator('input[type="password"]').count()) > 0;
+      const needsLogin =
+        (await page.locator('input[type="password"]').count()) > 0;
       if (needsLogin && LOGIN_USERNAME && LOGIN_PASSWORD) {
         console.log("🔐 נראה שנדרשת התחברות מחדש...");
         isLoggedIn = await performLogin(page);
@@ -910,21 +1124,20 @@ async function handleError(error, currentInterval) {
         }
       }
 
-      // Scan sections
       const results = await scanSections(page);
       const anyAvail = results.some((r) => r.avail === true);
 
-      // Handle hit
       if (anyAvail && !lastAnyAvailable) {
         await handleHit(page, results, context);
         lastAnyAvailable = true;
       } else if (!anyAvail) {
-        console.log(`Checked: anyAvail=${anyAvail} | ${new Date().toLocaleTimeString("he-IL")}`);
+        console.log(
+          `Checked: anyAvail=${anyAvail} | ${new Date().toLocaleTimeString("he-IL")}`,
+        );
         lastAnyAvailable = false;
-        consecutiveErrors = 0; // Reset on success
-        currentInterval = INTERVAL_MS; // Reset interval
+        consecutiveErrors = 0;
+        currentInterval = INTERVAL_MS;
       }
-
     } catch (e) {
       currentInterval = await handleError(e, currentInterval);
     }
