@@ -28,7 +28,6 @@ const INTERVAL_MS = Number(process.env.INTERVAL_MS || 1_000);
 
 // Notifications
 const NTFY_TOPIC = process.env.NTFY_TOPIC || "";
-const WEBHOOK_URL = process.env.WEBHOOK_URL || "";
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN || "";
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
 
@@ -1080,7 +1079,7 @@ async function handleError(error, currentInterval) {
   const page = await context.newPage();
   await applyStealth(page);
 
-  let lastAnyAvailable = false;
+  let availabilityStreak = 0;
   let isLoggedIn = false;
   let currentInterval = INTERVAL_MS;
 
@@ -1127,9 +1126,14 @@ async function handleError(error, currentInterval) {
       const results = await scanSections(page);
       const anyAvail = results.some((r) => r.avail === true);
 
-      if (anyAvail && !lastAnyAvailable) {
-        await handleHit(page, results, context);
-        lastAnyAvailable = true;
+      if (anyAvail) {
+        availabilityStreak += 1;
+      } else {
+        availabilityStreak = 0;
+      }
+
+      if (availabilityStreak === 1)
+         {        await handleHit(page, results, context);
       } else if (!anyAvail) {
         console.log(
           `Checked: anyAvail=${anyAvail} | ${new Date().toLocaleTimeString("he-IL")}`,
@@ -1139,6 +1143,7 @@ async function handleError(error, currentInterval) {
         currentInterval = INTERVAL_MS;
       }
     } catch (e) {
+            availabilityStreak = 0;
       currentInterval = await handleError(e, currentInterval);
     }
 
