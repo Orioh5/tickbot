@@ -12,7 +12,6 @@ const { chromium } = require("playwright-extra");
 
 // DEBUG flag (supports: 1/true/yes/on)
 const DEBUG = process.env.DEBUG === "1";
-String(process.env.DEBUG || "").toLowerCase();
 
 const HEADFUL = process.env.HEADFUL === "1";
 const PAUSE_ON_HIT = process.env.PAUSE_ON_HIT !== "0"; // default: true
@@ -30,6 +29,7 @@ const INTERVAL_MS = Number(process.env.INTERVAL_MS || 1_000);
 const NTFY_TOPIC = process.env.NTFY_TOPIC || "";
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN || "";
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
+const WEBHOOK_URL = process.env.WEBHOOK_URL || "";
 
 // Login credentials
 const LOGIN_USERNAME = process.env.LOGIN_USERNAME || "";
@@ -46,6 +46,13 @@ const STORAGE_STATE_PATH = process.env.STORAGE_STATE_PATH || "./state.json";
 
 // Category name (for filtering sections)
 const CATEGORY_NAME = process.env.CATEGORY_NAME || "יציע אבי רן עליון";
+const CATEGORY_TEXTS = [
+  CATEGORY_NAME,
+  CATEGORY_NAME.replace("יציע ", ""),
+  CATEGORY_NAME.replace(" עליון", ""),
+  "אבי רן עליון",
+  "אבי רן",
+].filter((text, index, self) => self.indexOf(text) === index);
 
 // Proxy support
 const PROXY_SERVER = process.env.PROXY_SERVER || ""; // e.g., "http://proxy.example.com:8080"
@@ -53,7 +60,6 @@ const PROXY_USERNAME = process.env.PROXY_USERNAME || "";
 const PROXY_PASSWORD = process.env.PROXY_PASSWORD || "";
 
 // API monitoring
-let apiDataCache = null;
 const API_MONITORING_ENABLED = process.env.API_MONITORING !== "0"; // default: true
 
 // ============================================================================
@@ -240,38 +246,20 @@ async function testTelegram() {
 
     if (response.ok && data.ok) {
       console.log("✅ Telegram test message sent successfully!");
-      console.log(
-        `   Check your Telegram - you should have received a test message`,
-      );
       return true;
     } else {
-      console.log(
-        `❌ Telegram test failed: ${data.description || response.statusText}`,
-      );
-      if (data.error_code === 401) {
-        console.log("   ⚠️  Invalid bot token - check TELEGRAM_TOKEN");
-        console.log(
-          "   Make sure the token starts with a number and contains a colon",
-        );
-      } else if (data.error_code === 400) {
-        console.log("   ⚠️  Invalid chat ID - check TELEGRAM_CHAT_ID");
-        console.log(
-          "   Make sure you've started a conversation with the bot first",
-        );
-      } else if (data.error_code === 403) {
-        console.log("   ⚠️  Bot blocked or chat not found");
-        console.log("   Make sure you've started a conversation with the bot");
-      }
-      if (DEBUG) {
-        console.log(`   Full error response: ${JSON.stringify(data, null, 2)}`);
-      }
+      const hint =
+        data.error_code === 401 ? "Invalid bot token - check TELEGRAM_TOKEN" :
+        data.error_code === 400 ? "Invalid chat ID - start a conversation with the bot first" :
+        data.error_code === 403 ? "Bot blocked or chat not found - start a conversation with the bot" :
+        data.description || response.statusText;
+      console.log(`❌ Telegram test failed: ${hint}`);
+      if (DEBUG) console.log(`   Full error response: ${JSON.stringify(data)}`);
       return false;
     }
   } catch (e) {
     console.log(`❌ Telegram test error: ${e?.message || e}`);
-    if (DEBUG) {
-      console.log(`   Stack: ${e.stack}`);
-    }
+    if (DEBUG) console.log(`   Stack: ${e.stack}`);
     return false;
   }
 }
@@ -521,7 +509,6 @@ async function performLogin(page, skipGoto = false) {
       return false;
     }
 
-    console.log("✅ Login successful!");
     return true;
   } catch (e) {
     console.log(`❌ Connection error: ${e?.message || e}`);
@@ -710,13 +697,7 @@ async function confirmHitByClick(page, section) {
 
 async function scanSections(page) {
   // Find the category "יציע אבי רן עליון"
-  const categoryTexts = [
-    CATEGORY_NAME,
-    CATEGORY_NAME.replace("יציע ", ""),
-    CATEGORY_NAME.replace(" עליון", ""),
-    "אבי רן עליון",
-    "אבי רן",
-  ].filter((text, index, self) => self.indexOf(text) === index);
+  const categoryTexts = CATEGORY_TEXTS;
 
   let categoryFound = false;
   let categoryElement = null;
@@ -751,6 +732,7 @@ async function scanSections(page) {
 
   if (!categoryFound) {
     console.log(`⚠️  Category '${CATEGORY_NAME}' not found!`);
+    notifiedCategoryFound = false;
     return [{ sec: "category", found: false, avail: false }];
   }
 
@@ -865,12 +847,6 @@ async function scanSections(page) {
     hasAvailability = availabilityCheck.available === true;
     availabilityDetails = availabilityCheck;
 
-    if (DEBUG) {
-      console.log(`📊 Category availability check: ${hasAvailability}`);
-      if (availabilityDetails && availabilityDetails.available) {
-        console.log(`   Details: ${JSON.stringify(availabilityDetails)}`);
-      }
-    }
   } catch (e) {
     console.log(`⚠️  Error checking availability: ${e?.message || e}`);
     if (DEBUG) console.log(`   Stack: ${e.stack}`);
@@ -887,7 +863,7 @@ async function scanSections(page) {
 
   if (DEBUG) {
     console.log(
-      `📊 Scan result: Category '${CATEGORY_NAME}' - Available: ${hasAvailability}`,
+      `📊 Scan result: Category '${CATEGORY_NAME}' - Available: ${hasAvailability}${availabilityDetails?.available ? ` | ${JSON.stringify(availabilityDetails)}` : ""}`,
     );
   }
 
@@ -918,13 +894,7 @@ async function handleHit(page, results, context) {
       console.log(`📍 מעבר ל${CATEGORY_NAME}...`);
 
       // Find the category and scroll to it
-      const categoryTexts = [
-        CATEGORY_NAME,
-        CATEGORY_NAME.replace("יציע ", ""),
-        CATEGORY_NAME.replace(" עליון", ""),
-        "אבי רן עליון",
-        "אבי רן",
-      ];
+      const categoryTexts = CATEGORY_TEXTS;
 
       for (const categoryText of categoryTexts) {
         try {
@@ -1030,13 +1000,9 @@ async function monitorAvailability(page, context) {
       const checkResults = await scanSections(page);
       stillAvailable = checkResults.some((r) => r.avail === true);
 
-      if (stillAvailable)
+      if (DEBUG)
         console.log(
-          `✅ הזמינות עדיין קיימת | ${new Date().toLocaleTimeString("he-IL")}`,
-        );
-      else
-        console.log(
-          `❌ הזמינות נעלמה - חוזר לבדיקה רגילה | ${new Date().toLocaleTimeString("he-IL")}`,
+          `${stillAvailable ? "✅ הזמינות עדיין קיימת" : "❌ הזמינות נעלמה - חוזר לבדיקה רגילה"} | ${new Date().toLocaleTimeString("he-IL")}`,
         );
     } catch (e) {
       console.log(`⚠️  שגיאה במעקב: ${e?.message || e}`);
@@ -1135,10 +1101,10 @@ async function handleError(error, currentInterval) {
       if (availabilityStreak === 1)
          {        await handleHit(page, results, context);
       } else if (!anyAvail) {
-        console.log(
-          `Checked: anyAvail=${anyAvail} | ${new Date().toLocaleTimeString("he-IL")}`,
-        );
-        lastAnyAvailable = false;
+        if (DEBUG)
+          console.log(
+            `Checked: anyAvail=${anyAvail} | ${new Date().toLocaleTimeString("he-IL")}`,
+          );
         consecutiveErrors = 0;
         currentInterval = INTERVAL_MS;
       }
