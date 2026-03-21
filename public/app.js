@@ -73,6 +73,7 @@ const ws = new WebSocket(`ws://${location.host}`);
 let startedAt      = null;
 let uptimeInterval = null;
 let autoScroll     = true;
+let isRunning      = false;
 
 // ── DOM refs ────────────────────────────────────────────────────────────────
 
@@ -122,6 +123,7 @@ ws.onerror = err => addLog('WebSocket error — is the server running?', 'error'
 
 function handleStatus(status) {
   const running = status.running;
+  isRunning = running;
 
   ui.statusBadge.className = `badge ${running ? 'badge-running' : 'badge-stopped'}`;
   ui.statusBadge.textContent = running ? '● MONITORING' : '● STOPPED';
@@ -319,13 +321,20 @@ ui.saveSettingsBtn.addEventListener('click', async () => {
   ui.saveSettingsBtn.textContent = 'Saving…';
   ui.saveSettingsBtn.disabled = true;
 
+  const formData = readForm();
+
   const res = await fetch('/api/settings', {
     method:  'POST',
     headers: { 'Content-Type': 'application/json' },
-    body:    JSON.stringify(readForm()),
+    body:    JSON.stringify(formData),
   });
 
   if (res.ok) {
+    // Update the sections grid immediately with the new selection
+    if (!isRunning) {
+      const pending = Object.fromEntries(formData.sections.map(s => [s, { status: 'pending' }]));
+      renderSections(pending);
+    }
     addLog('Settings saved.', 'success');
     ui.settingsOverlay.classList.add('hidden');
   } else {
