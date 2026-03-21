@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MHFC Ticket Monitor</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+  <!-- ── Header ─────────────────────────────────────────────────────────── -->
+  <header>
+    <div class="header-brand">
+      <span class="logo">🎟️</span>
+      <div>
+        <h1>MHFC Ticket Monitor</h1>
+        <span class="subtitle">Maccabi Haifa FC · Sami Ofer Stadium</span>
+      </div>
+    </div>
+    <div class="header-right">
+      <span id="statusBadge" class="badge badge-stopped">● STOPPED</span>
+      <button id="settingsBtn" class="btn-icon" title="Settings">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+        </svg>
+      </button>
+    </div>
+  </header>
+
+  <!-- ── Control Bar ────────────────────────────────────────────────────── -->
+  <div class="control-bar">
+    <div class="controls">
+      <button id="startBtn" class="btn btn-start">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+        Start Monitoring
+      </button>
+      <button id="stopBtn" class="btn btn-stop" disabled>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="3" y="3" width="18" height="18" rx="2"/></svg>
+        Stop
+      </button>
+    </div>
+    <div class="stats-row">
+      <div class="stat">
+        <span class="stat-value" id="statsChecks">0</span>
+        <span class="stat-label">Checks</span>
+      </div>
+      <div class="stat-divider"></div>
+      <div class="stat">
+        <span class="stat-value accent-green" id="statsAlerts">0</span>
+        <span class="stat-label">Alerts</span>
+      </div>
+      <div class="stat-divider"></div>
+      <div class="stat">
+        <span class="stat-value" id="statsErrors">0</span>
+        <span class="stat-label">Errors</span>
+      </div>
+      <div class="stat-divider"></div>
+      <div class="stat">
+        <span class="stat-value" id="statsUptime">--</span>
+        <span class="stat-label">Uptime</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Main ───────────────────────────────────────────────────────────── -->
+  <main>
+
+    <!-- Sections Panel -->
+    <section class="panel" id="sectionsPanel">
+      <div class="panel-header">
+        <h2>Sections</h2>
+        <span id="sectionSummary" class="text-muted">—</span>
+      </div>
+      <div id="sectionsGrid" class="sections-grid">
+        <!-- rendered by JS -->
+      </div>
+      <div class="legend">
+        <span class="legend-item"><span class="dot dot-pending"></span>Pending</span>
+        <span class="legend-item"><span class="dot dot-checking"></span>Checking</span>
+        <span class="legend-item"><span class="dot dot-available"></span>Available</span>
+        <span class="legend-item"><span class="dot dot-unavailable"></span>Sold Out</span>
+        <span class="legend-item"><span class="dot dot-not_found"></span>Not Found</span>
+        <span class="legend-item"><span class="dot dot-error"></span>Error</span>
+      </div>
+    </section>
+
+    <!-- Log Panel -->
+    <section class="panel" id="logPanel">
+      <div class="panel-header">
+        <h2>Live Log</h2>
+        <button id="clearLogBtn" class="btn-pill">Clear</button>
+      </div>
+      <div id="logFeed" class="log-feed"></div>
+      <div id="scrollPausedBanner" class="scroll-paused hidden">
+        Scroll paused — <button id="resumeScrollBtn">resume</button>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- ── Settings Panel ─────────────────────────────────────────────────── -->
+  <div id="settingsOverlay" class="overlay hidden">
+    <div class="overlay-backdrop" id="overlayBackdrop"></div>
+    <div class="settings-panel">
+      <div class="settings-header">
+        <h2>Settings</h2>
+        <button id="closeSettingsBtn" class="btn-icon">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+
+      <div class="settings-body">
+
+        <div class="form-section">
+          <h3>Event</h3>
+          <div class="form-group">
+            <label for="cfgUrl">Event URL</label>
+            <input type="text" id="cfgUrl" placeholder="https://tickets.mhaifafc.com/Stadium/Index?eventId=...">
+          </div>
+          <div class="form-group">
+            <label>Sections to Monitor</label>
+            <div class="picker-controls">
+              <button type="button" class="picker-ctrl-btn" id="pickAll">Select All</button>
+              <button type="button" class="picker-ctrl-btn" id="pickNone">Clear</button>
+            </div>
+            <div id="sectionPicker" class="section-picker"></div>
+            <span class="hint" id="selectedCountHint">0 sections selected</span>
+          </div>
+          <div class="form-group">
+            <label for="cfgCustomSections">Custom sections <span class="optional-tag">Away game</span></label>
+            <input type="text" id="cfgCustomSections" placeholder="e.g. 1,2,3,10,11">
+            <span class="hint">If filled, overrides the picker above — use this for away games with different section numbers.</span>
+          </div>
+          <div class="form-row">
+            <div class="form-group flex-1">
+              <label for="cfgInterval">Check every (seconds)</label>
+              <input type="number" id="cfgInterval" min="1" max="300">
+            </div>
+          </div>
+          <div class="form-group">
+            <label class="checkbox-label">
+              <input type="checkbox" id="cfgPauseOnHit">
+              <span>Pause monitoring when tickets are found</span>
+            </label>
+          </div>
+          <div class="form-group">
+            <label class="checkbox-label">
+              <input type="checkbox" id="cfgHeadful">
+              <span>Show browser window (headful mode)</span>
+            </label>
+          </div>
+        </div>
+
+        <div class="form-section">
+          <h3>Telegram Notifications</h3>
+          <div class="form-group">
+            <label for="cfgTelegramToken">Bot Token</label>
+            <input type="password" id="cfgTelegramToken" placeholder="123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11">
+            <span class="hint">Get from <strong>@BotFather</strong> on Telegram</span>
+          </div>
+          <div class="form-group">
+            <label for="cfgTelegramChatId">Chat ID</label>
+            <input type="text" id="cfgTelegramChatId" placeholder="e.g. 123456789">
+            <span class="hint">Get from <strong>@userinfobot</strong> on Telegram</span>
+          </div>
+          <button id="testTelegramBtn" class="btn btn-secondary btn-sm">Send Test Message</button>
+        </div>
+
+        <div class="form-section">
+          <h3>Account Login <span class="optional-tag">Optional</span></h3>
+          <div class="form-group">
+            <label for="cfgUsername">Email / Username</label>
+            <input type="email" id="cfgUsername" placeholder="your@email.com">
+          </div>
+          <div class="form-group">
+            <label for="cfgPassword">Password</label>
+            <input type="password" id="cfgPassword" placeholder="••••••••">
+          </div>
+          <div class="form-group">
+            <label for="cfgLoginUrl">Login URL</label>
+            <input type="text" id="cfgLoginUrl" placeholder="https://auth.mhaifafc.com/">
+          </div>
+        </div>
+
+      </div>
+
+      <div class="settings-footer">
+        <button id="saveSettingsBtn" class="btn btn-start btn-full">Save Settings</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Alert Toast ─────────────────────────────────────────────────────── -->
+  <div id="alertToast" class="alert-toast hidden"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
