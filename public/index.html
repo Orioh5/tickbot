@@ -127,9 +127,9 @@
             <span class="hint" id="selectedCountHint">0 sections selected</span>
           </div>
           <div class="form-group">
-            <label for="cfgCustomSections">Custom sections <span class="optional-tag">Away game</span></label>
-            <input type="text" id="cfgCustomSections" placeholder="e.g. 1,2,3,10,11">
-            <span class="hint">If filled, overrides the picker above — use this for away games with different section numbers.</span>
+            <label for="cfgCustomSections">Manual Section Override</label>
+            <input type="text" id="cfgCustomSections" placeholder="e.g. 101, 102, 201, 301">
+            <span class="hint">Comma-separated section numbers. If set, overrides the picker above.</span>
           </div>
           <div class="form-row">
             <div class="form-group flex-1">
@@ -150,6 +150,8 @@
             </label>
           </div>
         </div>
+       
+        
 
         <div class="form-section">
           <h3>Telegram Notifications</h3>
@@ -175,10 +177,6 @@
           <div class="form-group">
             <label for="cfgPassword">Password</label>
             <input type="password" id="cfgPassword" placeholder="••••••••">
-          </div>
-          <div class="form-group">
-            <label for="cfgLoginUrl">Login URL</label>
-            <input type="text" id="cfgLoginUrl" placeholder="https://auth.mhaifafc.com/">
           </div>
         </div>
 

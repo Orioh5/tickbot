@@ -260,7 +260,7 @@ function fillForm(s) {
   $('cfgTelegramChatId').value = s.telegramChatId || '';
   $('cfgUsername').value       = s.loginUsername  || '';
   $('cfgPassword').value       = s.loginPassword  || '';
-  $('cfgLoginUrl').value       = s.loginUrl       || '';
+  // loginUrl is constant — no UI field
 }
 
 function readForm() {
@@ -279,7 +279,7 @@ function readForm() {
     telegramChatId: $('cfgTelegramChatId').value.trim(),
     loginUsername:  $('cfgUsername').value.trim(),
     loginPassword:  $('cfgPassword').value,
-    loginUrl:       $('cfgLoginUrl').value.trim(),
+    loginUrl:       'https://auth.mhaifafc.com/',
   };
 }
 

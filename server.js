@@ -20,8 +20,8 @@ const PORT = process.env.PORT || 3000;
 
 function defaultSettings() {
   return {
-    url:            'https://tickets.mhaifafc.com/Stadium/Index?eventId=5230',
-    sections:       ['201','202','203','204','205','206','207','208','209','210','211','212'],
+    url:            '',
+    sections:       [],
     intervalMs:     10000,
     pauseOnHit:     true,
     telegramToken:  process.env.TELEGRAM_TOKEN  || '',
@@ -82,6 +82,11 @@ app.get('/api/settings', (req, res) => {
 app.post('/api/settings', (req, res) => {
   const settings = { ...loadSettings(), ...req.body };
   saveSettings(settings);
+  // If monitor isn't running, push the new section list to all dashboards immediately
+  if (!monitor.running) {
+    const pending = Object.fromEntries(settings.sections.map(s => [s, { status: 'pending' }]));
+    broadcast({ type: 'sections', sections: pending });
+  }
   res.json({ ok: true });
 });
 
@@ -111,8 +116,13 @@ app.post('/api/monitor/stop', async (req, res) => {
 // ── WebSocket — send current state on connect ──────────────────────────────
 
 wss.on('connection', ws => {
-  ws.send(JSON.stringify({ type: 'status',   status:   monitor.getStatus()   }));
-  ws.send(JSON.stringify({ type: 'sections', sections: monitor.getSections() }));
+  ws.send(JSON.stringify({ type: 'status',   status: monitor.getStatus() }));
+  // If monitor is running, show live section statuses; otherwise show configured sections as pending
+  const liveSections = monitor.getSections();
+  const sections = monitor.running || Object.keys(liveSections).length > 0
+    ? liveSections
+    : Object.fromEntries(loadSettings().sections.map(s => [s, { status: 'pending' }]));
+  ws.send(JSON.stringify({ type: 'sections', sections }));
   ws.send(JSON.stringify({ type: 'stats',    stats:    monitor.getStats()    }));
 });
 

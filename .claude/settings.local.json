@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install:*)",
+      "Bash(cd:*)",
+      "mcp__Claude_Preview__preview_start"
+    ]
+  }
+}

@@ -141,10 +141,9 @@ class Monitor extends EventEmitter {
 
     this.context = await this.browser.newContext(ctxOpts);
 
-    // Block images, fonts, media for faster loading
+    // Only block media — images/fonts needed for seat map to render
     await this.context.route('**/*', route => {
-      const type = route.request().resourceType();
-      if (['image', 'font', 'media'].includes(type)) {
+      if (route.request().resourceType() === 'media') {
         route.abort();
       } else {
         route.continue();
@@ -208,8 +207,8 @@ class Monitor extends EventEmitter {
       try {
         if (!navigated) {
           this.log('Loading event page...', 'info');
-          await this.page.goto(this.settings.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-          await this._sleep(3000);
+          await this.page.goto(this.settings.url, { waitUntil: 'networkidle', timeout: 45000 });
+          await this._sleep(2000);
           navigated = true;
         }
 
@@ -236,6 +235,8 @@ class Monitor extends EventEmitter {
   }
 
   async _checkAvailability() {
+    if (!this.page) return;
+
     // Check for Queue-it
     const isQueued = await this.page.evaluate(() =>
       !!(document.querySelector('#queueit_overlay') ||
@@ -255,10 +256,19 @@ class Monitor extends EventEmitter {
     }
     this.emit('sections', this.getSections());
 
-    // Check each section
+    // Read available sections from the page — sections appear in the LI list only when available
+    const availableOnPage = await this.page.evaluate(() => {
+      return Array.from(document.querySelectorAll('[onclick*="processSectorById"]'))
+        .map(el => { const m = el.textContent.match(/גוש\s*(\d+)/); return m ? m[1] : null; })
+        .filter(Boolean);
+    }).catch(() => []);
+
+    this.log(`Sections on page: [${availableOnPage.join(', ') || 'none'}]`, 'info');
+
     for (const section of this.settings.sections) {
-      if (!this.running) break;
-      this.sections[section] = { status: await this._checkSection(section) };
+      this.sections[section] = {
+        status: availableOnPage.includes(String(section)) ? 'available' : 'unavailable'
+      };
     }
 
     this.stats.checks++;
@@ -285,54 +295,6 @@ class Monitor extends EventEmitter {
       }
     } else {
       this.log(`Check #${this.stats.checks}: No availability in ${this.settings.sections.length} sections`, 'info');
-    }
-  }
-
-  async _checkSection(section) {
-    try {
-      return await this.page.evaluate(sectionNum => {
-        const selectors = [
-          `[data-section="${sectionNum}"]`,
-          `[data-block="${sectionNum}"]`,
-          `[data-id="${sectionNum}"]`,
-          `[id="section_${sectionNum}"]`,
-          `[id="block_${sectionNum}"]`,
-          `[id="s${sectionNum}"]`,
-          `[aria-label="${sectionNum}"]`,
-          `[title="${sectionNum}"]`,
-        ];
-
-        let el = null;
-        for (const sel of selectors) {
-          el = document.querySelector(sel);
-          if (el) break;
-        }
-
-        if (!el) return 'not_found';
-
-        if (el.disabled || el.getAttribute('aria-disabled') === 'true') return 'unavailable';
-
-        const cls = ((el.className || '') + ' ' + (el.getAttribute('data-status') || '')).toLowerCase();
-
-        if (cls.includes('disabled') || cls.includes('unavailable') ||
-            cls.includes('sold') || cls.includes('locked') || cls.includes('full')) {
-          return 'unavailable';
-        }
-
-        if (cls.includes('available') || cls.includes('open') || cls.includes('free')) {
-          return 'available';
-        }
-
-        // SVG fill color heuristic — muted = unavailable
-        const fill = (el.getAttribute('fill') || '').toLowerCase();
-        if (fill && (fill.includes('#999') || fill.includes('#ccc') || fill.includes('#666') || fill === 'gray' || fill === 'grey')) {
-          return 'unavailable';
-        }
-
-        return 'available';
-      }, section);
-    } catch (_) {
-      return 'error';
     }
   }
 
