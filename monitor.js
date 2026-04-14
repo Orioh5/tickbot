@@ -141,10 +141,9 @@ class Monitor extends EventEmitter {
 
     this.context = await this.browser.newContext(ctxOpts);
 
-    // Block images, fonts, media for faster loading
+    // Only block media — images/fonts needed for seat map to render
     await this.context.route('**/*', route => {
-      const type = route.request().resourceType();
-      if (['image', 'font', 'media'].includes(type)) {
+      if (route.request().resourceType() === 'media') {
         route.abort();
       } else {
         route.continue();
@@ -208,8 +207,8 @@ class Monitor extends EventEmitter {
       try {
         if (!navigated) {
           this.log('Loading event page...', 'info');
-          await this.page.goto(this.settings.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-          await this._sleep(3000);
+          await this.page.goto(this.settings.url, { waitUntil: 'networkidle', timeout: 45000 });
+          await this._sleep(2000);
           navigated = true;
         }
 
@@ -236,6 +235,8 @@ class Monitor extends EventEmitter {
   }
 
   async _checkAvailability() {
+    if (!this.page) return;
+
     // Check for Queue-it
     const isQueued = await this.page.evaluate(() =>
       !!(document.querySelector('#queueit_overlay') ||
@@ -255,10 +256,23 @@ class Monitor extends EventEmitter {
     }
     this.emit('sections', this.getSections());
 
-    // Check each section
+    // Read available sections from the page — sections appear in the LI list only when available
+    // Extract section ID from the onclick attribute (language-agnostic, more reliable than parsing text)
+    const availableOnPage = await this.page.evaluate(() => {
+      return Array.from(document.querySelectorAll('[onclick*="processSectorById"]'))
+        .map(el => {
+          const m = (el.getAttribute('onclick') || '').match(/processSectorById\((\d+)\)/);
+          return m ? m[1] : null;
+        })
+        .filter(Boolean);
+    }).catch(() => []);
+
+    this.log(`Sections on page: [${availableOnPage.join(', ') || 'none'}]`, 'info');
+
     for (const section of this.settings.sections) {
-      if (!this.running) break;
-      this.sections[section] = { status: await this._checkSection(section) };
+      this.sections[section] = {
+        status: availableOnPage.includes(String(section)) ? 'available' : 'unavailable'
+      };
     }
 
     this.stats.checks++;
@@ -271,9 +285,16 @@ class Monitor extends EventEmitter {
       .map(([k]) => k);
 
     if (available.length > 0) {
+      let purchased = false;
+      if (this.settings.autoPurchase) {
+        purchased = await this._tryAutoPurchase(available[0]);
+      }
+
       this.stats.alerts++;
       this.emit('stats', this.getStats());
-      const msg = `🎟️ Tickets available in sections: ${available.join(', ')}!`;
+      const msg = purchased
+        ? `🛒 Tickets added to cart! Section ${available[0]} — complete checkout now!`
+        : `🎟️ Tickets available in sections: ${available.join(', ')}!`;
       this.log(msg, 'alert');
       this.emit('alert', msg);
       await this._notify(msg);
@@ -288,51 +309,45 @@ class Monitor extends EventEmitter {
     }
   }
 
-  async _checkSection(section) {
+  async _tryAutoPurchase(sectionId) {
+    if (!this.page) return false;
     try {
-      return await this.page.evaluate(sectionNum => {
-        const selectors = [
-          `[data-section="${sectionNum}"]`,
-          `[data-block="${sectionNum}"]`,
-          `[data-id="${sectionNum}"]`,
-          `[id="section_${sectionNum}"]`,
-          `[id="block_${sectionNum}"]`,
-          `[id="s${sectionNum}"]`,
-          `[aria-label="${sectionNum}"]`,
-          `[title="${sectionNum}"]`,
-        ];
+      this.log(`Auto-purchase: clicking section ${sectionId}...`, 'info');
 
-        let el = null;
-        for (const sel of selectors) {
-          el = document.querySelector(sel);
-          if (el) break;
-        }
+      // Click the section element
+      const el = await this.page.$(`[onclick*="processSectorById(${sectionId})"]`);
+      if (!el) {
+        this.log('Auto-purchase: section element not found on page', 'warning');
+        return false;
+      }
+      await el.click();
 
-        if (!el) return 'not_found';
+      // Wait for the quantity dialog
+      await this.page.waitForSelector(
+        '.modal, [class*="dialog"], [class*="popup"], [class*="modal"]',
+        { timeout: 6000 }
+      );
+      await this._sleep(500);
 
-        if (el.disabled || el.getAttribute('aria-disabled') === 'true') return 'unavailable';
+      // Increase quantity if desired > 1
+      const target = Math.max(1, this.settings.desiredQuantity || 1);
+      for (let i = 1; i < target; i++) {
+        await this.page.click(
+          'button:has-text("+"), [class*="plus"], [class*="increment"], [aria-label*="increase"]'
+        ).catch(() => {});
+        await this._sleep(300);
+      }
 
-        const cls = ((el.className || '') + ' ' + (el.getAttribute('data-status') || '')).toLowerCase();
+      // Confirm the dialog
+      await this.page.click(
+        'button:has-text("OK"), button:has-text("אישור"), button:has-text("✓"), [class*="confirm"], [class*="ok-btn"]'
+      );
 
-        if (cls.includes('disabled') || cls.includes('unavailable') ||
-            cls.includes('sold') || cls.includes('locked') || cls.includes('full')) {
-          return 'unavailable';
-        }
-
-        if (cls.includes('available') || cls.includes('open') || cls.includes('free')) {
-          return 'available';
-        }
-
-        // SVG fill color heuristic — muted = unavailable
-        const fill = (el.getAttribute('fill') || '').toLowerCase();
-        if (fill && (fill.includes('#999') || fill.includes('#ccc') || fill.includes('#666') || fill === 'gray' || fill === 'grey')) {
-          return 'unavailable';
-        }
-
-        return 'available';
-      }, section);
-    } catch (_) {
-      return 'error';
+      this.log(`Auto-purchase: section ${sectionId} added to cart!`, 'success');
+      return true;
+    } catch (e) {
+      this.log(`Auto-purchase failed: ${e.message}`, 'error');
+      return false;
     }
   }
 

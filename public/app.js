@@ -73,6 +73,7 @@ const ws = new WebSocket(`ws://${location.host}`);
 let startedAt      = null;
 let uptimeInterval = null;
 let autoScroll     = true;
+let isRunning      = false;
 
 // ── DOM refs ────────────────────────────────────────────────────────────────
 
@@ -122,6 +123,7 @@ ws.onerror = err => addLog('WebSocket error — is the server running?', 'error'
 
 function handleStatus(status) {
   const running = status.running;
+  isRunning = running;
 
   ui.statusBadge.className = `badge ${running ? 'badge-running' : 'badge-stopped'}`;
   ui.statusBadge.textContent = running ? '● MONITORING' : '● STOPPED';
@@ -254,11 +256,13 @@ function fillForm(s) {
   $('cfgInterval').value       = Math.round((s.intervalMs || 10000) / 1000);
   $('cfgPauseOnHit').checked   = s.pauseOnHit !== false;
   $('cfgHeadful').checked      = !!s.headful;
+  $('cfgAutoPurchase').checked  = !!s.autoPurchase;
+  $('cfgDesiredQuantity').value = s.desiredQuantity || 1;
   $('cfgTelegramToken').value  = s.telegramToken  || '';
   $('cfgTelegramChatId').value = s.telegramChatId || '';
   $('cfgUsername').value       = s.loginUsername  || '';
   $('cfgPassword').value       = s.loginPassword  || '';
-  $('cfgLoginUrl').value       = s.loginUrl       || '';
+  // loginUrl is constant — no UI field
 }
 
 function readForm() {
@@ -277,7 +281,9 @@ function readForm() {
     telegramChatId: $('cfgTelegramChatId').value.trim(),
     loginUsername:  $('cfgUsername').value.trim(),
     loginPassword:  $('cfgPassword').value,
-    loginUrl:       $('cfgLoginUrl').value.trim(),
+    loginUrl:       'https://auth.mhaifafc.com/',
+    autoPurchase:    $('cfgAutoPurchase').checked,
+    desiredQuantity: parseInt($('cfgDesiredQuantity').value, 10) || 1,
   };
 }
 
@@ -319,13 +325,20 @@ ui.saveSettingsBtn.addEventListener('click', async () => {
   ui.saveSettingsBtn.textContent = 'Saving…';
   ui.saveSettingsBtn.disabled = true;
 
+  const formData = readForm();
+
   const res = await fetch('/api/settings', {
     method:  'POST',
     headers: { 'Content-Type': 'application/json' },
-    body:    JSON.stringify(readForm()),
+    body:    JSON.stringify(formData),
   });
 
   if (res.ok) {
+    // Update the sections grid immediately with the new selection
+    if (!isRunning) {
+      const pending = Object.fromEntries(formData.sections.map(s => [s, { status: 'pending' }]));
+      renderSections(pending);
+    }
     addLog('Settings saved.', 'success');
     ui.settingsOverlay.classList.add('hidden');
   } else {
