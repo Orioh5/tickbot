@@ -256,6 +256,8 @@ function fillForm(s) {
   $('cfgInterval').value       = Math.round((s.intervalMs || 10000) / 1000);
   $('cfgPauseOnHit').checked   = s.pauseOnHit !== false;
   $('cfgHeadful').checked      = !!s.headful;
+  $('cfgAutoPurchase').checked  = !!s.autoPurchase;
+  $('cfgDesiredQuantity').value = s.desiredQuantity || 1;
   $('cfgTelegramToken').value  = s.telegramToken  || '';
   $('cfgTelegramChatId').value = s.telegramChatId || '';
   $('cfgUsername').value       = s.loginUsername  || '';
@@ -280,6 +282,8 @@ function readForm() {
     loginUsername:  $('cfgUsername').value.trim(),
     loginPassword:  $('cfgPassword').value,
     loginUrl:       'https://auth.mhaifafc.com/',
+    autoPurchase:    $('cfgAutoPurchase').checked,
+    desiredQuantity: parseInt($('cfgDesiredQuantity').value, 10) || 1,
   };
 }
 

@@ -257,9 +257,13 @@ class Monitor extends EventEmitter {
     this.emit('sections', this.getSections());
 
     // Read available sections from the page — sections appear in the LI list only when available
+    // Extract section ID from the onclick attribute (language-agnostic, more reliable than parsing text)
     const availableOnPage = await this.page.evaluate(() => {
       return Array.from(document.querySelectorAll('[onclick*="processSectorById"]'))
-        .map(el => { const m = el.textContent.match(/גוש\s*(\d+)/); return m ? m[1] : null; })
+        .map(el => {
+          const m = (el.getAttribute('onclick') || '').match(/processSectorById\((\d+)\)/);
+          return m ? m[1] : null;
+        })
         .filter(Boolean);
     }).catch(() => []);
 
@@ -281,9 +285,16 @@ class Monitor extends EventEmitter {
       .map(([k]) => k);
 
     if (available.length > 0) {
+      let purchased = false;
+      if (this.settings.autoPurchase) {
+        purchased = await this._tryAutoPurchase(available[0]);
+      }
+
       this.stats.alerts++;
       this.emit('stats', this.getStats());
-      const msg = `🎟️ Tickets available in sections: ${available.join(', ')}!`;
+      const msg = purchased
+        ? `🛒 Tickets added to cart! Section ${available[0]} — complete checkout now!`
+        : `🎟️ Tickets available in sections: ${available.join(', ')}!`;
       this.log(msg, 'alert');
       this.emit('alert', msg);
       await this._notify(msg);
@@ -295,6 +306,48 @@ class Monitor extends EventEmitter {
       }
     } else {
       this.log(`Check #${this.stats.checks}: No availability in ${this.settings.sections.length} sections`, 'info');
+    }
+  }
+
+  async _tryAutoPurchase(sectionId) {
+    if (!this.page) return false;
+    try {
+      this.log(`Auto-purchase: clicking section ${sectionId}...`, 'info');
+
+      // Click the section element
+      const el = await this.page.$(`[onclick*="processSectorById(${sectionId})"]`);
+      if (!el) {
+        this.log('Auto-purchase: section element not found on page', 'warning');
+        return false;
+      }
+      await el.click();
+
+      // Wait for the quantity dialog
+      await this.page.waitForSelector(
+        '.modal, [class*="dialog"], [class*="popup"], [class*="modal"]',
+        { timeout: 6000 }
+      );
+      await this._sleep(500);
+
+      // Increase quantity if desired > 1
+      const target = Math.max(1, this.settings.desiredQuantity || 1);
+      for (let i = 1; i < target; i++) {
+        await this.page.click(
+          'button:has-text("+"), [class*="plus"], [class*="increment"], [aria-label*="increase"]'
+        ).catch(() => {});
+        await this._sleep(300);
+      }
+
+      // Confirm the dialog
+      await this.page.click(
+        'button:has-text("OK"), button:has-text("אישור"), button:has-text("✓"), [class*="confirm"], [class*="ok-btn"]'
+      );
+
+      this.log(`Auto-purchase: section ${sectionId} added to cart!`, 'success');
+      return true;
+    } catch (e) {
+      this.log(`Auto-purchase failed: ${e.message}`, 'error');
+      return false;
     }
   }
 

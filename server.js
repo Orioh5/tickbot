@@ -33,6 +33,8 @@ function defaultSettings() {
     proxyServer:    '',
     proxyUsername:  '',
     proxyPassword:  '',
+    autoPurchase:    false,
+    desiredQuantity: 1,
   };
 }
 
