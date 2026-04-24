@@ -32,7 +32,7 @@ Three core files:
 
 - **`server.js`** — Express HTTP server + WebSocket server. Serves the static frontend, exposes REST API (`/api/settings`, `/api/monitor/start`, `/api/monitor/stop`, `/api/status`), and forwards Monitor events to all connected browser clients via WebSocket.
 
-- **`monitor.js`** — `Monitor extends EventEmitter`. Manages the Playwright browser lifecycle (launch, login, monitoring loop). Emits: `log`, `status`, `sections`, `stats`, `alert`. The `start()` method is async but `_runLoop()` runs detached (not awaited), so it doesn't block the HTTP response.
+- **`monitor.js`** — `Monitor extends EventEmitter`. Manages the Playwright browser lifecycle (launch, login, monitoring loop). Emits: `log`, `status`, `sections`, `stats`, `alert`, `apiData` (raw JSON from intercepted XHR responses containing "availability", "SeatMap", "blocks", or "seats" in the URL). The `start()` method is async but `_runLoop()` runs detached (not awaited), so it doesn't block the HTTP response.
 
 - **`public/`** — Static frontend (vanilla HTML/CSS/JS, no build step needed).
   - `index.html` — layout
@@ -48,24 +48,49 @@ Browser (dashboard)  ←──WebSocket──→  server.js  ←──events─�
 
 ## How availability detection works
 
-The ticketing site (`tickets.mhaifafc.com`) renders a seat map SVG. Available sections appear as `li.collection-item` elements with an `onclick` attribute calling `stadium.processSectorById(sectorId)`. Their text content contains the Hebrew "גוש X" (Block X) where X is the section number.
+The ticketing site (`tickets.mhaifafc.com`) renders a seat map SVG. Available sections appear as `li.collection-item` elements with an `onclick` attribute calling `stadium.processSectorById(sectorId)`. Their text content contains the Hebrew "גוש X" (Block X) where X is the visual section number.
 
 **Key insight:** Sold-out sections are *absent* from this list — no element exists for them at all. So detection is: read which section numbers appear in the list → present = available, absent = unavailable.
+
+**Two different IDs exist per section:**
+- **Visual label** — the small integer shown on the map and in the element text (e.g. `13`, `14`, `15`). This is what users type in the Manual Section Override field.
+- **Internal onclick ID** — a large integer used in `processSectorById()` (e.g. `1590`, `1591`, `1592`). This changes per event and is NOT the number to configure.
+
+The monitor extracts both and compares against the visual label (primary), with onclick ID as a fallback:
 
 ```javascript
 // In monitor.js _checkAvailability()
 Array.from(document.querySelectorAll('[onclick*="processSectorById"]'))
-  .map(el => { const m = el.textContent.match(/גוש\s*(\d+)/); return m ? m[1] : null; })
+  .map(el => {
+    const m = (el.getAttribute('onclick') || '').match(/processSectorById\((\d+)\)/);
+    if (!m) return null;
+    const labelMatch = el.textContent.trim().match(/(\d+)/);
+    return { id: m[1], label: labelMatch ? labelMatch[1] : m[1] };
+  })
   .filter(Boolean);
 ```
 
-**Section numbers** on this site are small integers (e.g. 12, 13, 16, 17…), NOT the 3-digit numbers shown in the `STADIUM_ZONES` object in `app.js`. The `STADIUM_ZONES` picker uses 3-digit display numbers (101–234); users who know their real section numbers should use the **Manual Section Override** field instead.
+The Live Log shows both: `Sections on page: [13 (id:1590), 14 (id:1591), 15 (id:1592)]`
+
+**Section numbers** to configure are the small integers visible on the map (e.g. 13, 14, 15), NOT the large onclick IDs, and NOT the 3-digit numbers in the `STADIUM_ZONES` object in `app.js` (those are fake display numbers for the zone picker UI). Use the **Manual Section Override** field with the visual map numbers.
 
 ## Settings and state
 
-- `settings.json` — persisted settings. `sections` array is what the monitor actually watches. `customSections` string is the raw input from the Manual Override field in the UI; if non-empty, it overrides the visual picker.
+- `settings.json` — persisted settings. Key fields:
+  - `sections` — array of section IDs the monitor actually watches (small integers)
+  - `customSections` — raw input from the Manual Override field; if non-empty, overrides the visual picker
+  - `intervalMs` — polling interval in ms (default 10000)
+  - `pauseOnHit` — stop monitoring automatically when tickets are found
+  - `headful` — run Chromium in visible window mode
+  - `proxyServer`, `proxyUsername`, `proxyPassword` — optional proxy
+  - `autoPurchase` — attempt to auto-click section and confirm the quantity dialog when available
+  - `desiredQuantity` — number of tickets to add to cart when auto-purchasing
 - `state.json` — Playwright `storageState` (cookies + localStorage). Created after first successful login. Required for the seat map to load on the event page — without it, the page redirects to the homepage.
 - Login URL is hardcoded to `https://auth.mhaifafc.com/` — there is no editable field for it.
+
+## Queue-it handling
+
+The monitor detects Queue-it overlays (`#queueit_overlay`, `[id*="queueit"]`, or `queue-it` in the URL) and sends a Telegram alert. It does not auto-skip the queue — detection is informational only.
 
 ## Important browser/Playwright notes
 

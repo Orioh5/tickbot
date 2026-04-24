@@ -68,7 +68,8 @@ function updateSelectedCount() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-const ws = new WebSocket(`ws://${location.host}`);
+const wsScheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
+const ws = new WebSocket(`${wsScheme}//${location.host}`);
 
 let startedAt      = null;
 let uptimeInterval = null;
@@ -349,6 +350,13 @@ ui.saveSettingsBtn.addEventListener('click', async () => {
   ui.saveSettingsBtn.disabled = false;
 });
 
+function buildNotifyText(message) {
+  const eventUrl  = $('cfgUrl') ? $('cfgUrl').value.trim() : '';
+  const loginUrl  = 'https://auth.mhaifafc.com/';
+  if (!eventUrl) return message;
+  return `${message}\n\n🔑 Login & go straight there:\n${loginUrl}?redirectUrl=${encodeURIComponent(eventUrl)}\n\n🎟️ Direct link (if already logged in):\n${eventUrl}`;
+}
+
 // Test Telegram
 ui.testTelegramBtn.addEventListener('click', async () => {
   const token  = $('cfgTelegramToken').value.trim();
@@ -366,7 +374,7 @@ ui.testTelegramBtn.addEventListener('click', async () => {
     const res  = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ chat_id: chatId, text: '🧪 MHFC Monitor — test message. Bot is working!' }),
+      body:    JSON.stringify({ chat_id: chatId, text: buildNotifyText('🧪 MHFC Monitor — test message. Bot is working!') }),
     });
     const data = await res.json();
 

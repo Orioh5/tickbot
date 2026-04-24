@@ -13,7 +13,9 @@ const app    = express();
 const server = http.createServer(app);
 const wss    = new WebSocket.Server({ server });
 
-const SETTINGS_PATH = path.join(__dirname, 'settings.json');
+const SETTINGS_PATH = process.env.DATA_DIR
+  ? path.join(process.env.DATA_DIR, 'settings.json')
+  : path.join(__dirname, 'settings.json');
 const PORT = process.env.PORT || 3000;
 
 // ── Settings ──────────────────────────────────────────────────────────────

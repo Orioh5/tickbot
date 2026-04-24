@@ -5,7 +5,9 @@ const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
 
-const STATE_PATH = path.join(__dirname, 'state.json');
+const STATE_PATH = process.env.DATA_DIR
+  ? path.join(process.env.DATA_DIR, 'state.json')
+  : path.join(__dirname, 'state.json');
 
 class Monitor extends EventEmitter {
   constructor() {
@@ -250,6 +252,9 @@ class Monitor extends EventEmitter {
       return;
     }
 
+    // Snapshot previous section statuses before this check cycle, so we can detect transitions
+    const prevSections = { ...this.sections };
+
     // Mark all as checking
     for (const s of this.settings.sections) {
       this.sections[s] = { status: 'checking' };
@@ -257,21 +262,34 @@ class Monitor extends EventEmitter {
     this.emit('sections', this.getSections());
 
     // Read available sections from the page — sections appear in the LI list only when available
-    // Extract section ID from the onclick attribute (language-agnostic, more reliable than parsing text)
+    // Extract BOTH the onclick internal ID and the visual block label from text content.
+    // The ticketing site uses large internal IDs (e.g. 1590) in onclick but shows small visual
+    // numbers (e.g. 13) on the map and in the element text ("גוש 13"). Users type visual numbers,
+    // so we compare against labels; onclick IDs are kept as a fallback for advanced users.
     const availableOnPage = await this.page.evaluate(() => {
       return Array.from(document.querySelectorAll('[onclick*="processSectorById"]'))
         .map(el => {
           const m = (el.getAttribute('onclick') || '').match(/processSectorById\((\d+)\)/);
-          return m ? m[1] : null;
+          if (!m) return null;
+          // Extract the visual block number from text content (e.g. "גוש 13" → "13")
+          const labelMatch = el.textContent.trim().match(/(\d+)/);
+          return { id: m[1], label: labelMatch ? labelMatch[1] : m[1] };
         })
         .filter(Boolean);
     }).catch(() => []);
 
-    this.log(`Sections on page: [${availableOnPage.join(', ') || 'none'}]`, 'info');
+    const onPageSummary = availableOnPage.length
+      ? availableOnPage.map(s => s.label !== s.id ? `${s.label} (id:${s.id})` : s.id).join(', ')
+      : 'none';
+    this.log(`Sections on page: [${onPageSummary}]`, 'info');
+
+    const availableLabels = new Set(availableOnPage.map(s => s.label));
+    const availableIds    = new Set(availableOnPage.map(s => s.id));
 
     for (const section of this.settings.sections) {
+      const sec = String(section);
       this.sections[section] = {
-        status: availableOnPage.includes(String(section)) ? 'available' : 'unavailable'
+        status: (availableLabels.has(sec) || availableIds.has(sec)) ? 'available' : 'unavailable'
       };
     }
 
@@ -280,21 +298,23 @@ class Monitor extends EventEmitter {
     this.emit('sections', this.getSections());
     this.emit('stats', this.getStats());
 
-    const available = Object.entries(this.sections)
-      .filter(([, v]) => v.status === 'available')
-      .map(([k]) => k);
+    // Detect state transitions — only alert when a section changes state, not on every check
+    const nowAvailable   = new Set(Object.entries(this.sections).filter(([, v]) => v.status === 'available').map(([k]) => k));
+    const wasAvailable   = new Set(Object.entries(prevSections).filter(([, v]) => v.status === 'available').map(([k]) => k));
+    const newlyAvailable   = [...nowAvailable].filter(k => !wasAvailable.has(k));
+    const newlyUnavailable = [...wasAvailable].filter(k => !nowAvailable.has(k));
 
-    if (available.length > 0) {
+    if (newlyAvailable.length > 0) {
       let purchased = false;
       if (this.settings.autoPurchase) {
-        purchased = await this._tryAutoPurchase(available[0]);
+        purchased = await this._tryAutoPurchase(newlyAvailable[0]);
       }
 
       this.stats.alerts++;
       this.emit('stats', this.getStats());
       const msg = purchased
-        ? `🛒 Tickets added to cart! Section ${available[0]} — complete checkout now!`
-        : `🎟️ Tickets available in sections: ${available.join(', ')}!`;
+        ? `🛒 Tickets added to cart! Section ${newlyAvailable[0]} — complete checkout now!`
+        : `🎟️ Tickets available in sections: ${newlyAvailable.join(', ')}!`;
       this.log(msg, 'alert');
       this.emit('alert', msg);
       await this._notify(msg);
@@ -304,7 +324,15 @@ class Monitor extends EventEmitter {
         this.running = false;
         this.emit('status', this.getStatus());
       }
-    } else {
+    } else if (newlyUnavailable.length > 0) {
+      // Tickets were available but are now gone — send one notification
+      const msg = `❌ Tickets no longer available in sections: ${newlyUnavailable.join(', ')}`;
+      this.log(msg, 'warning');
+      this.emit('alert', msg);
+      await this._notify(msg);
+    }
+
+    if (nowAvailable.size === 0 && newlyAvailable.length === 0) {
       this.log(`Check #${this.stats.checks}: No availability in ${this.settings.sections.length} sections`, 'info');
     }
   }
@@ -363,7 +391,7 @@ class Monitor extends EventEmitter {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           chat_id: s.telegramChatId,
-          text: `${message}\n\n${s.url}`,
+          text: `${message}\n\n🔑 Login & go straight there:\n${s.loginUrl}?redirectUrl=${encodeURIComponent(s.url)}\n\n🎟️ Direct link (if already logged in):\n${s.url}`,
         }),
       });
 
