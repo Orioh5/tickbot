@@ -1,0 +1,7 @@
+node_modules
+.git
+.env
+state.json
+settings.json
+docs
+*.md
