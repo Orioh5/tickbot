@@ -18,6 +18,7 @@ class Monitor extends EventEmitter {
     this.page = null;
     this.sections = {};
     this.stats = { checks: 0, alerts: 0, errors: 0, startedAt: null, lastCheck: null };
+    this._labelToOnclickId = {};
     this.settings = null;
     this._stopRequested = false;
   }
@@ -285,6 +286,12 @@ class Monitor extends EventEmitter {
 
     const availableLabels = new Set(availableOnPage.map(s => s.label));
     const availableIds    = new Set(availableOnPage.map(s => s.id));
+    // Map from visual label (and onclick ID) → internal onclick ID, for auto-purchase clicks
+    this._labelToOnclickId = {};
+    for (const s of availableOnPage) {
+      this._labelToOnclickId[s.label] = s.id;
+      this._labelToOnclickId[s.id]    = s.id;
+    }
 
     for (const section of this.settings.sections) {
       const sec = String(section);
@@ -342,8 +349,11 @@ class Monitor extends EventEmitter {
     try {
       this.log(`Auto-purchase: clicking section ${sectionId}...`, 'info');
 
+      // Resolve visual label → internal onclick ID (e.g. "13" → "1590")
+      const onclickId = (this._labelToOnclickId || {})[String(sectionId)] || String(sectionId);
+
       // Click the section element
-      const el = await this.page.$(`[onclick*="processSectorById(${sectionId})"]`);
+      const el = await this.page.$(`[onclick*="processSectorById(${onclickId})"]`);
       if (!el) {
         this.log('Auto-purchase: section element not found on page', 'warning');
         return false;
