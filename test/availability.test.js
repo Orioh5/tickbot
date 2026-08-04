@@ -206,6 +206,12 @@ test('auto-purchase opens the cart and returns the completed owner-assignment re
     goto: async url => { navigations.push(url); },
     url: () => 'https://tickets.mhaifafc.com/Transaction2/Edit',
     locator: selector => {
+      if (selector === '[onclick*="processSectorById(13)"]:visible') {
+        return {
+          count: async () => 1,
+          first: () => ({ click: async () => {} }),
+        };
+      }
       assert.equal(selector, '.transaction-ticket');
       return { count: async () => 1 };
     },
@@ -225,6 +231,51 @@ test('auto-purchase opens the cart and returns the completed owner-assignment re
   assert.deepEqual(navigations, ['https://tickets.mhaifafc.com/Transaction2/Edit']);
   assert.equal(ownerFlowCalls, 1);
   assert.deepEqual(statusPhases, ['cart-interaction', 'cart-verification', 'owner-selection']);
+});
+
+test('auto-purchase clicks the visible sector when a hidden duplicate appears first', async () => {
+  const monitor = new Monitor();
+  let hiddenClicks = 0;
+  let visibleClicks = 0;
+  monitor.running = true;
+  monitor._phase = 'monitoring';
+  monitor.settings = {
+    url: 'https://tickets.mhaifafc.com/Stadium/Index?eventId=5989',
+    loginUrl: 'https://auth.mhaifafc.com/',
+    desiredQuantity: 1,
+  };
+  monitor._labelToOnclickId = { 13: '1590' };
+  monitor.page = {
+    $: async () => ({
+      click: async () => {
+        hiddenClicks++;
+        throw new Error('hidden sector cannot be clicked');
+      },
+    }),
+    locator: selector => {
+      if (selector === '[onclick*="processSectorById(1590)"]:visible') {
+        return {
+          count: async () => 1,
+          first: () => ({ click: async () => { visibleClicks++; } }),
+        };
+      }
+      assert.equal(selector, '.transaction-ticket');
+      return { count: async () => 1 };
+    },
+    waitForSelector: async () => {},
+    click: async () => {},
+    goto: async () => {},
+    url: () => 'https://tickets.mhaifafc.com/Transaction2/Edit',
+  };
+  monitor._sleep = async () => {};
+  monitor._finishCartOwnerFlow = async () => ({ status: 'complete' });
+
+  assert.deepEqual(await monitor._tryAutoPurchase('13'), {
+    cartReady: true,
+    assignments: 'complete',
+  });
+  assert.equal(hiddenClicks, 0);
+  assert.equal(visibleClicks, 1);
 });
 
 function makeCartPage({ finalUrl, ticketCount, incrementFails = false, confirmFails = false }) {
@@ -249,6 +300,12 @@ function makeCartPage({ finalUrl, ticketCount, incrementFails = false, confirmFa
       goto: async () => { currentUrl = finalUrl; },
       url: () => currentUrl,
       locator: selector => {
+        if (selector === '[onclick*="processSectorById(13)"]:visible') {
+          return {
+            count: async () => 1,
+            first: () => ({ click: async () => { selectedSection = true; } }),
+          };
+        }
         assert.equal(selector, '.transaction-ticket');
         return { count: async () => ticketCount };
       },
@@ -405,7 +462,12 @@ test('auto-purchase returns a structured failure when the section cannot be clic
   monitor.running = true;
   monitor._phase = 'monitoring';
   monitor.settings = { desiredQuantity: 1 };
-  monitor.page = { $: async () => null };
+  monitor.page = {
+    locator: selector => {
+      assert.equal(selector, '[onclick*="processSectorById(13)"]:visible');
+      return { count: async () => 0 };
+    },
+  };
 
   assert.deepEqual(await monitor._tryAutoPurchase('13'), {
     cartReady: false,
