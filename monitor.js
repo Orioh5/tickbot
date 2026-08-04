@@ -640,32 +640,39 @@ class Monitor extends EventEmitter {
         return { cartReady: false, assignments: 'failed' };
       }
 
-      // Wait for the quantity dialog
-      await this.page.waitForSelector(
-        '.modal, [class*="dialog"], [class*="popup"], [class*="modal"]',
-        { timeout: 6000 }
-      );
-      await this._sleep(500);
+      // The stadium page opens this specific GA quantity dialog. Generic modal
+      // selectors also match permanent accessibility dialogs on the page.
+      await this.page.waitForSelector('#seatCountModal', {
+        state: 'visible',
+        timeout: 6000,
+      });
 
-      // Increase quantity if desired > 1
       const target = Math.max(1, this.settings.desiredQuantity || 1);
-      for (let i = 1; i < target; i++) {
-        await this.page.click(
-          'button:has-text("+"), [class*="plus"], [class*="increment"], [aria-label*="increase"]'
-        );
-        await this._sleep(300);
-      }
+      await this.page.locator('#scount').fill(String(target));
 
-      // Confirm the dialog
+      // #fnFastSeats posts the reservation and then navigates to the URL
+      // returned by the server. Wait for that official flow to finish instead
+      // of racing it with a separate page.goto().
       confirmationAttempted = true;
       this.running = false;
       this._setPhase('cart-verification');
-      await this.page.click(
-        'button:has-text("OK"), button:has-text("אישור"), button:has-text("✓"), [class*="confirm"], [class*="ok-btn"]'
-      );
+      const reservationResponsePromise = this.page.waitForResponse(response =>
+        response.url().includes('/Stadium/GetWglAutoSeats') &&
+        response.request().method() === 'POST',
+      { timeout: 45000 });
+      await this.page.click('#fnFastSeats');
+      const reservationResponse = await reservationResponsePromise;
+      if (!reservationResponse.ok()) {
+        throw new Error(`Seat reservation failed with HTTP ${reservationResponse.status()}`);
+      }
+      const reservation = await reservationResponse.json();
+      if (!reservation?.redirectUrl) {
+        throw new Error(reservation?.message || 'Seat reservation did not return a cart URL');
+      }
 
       const checkoutUrl = new URL('/Transaction2/Edit', this.settings.url).toString();
-      await this.page.goto(checkoutUrl, { waitUntil: 'networkidle', timeout: 45000 });
+      const reservationUrl = new URL(reservation.redirectUrl, this.settings.url).toString();
+      await this.page.waitForURL(reservationUrl, { waitUntil: 'networkidle', timeout: 45000 });
       await this._verifyCart(checkoutUrl, target);
 
       cartReady = true;

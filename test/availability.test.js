@@ -203,16 +203,15 @@ test('auto-purchase opens the cart and returns the completed owner-assignment re
     $: async () => ({ click: async () => {} }),
     evaluate: async () => true,
     waitForSelector: async () => {},
+    waitForResponse: async () => ({
+      ok: () => true,
+      json: async () => ({ redirectUrl: '/Transaction2/Edit' }),
+    }),
     click: async () => {},
-    goto: async url => { navigations.push(url); },
+    waitForURL: async url => { navigations.push(url); },
     url: () => 'https://tickets.mhaifafc.com/Transaction2/Edit',
     locator: selector => {
-      if (selector === '[onclick*="processSectorById(13)"]:visible') {
-        return {
-          count: async () => 1,
-          first: () => ({ click: async () => {} }),
-        };
-      }
+      if (selector === '#scount') return { fill: async () => {} };
       assert.equal(selector, '.transaction-ticket');
       return { count: async () => 1 };
     },
@@ -251,15 +250,19 @@ test('auto-purchase activates the zero-size sector list item through its DOM cli
       domClicks++;
       return true;
     },
+    waitForSelector: async () => {},
+    waitForResponse: async () => ({
+      ok: () => true,
+      json: async () => ({ redirectUrl: '/Transaction2/Edit' }),
+    }),
+    click: async () => {},
+    waitForURL: async () => {},
+    url: () => 'https://tickets.mhaifafc.com/Transaction2/Edit',
     locator: selector => {
-      if (selector.includes('processSectorById(1590)')) return { count: async () => 0 };
+      if (selector === '#scount') return { fill: async () => {} };
       assert.equal(selector, '.transaction-ticket');
       return { count: async () => 1 };
     },
-    waitForSelector: async () => {},
-    click: async () => {},
-    goto: async () => {},
-    url: () => 'https://tickets.mhaifafc.com/Transaction2/Edit',
   };
   monitor._sleep = async () => {};
   monitor._finishCartOwnerFlow = async () => ({ status: 'complete' });
@@ -269,6 +272,63 @@ test('auto-purchase activates the zero-size sector list item through its DOM cli
     assignments: 'complete',
   });
   assert.equal(domClicks, 1);
+});
+
+test('auto-purchase waits for the official fast-seat reservation redirect before verifying the cart', async () => {
+  const monitor = new Monitor();
+  const actions = [];
+  let currentUrl = 'https://tickets.mhaifafc.com/Stadium/Index?eventId=5989';
+  monitor.running = true;
+  monitor._phase = 'monitoring';
+  monitor.settings = {
+    url: currentUrl,
+    desiredQuantity: 2,
+  };
+  monitor.page = {
+    evaluate: async () => true,
+    waitForSelector: async (selector, options) => {
+      actions.push(['dialog', selector, options]);
+      assert.equal(selector, '#seatCountModal');
+      assert.equal(options.state, 'visible');
+    },
+    locator: selector => {
+      if (selector === '#scount') {
+        return { fill: async value => { actions.push(['quantity', value]); } };
+      }
+      assert.equal(selector, '.transaction-ticket');
+      return { count: async () => 2 };
+    },
+    waitForResponse: async predicate => {
+      const response = {
+        url: () => 'https://tickets.mhaifafc.com/Stadium/GetWglAutoSeats?eventId=5989',
+        request: () => ({ method: () => 'POST' }),
+        ok: () => true,
+        json: async () => ({ redirectUrl: '/Transaction2/Edit' }),
+      };
+      assert.equal(predicate(response), true);
+      actions.push(['reservation-response']);
+      return response;
+    },
+    click: async selector => { actions.push(['click', selector]); },
+    waitForURL: async url => {
+      actions.push(['redirect', url]);
+      currentUrl = url;
+    },
+    url: () => currentUrl,
+  };
+  monitor._finishCartOwnerFlow = async () => ({ status: 'complete' });
+
+  assert.deepEqual(await monitor._tryAutoPurchase('13'), {
+    cartReady: true,
+    assignments: 'complete',
+  });
+  assert.deepEqual(actions, [
+    ['dialog', '#seatCountModal', { state: 'visible', timeout: 6000 }],
+    ['quantity', '2'],
+    ['reservation-response'],
+    ['click', '#fnFastSeats'],
+    ['redirect', 'https://tickets.mhaifafc.com/Transaction2/Edit'],
+  ]);
 });
 
 function makeCartPage({ finalUrl, ticketCount, incrementFails = false, confirmFails = false }) {
@@ -285,22 +345,23 @@ function makeCartPage({ finalUrl, ticketCount, incrementFails = false, confirmFa
         return true;
       },
       waitForSelector: async () => {},
+      waitForResponse: async () => ({
+        ok: () => true,
+        json: async () => ({ redirectUrl: '/Transaction2/Edit' }),
+      }),
       click: async selector => {
-        if (selector.includes('has-text("+")')) {
-          increments++;
-          if (incrementFails) throw new Error('quantity increment failed');
-          return;
-        }
         if (confirmFails) throw new Error('confirmation failed');
         confirmed = true;
       },
-      goto: async () => { currentUrl = finalUrl; },
+      waitForURL: async () => { currentUrl = finalUrl; },
       url: () => currentUrl,
       locator: selector => {
-        if (selector === '[onclick*="processSectorById(13)"]:visible') {
+        if (selector === '#scount') {
           return {
-            count: async () => 1,
-            first: () => ({ click: async () => { selectedSection = true; } }),
+            fill: async value => {
+              increments = Number(value) - 1;
+              if (incrementFails) throw new Error('quantity increment failed');
+            },
           };
         }
         assert.equal(selector, '.transaction-ticket');
