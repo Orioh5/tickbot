@@ -148,6 +148,18 @@ test('monitor prerequisites require both a Telegram token and chat ID', () => {
     () => validateMonitorPrerequisites({ telegramToken: '', telegramChatId: '12345' }),
     /Telegram token and chat ID are required/
   );
+  assert.throws(
+    () => validateMonitorPrerequisites({ telegramToken: '   ', telegramChatId: '12345' }),
+    /Telegram token and chat ID are required/
+  );
+  assert.throws(
+    () => validateMonitorPrerequisites({ telegramToken: 'token', telegramChatId: '\t\n' }),
+    /Telegram token and chat ID are required/
+  );
+  assert.throws(
+    () => validateMonitorPrerequisites({ telegramToken: 123, telegramChatId: '12345' }),
+    /Telegram token and chat ID are required/
+  );
   assert.doesNotThrow(() => validateMonitorPrerequisites({
     telegramToken: 'token',
     telegramChatId: '12345',

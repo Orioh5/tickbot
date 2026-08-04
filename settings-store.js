@@ -114,7 +114,9 @@ function validateSettingsPatch(patch) {
 }
 
 function validateMonitorPrerequisites(settings) {
-  if (!settings.telegramToken || !settings.telegramChatId) {
+  const hasToken = typeof settings.telegramToken === 'string' && settings.telegramToken.trim();
+  const hasChatId = typeof settings.telegramChatId === 'string' && settings.telegramChatId.trim();
+  if (!hasToken || !hasChatId) {
     throw new SettingsValidationError('Telegram token and chat ID are required for owner selection');
   }
 }
