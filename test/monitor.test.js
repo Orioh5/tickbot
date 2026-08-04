@@ -14,6 +14,24 @@ function settings(overrides = {}) {
   };
 }
 
+test('refreshes for cart automation when legacy false finds a watched ticket', async () => {
+  const monitor = new Monitor();
+  let refreshReason = '';
+  monitor.running = true;
+  monitor.settings = { sections: ['116'], autoPurchase: false };
+  monitor.sections = { 116: { status: 'unavailable' } };
+  monitor._onclickIdToLabel = { 1648: '116' };
+  monitor._fetchApiAvailability = async () => ({
+    timestamp: null,
+    sectors: [{ id: '1648', freeSeats: 1 }],
+  });
+  monitor._refreshDomAvailability = async reason => { refreshReason = reason; };
+
+  await monitor._pollApiAvailability();
+
+  assert.match(refreshReason, /auto-purchase/i);
+});
+
 test('re-prompts without an owner rejected by the ticketing site', async () => {
   const monitor = new Monitor();
   monitor.running = true;
@@ -302,10 +320,11 @@ test('reports an empty successful sectors response without a JSON parser error',
   );
 });
 
-test('API polling updates a mapped visual section without reloading the page', async () => {
+test('API polling refreshes the DOM before cart automation for a newly available mapped section', async () => {
   const monitor = new Monitor();
   const notifications = [];
   let reloads = 0;
+  let domChecks = 0;
 
   monitor.running = true;
   monitor.settings = settings({ sections: ['116'] });
@@ -316,14 +335,16 @@ test('API polling updates a mapped visual section without reloading the page', a
     sectors: [{ id: '1648', freeSeats: 1 }],
   });
   monitor.page = { reload: async () => { reloads++; } };
+  monitor._sleep = async () => {};
+  monitor._checkAvailability = async () => { domChecks++; };
   monitor._notify = async message => notifications.push(message);
 
   await monitor._pollApiOrFallback();
 
-  assert.equal(reloads, 0);
-  assert.equal(monitor.sections[116].status, 'available');
-  assert.equal(monitor.sections[116].freeSeats, 1);
-  assert.equal(notifications.length, 1);
+  assert.equal(reloads, 1);
+  assert.equal(domChecks, 1);
+  assert.equal(monitor.sections[116].status, 'unavailable');
+  assert.equal(notifications.length, 0);
 });
 
 test('API polling refreshes the DOM once when an available internal ID is not mapped', async () => {

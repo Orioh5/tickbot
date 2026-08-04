@@ -350,7 +350,7 @@ class Monitor extends EventEmitter {
       freeSeats: sector.freeSeats,
     }));
 
-    const newlyAvailableForPurchase = this.settings.autoPurchase && availableSections.some(sector => {
+    const newlyAvailableForPurchase = availableSections.some(sector => {
       const watched = configured.has(sector.label) || configured.has(sector.id);
       const previous = this.sections[sector.label] || this.sections[sector.id];
       return watched && previous?.status !== 'available';
@@ -508,10 +508,7 @@ class Monitor extends EventEmitter {
     const newlyUnavailable = [...wasAvailable].filter(k => !nowAvailable.has(k));
 
     if (newlyAvailable.length > 0) {
-      let purchaseResult = { cartReady: false, assignments: 'failed' };
-      if (this.settings.autoPurchase) {
-        purchaseResult = await this._tryAutoPurchase(newlyAvailable[0]);
-      }
+      const purchaseResult = await this._tryAutoPurchase(newlyAvailable[0]);
 
       this.stats.alerts++;
       this.emit('stats', this.getStats());

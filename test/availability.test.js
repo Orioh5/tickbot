@@ -100,6 +100,7 @@ test('notifies only once while a section remains available', async () => {
   monitor.sections = { 13: { status: 'pending' } };
   monitor.page = { evaluate: async () => results.shift() };
   monitor._notify = async message => notifications.push(message);
+  monitor._tryAutoPurchase = async () => ({ cartReady: false, assignments: 'failed' });
 
   await monitor._checkAvailability();
   await monitor._checkAvailability();
@@ -232,4 +233,21 @@ test('availability does not send a second Telegram alert after the cart owner fl
   await monitor._applyAvailability([{ id: '1590', label: '13' }]);
 
   assert.deepEqual(notifications, ['✅ הסל מוכן לתשלום.']);
+});
+
+test('attempts cart insertion on a newly available watched section without an autoPurchase setting', async () => {
+  const monitor = new Monitor();
+  let attempted = '';
+  monitor.running = true;
+  monitor.settings = { sections: ['101'], pauseOnHit: false };
+  monitor.sections = { 101: { status: 'unavailable' } };
+  monitor._tryAutoPurchase = async section => {
+    attempted = section;
+    return { cartReady: true, assignments: 'complete' };
+  };
+  monitor._notify = async () => {};
+
+  await monitor._applyAvailability([{ id: '1614', label: '101' }]);
+
+  assert.equal(attempted, '101');
 });
