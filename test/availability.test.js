@@ -1,5 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 
 const Monitor = require('../monitor');
 
@@ -45,7 +47,24 @@ test('adds a direct cart link when tickets were added automatically', () => {
   );
 
   assert.match(text, /https:\/\/tickets\.mhaifafc\.com\/Transaction2\/Edit/);
+  assert.match(text, /Cart is ready/i);
+  assert.match(text, /continue to payment/i);
   assert.match(text, /eventId=5989/);
+});
+
+test('adds a neutral inspection link for an unverified cart without ready or payment wording', () => {
+  const text = Monitor.buildNotificationText(
+    {
+      url: 'https://tickets.mhaifafc.com/Stadium/Index?eventId=5989',
+      loginUrl: 'https://auth.mhaifafc.com/',
+    },
+    'Cart contents could not be verified',
+    { inspectCart: true }
+  );
+
+  assert.match(text, /https:\/\/tickets\.mhaifafc\.com\/Transaction2\/Edit/);
+  assert.match(text, /inspect it manually/i);
+  assert.doesNotMatch(text, /Cart is ready|continue to payment/i);
 });
 
 test('parses visual section labels and internal onclick IDs from page candidates', () => {
@@ -208,7 +227,7 @@ test('auto-purchase opens the cart and returns the completed owner-assignment re
   assert.deepEqual(statusPhases, ['cart-interaction', 'cart-verification', 'owner-selection']);
 });
 
-function makeCartPage({ finalUrl, ticketCount, incrementFails = false }) {
+function makeCartPage({ finalUrl, ticketCount, incrementFails = false, confirmFails = false }) {
   let selectedSection = false;
   let confirmed = false;
   let increments = 0;
@@ -224,6 +243,7 @@ function makeCartPage({ finalUrl, ticketCount, incrementFails = false }) {
           if (incrementFails) throw new Error('quantity increment failed');
           return;
         }
+        if (confirmFails) throw new Error('confirmation failed');
         confirmed = true;
       },
       goto: async () => { currentUrl = finalUrl; },
@@ -236,9 +256,15 @@ function makeCartPage({ finalUrl, ticketCount, incrementFails = false }) {
   };
 }
 
-async function runCartVerificationCase({ desiredQuantity, finalUrl, ticketCount, incrementFails }) {
+async function runCartVerificationCase({
+  desiredQuantity,
+  finalUrl,
+  ticketCount,
+  incrementFails,
+  confirmFails,
+}) {
   const monitor = new Monitor();
-  const cart = makeCartPage({ finalUrl, ticketCount, incrementFails });
+  const cart = makeCartPage({ finalUrl, ticketCount, incrementFails, confirmFails });
   let ownerFlowCalls = 0;
   const dashboardAlerts = [];
   monitor.running = true;
@@ -264,6 +290,26 @@ async function runCartVerificationCase({ desiredQuantity, finalUrl, ticketCount,
   };
 }
 
+function assertUnverifiedCartRecovery(run) {
+  const alert = run.dashboardAlerts.at(-1);
+  assert.equal(run.monitor.getStatus().phase, 'cart-recovery');
+  assert.match(alert, /\/Transaction2\/Edit/);
+  assert.match(alert, /inspect it manually/i);
+  assert.doesNotMatch(alert, /Cart is ready|continue to payment|מוכן לתשלום/i);
+}
+
+test('confirmation failure enters neutral manual cart recovery', async () => {
+  const run = await runCartVerificationCase({
+    desiredQuantity: 1,
+    finalUrl: 'https://tickets.mhaifafc.com/Transaction2/Edit',
+    ticketCount: 1,
+    confirmFails: true,
+  });
+  assert.deepEqual(run.result, { cartReady: false, assignments: 'manual' });
+  assert.equal(run.ownerFlowCalls(), 0);
+  assertUnverifiedCartRecovery(run);
+});
+
 test('does not accept an empty cart as a no-owner-required cart', async () => {
   const run = await runCartVerificationCase({
     desiredQuantity: 1,
@@ -274,7 +320,7 @@ test('does not accept an empty cart as a no-owner-required cart', async () => {
   assert.equal(run.ownerFlowCalls(), 0);
   assert.equal(run.monitor.running, false);
   assert.equal(run.monitor.getStatus().busy, true);
-  assert.match(run.dashboardAlerts.at(-1), /\/Transaction2\/Edit/);
+  assertUnverifiedCartRecovery(run);
 });
 
 test('does not accept a home redirect as a ready cart', async () => {
@@ -287,7 +333,7 @@ test('does not accept a home redirect as a ready cart', async () => {
   assert.equal(run.ownerFlowCalls(), 0);
   assert.equal(run.monitor.running, false);
   assert.equal(run.monitor.getStatus().busy, true);
-  assert.match(run.dashboardAlerts.at(-1), /\/Transaction2\/Edit/);
+  assertUnverifiedCartRecovery(run);
 });
 
 test('does not accept fewer cart tickets than requested', async () => {
@@ -300,7 +346,17 @@ test('does not accept fewer cart tickets than requested', async () => {
   assert.equal(run.ownerFlowCalls(), 0);
   assert.equal(run.monitor.running, false);
   assert.equal(run.monitor.getStatus().busy, true);
-  assert.match(run.dashboardAlerts.at(-1), /\/Transaction2\/Edit/);
+  assertUnverifiedCartRecovery(run);
+});
+
+test('dashboard keeps Start disabled on 409 and refreshes authoritative monitor status', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
+  assert.match(source, /async function refreshMonitorStatus\(\)/);
+  assert.match(source, /if \(res\.status === 409\) \{[\s\S]*?await refreshMonitorStatus\(\)/);
+  assert.doesNotMatch(
+    source,
+    /if \(res\.status === 409\) \{[\s\S]*?ui\.startBtn\.disabled = false;[\s\S]*?\}/
+  );
 });
 
 test('fails cart insertion when a requested quantity increment fails', async () => {

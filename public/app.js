@@ -130,6 +130,7 @@ function handleStatus(status) {
     monitoring: '● MONITORING',
     'cart-interaction': '● ADDING TO CART',
     'cart-verification': '● VERIFYING CART',
+    'cart-recovery': '● CHECK CART MANUALLY',
     'owner-selection': '● OWNER SELECTION',
     'cart-ready': '● CART READY',
     stopping: '● STOPPING',
@@ -164,6 +165,16 @@ function tickUptime() {
     : m > 0
     ? `${m}m ${sec}s`
     : `${sec}s`;
+}
+
+async function refreshMonitorStatus() {
+  const res = await fetch('/api/status');
+  if (!res.ok) throw new Error(`Status request failed (${res.status})`);
+  const snapshot = await res.json();
+  handleStatus(snapshot.status);
+  if (snapshot.sections) renderSections(snapshot.sections);
+  if (snapshot.stats) updateStats(snapshot.stats);
+  return snapshot.status;
 }
 
 // ── Stats ────────────────────────────────────────────────────────────────────
@@ -312,14 +323,24 @@ ui.startBtn.addEventListener('click', async () => {
   ui.startBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="10" fill="none" stroke="currentColor" stroke-width="2"><animateTransform attributeName="transform" type="rotate" from="0 12 12" to="360 12 12" dur="0.8s" repeatCount="indefinite"/></circle></svg> Starting…';
   try {
     const res  = await fetch('/api/monitor/start', { method: 'POST' });
-    const data = await res.json();
+    const data = await res.json().catch(() => ({}));
     if (!res.ok) {
-      addLog(`Failed to start: ${data.error}`, 'error');
-      ui.startBtn.disabled = false;
+      addLog(`Failed to start: ${data.error || `HTTP ${res.status}`}`, 'error');
+      if (res.status === 409) {
+        try {
+          await refreshMonitorStatus();
+        } catch (statusError) {
+          addLog(`Could not refresh monitor status: ${statusError.message}`, 'error');
+          ui.startBtn.disabled = true;
+          ui.stopBtn.disabled = false;
+        }
+      } else {
+        ui.startBtn.disabled = isRunning;
+      }
     }
   } catch (e) {
     addLog(`Failed to start: ${e.message}`, 'error');
-    ui.startBtn.disabled = false;
+    ui.startBtn.disabled = isRunning;
   }
   ui.startBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg> Start Monitoring';
 });

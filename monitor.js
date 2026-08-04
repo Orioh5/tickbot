@@ -50,11 +50,16 @@ function parseSectorsInfo(payload) {
   };
 }
 
-function buildNotificationText(settings, message, { checkoutReady = false } = {}) {
+function buildNotificationText(settings, message, {
+  checkoutReady = false,
+  inspectCart = false,
+} = {}) {
   const checkoutUrl = new URL('/Transaction2/Edit', settings.url).toString();
   const checkout = checkoutReady
     ? `\n\n💳 Cart is ready — continue to payment:\n${checkoutUrl}`
-    : '';
+    : (inspectCart
+      ? `\n\n🛒 Open the cart to inspect it manually:\n${checkoutUrl}`
+      : '');
   return `${message}${checkout}\n\n🔑 Login & go straight there:\n${settings.loginUrl}?redirectUrl=${encodeURIComponent(settings.url)}\n\n🎟️ Direct event link:\n${settings.url}`;
 }
 
@@ -661,11 +666,11 @@ class Monitor extends EventEmitter {
     } catch (e) {
       this.log(`Auto-purchase failed: ${e.message}`, 'error');
       if (confirmationAttempted) {
-        if (!this._stopRequested) this._setPhase('cart-ready');
+        if (!this._stopRequested) this._setPhase(cartReady ? 'cart-ready' : 'cart-recovery');
         const fallbackMessage = cartReady
           ? '⚠️ לא ניתן להשלים את השיוך אוטומטית. יש להשלים ידנית בסל.'
           : '⚠️ לא ניתן לאמת את תוכן הסל. יש לבדוק ולהשלים ידנית בסל.';
-        await this._sendCartRecovery(fallbackMessage);
+        await this._sendCartRecovery(fallbackMessage, { verifiedCart: cartReady });
         return { cartReady, assignments: 'manual' };
       }
       this._restoreScanningPhase(previousPhase);
@@ -747,13 +752,16 @@ class Monitor extends EventEmitter {
       ? messages.complete
       : (messages[result.reason] || messages.error);
     if (!this._stopRequested) this._setPhase('cart-ready');
-    await this._sendCartRecovery(message);
+    await this._sendCartRecovery(message, { verifiedCart: true });
     return result;
   }
 
-  async _sendCartRecovery(message) {
-    const dashboardText = buildNotificationText(this.settings, message, { checkoutReady: true });
-    const delivered = await this._notify(message, { checkoutReady: true });
+  async _sendCartRecovery(message, { verifiedCart = false } = {}) {
+    const notificationOptions = verifiedCart
+      ? { checkoutReady: true }
+      : { inspectCart: true };
+    const dashboardText = buildNotificationText(this.settings, message, notificationOptions);
+    const delivered = await this._notify(message, notificationOptions);
     if (!delivered) this._emitDashboardFallback(dashboardText);
     return delivered;
   }
