@@ -201,6 +201,7 @@ test('auto-purchase opens the cart and returns the completed owner-assignment re
   };
   monitor.page = {
     $: async () => ({ click: async () => {} }),
+    evaluate: async () => true,
     waitForSelector: async () => {},
     click: async () => {},
     goto: async url => { navigations.push(url); },
@@ -233,10 +234,9 @@ test('auto-purchase opens the cart and returns the completed owner-assignment re
   assert.deepEqual(statusPhases, ['cart-interaction', 'cart-verification', 'owner-selection']);
 });
 
-test('auto-purchase clicks the visible sector when a hidden duplicate appears first', async () => {
+test('auto-purchase activates the zero-size sector list item through its DOM click handler', async () => {
   const monitor = new Monitor();
-  let hiddenClicks = 0;
-  let visibleClicks = 0;
+  let domClicks = 0;
   monitor.running = true;
   monitor._phase = 'monitoring';
   monitor.settings = {
@@ -246,19 +246,13 @@ test('auto-purchase clicks the visible sector when a hidden duplicate appears fi
   };
   monitor._labelToOnclickId = { 13: '1590' };
   monitor.page = {
-    $: async () => ({
-      click: async () => {
-        hiddenClicks++;
-        throw new Error('hidden sector cannot be clicked');
-      },
-    }),
+    evaluate: async (_fn, onclickId) => {
+      assert.equal(onclickId, '1590');
+      domClicks++;
+      return true;
+    },
     locator: selector => {
-      if (selector === '[onclick*="processSectorById(1590)"]:visible') {
-        return {
-          count: async () => 1,
-          first: () => ({ click: async () => { visibleClicks++; } }),
-        };
-      }
+      if (selector.includes('processSectorById(1590)')) return { count: async () => 0 };
       assert.equal(selector, '.transaction-ticket');
       return { count: async () => 1 };
     },
@@ -274,8 +268,7 @@ test('auto-purchase clicks the visible sector when a hidden duplicate appears fi
     cartReady: true,
     assignments: 'complete',
   });
-  assert.equal(hiddenClicks, 0);
-  assert.equal(visibleClicks, 1);
+  assert.equal(domClicks, 1);
 });
 
 function makeCartPage({ finalUrl, ticketCount, incrementFails = false, confirmFails = false }) {
@@ -287,6 +280,10 @@ function makeCartPage({ finalUrl, ticketCount, incrementFails = false, confirmFa
     state: () => ({ selectedSection, confirmed, increments, currentUrl }),
     page: {
       $: async () => ({ click: async () => { selectedSection = true; } }),
+      evaluate: async () => {
+        selectedSection = true;
+        return true;
+      },
       waitForSelector: async () => {},
       click: async selector => {
         if (selector.includes('has-text("+")')) {
@@ -463,10 +460,7 @@ test('auto-purchase returns a structured failure when the section cannot be clic
   monitor._phase = 'monitoring';
   monitor.settings = { desiredQuantity: 1 };
   monitor.page = {
-    locator: selector => {
-      assert.equal(selector, '[onclick*="processSectorById(13)"]:visible');
-      return { count: async () => 0 };
-    },
+    evaluate: async () => false,
   };
 
   assert.deepEqual(await monitor._tryAutoPurchase('13'), {

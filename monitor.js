@@ -622,15 +622,23 @@ class Monitor extends EventEmitter {
       const onclickId = (this._labelToOnclickId || {})[String(sectionId)] || String(sectionId);
 
       // Click the section element
-      const sector = this.page.locator(
-        `[onclick*="processSectorById(${onclickId})"]:visible`
-      );
-      if (await sector.count() === 0) {
+      const sectorActivated = await this.page.evaluate(id => {
+        const sector = Array.from(
+          document.querySelectorAll('[onclick*="processSectorById"]')
+        ).find(element => {
+          const match = (element.getAttribute('onclick') || '')
+            .match(/processSectorById\((\d+)\)/);
+          return match?.[1] === String(id);
+        });
+        if (!sector) return false;
+        sector.click();
+        return true;
+      }, onclickId);
+      if (!sectorActivated) {
         this.log('Auto-purchase: section element not found on page', 'warning');
         this._restoreScanningPhase(previousPhase);
         return { cartReady: false, assignments: 'failed' };
       }
-      await sector.first().click();
 
       // Wait for the quantity dialog
       await this.page.waitForSelector(
