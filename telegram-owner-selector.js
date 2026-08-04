@@ -62,27 +62,60 @@ class TelegramOwnerSelector {
     if (signal?.aborted) return { status: 'cancelled' };
 
     const deadline = this.now() + this.timeoutMs;
-    while (this.now() < deadline) {
-      if (signal?.aborted) return { status: 'cancelled' };
-      const updates = await this._call('getUpdates', {
-        offset: this.updateOffset,
-        timeout: 20,
-        allowed_updates: ['callback_query'],
-      }, { signal });
-      for (const update of updates) {
-        this.updateOffset = Math.max(this.updateOffset, update.update_id + 1);
-        const query = update.callback_query;
-        if (!query) continue;
-        const [prefix, callbackNonce, candidateKey] = String(query.data || '').split(':');
-        if (
-          prefix !== 'owner' || callbackNonce !== nonce ||
-          String(query.message?.chat?.id) !== this.chatId || !allowed.has(candidateKey)
-        ) continue;
-        await this._call('answerCallbackQuery', { callback_query_id: query.id });
-        return { status: 'selected', candidateKey };
+    const timeoutMs = deadline - this.now();
+    if (timeoutMs <= 0) return { status: 'timeout' };
+    const deadlineController = new AbortController();
+    const pollController = new AbortController();
+    const abortPoll = () => pollController.abort();
+    signal?.addEventListener('abort', abortPoll, { once: true });
+    deadlineController.signal.addEventListener('abort', abortPoll, { once: true });
+    const deadlineTimer = setTimeout(() => deadlineController.abort(), timeoutMs);
+    deadlineTimer.unref?.();
+
+    try {
+      while (this.now() < deadline) {
+        if (signal?.aborted) return { status: 'cancelled' };
+        const timeout = new Promise(resolve => {
+          deadlineController.signal.addEventListener('abort', () => resolve(null), { once: true });
+        });
+        let updates;
+        try {
+          updates = await Promise.race([
+            this._call('getUpdates', {
+              offset: this.updateOffset,
+              timeout: 20,
+              allowed_updates: ['callback_query'],
+            }, { signal: pollController.signal }),
+            timeout,
+          ]);
+        } catch (error) {
+          if (signal?.aborted) return { status: 'cancelled' };
+          if (deadlineController.signal.aborted) return { status: 'timeout' };
+          throw error;
+        }
+        if (signal?.aborted) return { status: 'cancelled' };
+        if (deadlineController.signal.aborted || this.now() >= deadline) {
+          return { status: 'timeout' };
+        }
+        for (const update of updates) {
+          this.updateOffset = Math.max(this.updateOffset, update.update_id + 1);
+          const query = update.callback_query;
+          if (!query) continue;
+          const [prefix, callbackNonce, candidateKey] = String(query.data || '').split(':');
+          if (
+            prefix !== 'owner' || callbackNonce !== nonce ||
+            String(query.message?.chat?.id) !== this.chatId || !allowed.has(candidateKey)
+          ) continue;
+          await this._call('answerCallbackQuery', { callback_query_id: query.id });
+          return { status: 'selected', candidateKey };
+        }
       }
+      return { status: 'timeout' };
+    } finally {
+      clearTimeout(deadlineTimer);
+      signal?.removeEventListener('abort', abortPoll);
+      deadlineController.signal.removeEventListener('abort', abortPoll);
     }
-    return { status: 'timeout' };
   }
 }
 

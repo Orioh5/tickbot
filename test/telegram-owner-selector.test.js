@@ -80,17 +80,35 @@ test('ignores foreign chat, stale nonce, and unknown candidate callbacks', async
   );
 });
 
-test('returns timeout after 180000 ms without a valid callback', async () => {
+test('returns timeout when a poll returns a valid callback after 180000 ms', async () => {
   let clock = 0;
+  const methods = [];
   const selector = new TelegramOwnerSelector({
     token: 'test-token', chatId: '12345',
-    now: () => (clock += 180000),
-    fetchImpl: async () => ({ ok: true, json: async () => ({ ok: true, result: [] }) }),
+    nonceFactory: () => 'fixednonce',
+    now: () => clock,
+    fetchImpl: async url => {
+      const method = url.split('/').pop();
+      methods.push(method);
+      if (method === 'getUpdates') {
+        clock = 180000;
+        return { ok: true, json: async () => ({ ok: true, result: [{
+          update_id: 1,
+          callback_query: {
+            id: 'late-callback',
+            data: 'owner:fixednonce:a',
+            message: { chat: { id: 12345 } },
+          },
+        }] }) };
+      }
+      return { ok: true, json: async () => ({ ok: true, result: { message_id: 51 } }) };
+    },
   });
   assert.deepEqual(
     await selector.chooseOwner({ ticketNumber: 1, candidates: [{ key: 'a', name: 'בעלים א' }] }),
     { status: 'timeout' }
   );
+  assert.deepEqual(methods, ['sendMessage', 'getUpdates']);
 });
 
 test('returns cancelled without applying a late callback', async () => {
@@ -142,7 +160,7 @@ test('cancels an outstanding long poll and forwards its abort signal', async () 
     }),
     { status: 'cancelled' }
   );
-  assert.equal(pollSignal, controller.signal);
+  assert.equal(pollSignal.aborted, true);
 });
 
 test('returns an error result when Telegram rejects a request', async () => {
