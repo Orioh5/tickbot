@@ -31,6 +31,22 @@ test('removes an Arabic-decimal identity number from an owner display label', ()
   assert.equal(redactOwnerName('בעלים א (٠٠٠-٠٠٠-٠٠١)'), 'בעלים א');
 });
 
+test('removes a comma-separated trailing identity number from an owner display label', () => {
+  assert.equal(redactOwnerName('בעלים א (000,000,001)'), 'בעלים א');
+});
+
+test('removes a colon-separated trailing identity number from an owner display label', () => {
+  assert.equal(redactOwnerName('בעלים א (000:000:001)'), 'בעלים א');
+});
+
+test('removes an Arabic thousands-separated identity number from an owner display label', () => {
+  assert.equal(redactOwnerName('בעלים א (٠٠٠٬٠٠٠٬٠٠١)'), 'בעלים א');
+});
+
+test('keeps an ordinary short-number owner label', () => {
+  assert.equal(redactOwnerName('בעלים א 123'), 'בעלים א 123');
+});
+
 test('creates opaque keys while retaining identifiers only in memory', () => {
   assert.deepEqual(parseOwnerCandidates([
     { text: 'בעלים א (000000001)', identifier: '000000001' },
@@ -44,6 +60,12 @@ test('creates opaque keys while retaining identifiers only in memory', () => {
 test('omits candidates whose labels retain an identity-like decimal sequence', () => {
   assert.deepEqual(parseOwnerCandidates([
     { text: 'בעלים א מזהה 000-000-001 נוסף', identifier: '000000001' },
+  ]), []);
+});
+
+test('omits candidates with embedded punctuation-form identity-like decimal sequences', () => {
+  assert.deepEqual(parseOwnerCandidates([
+    { text: 'בעלים א 000,000,001 נוסף', identifier: '000000001' },
   ]), []);
 });
 

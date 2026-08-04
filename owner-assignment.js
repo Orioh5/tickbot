@@ -1,4 +1,4 @@
-const IDENTITY_SEQUENCE = /\p{Nd}(?:[\s\p{Pd}._/]*\p{Nd}){4,}/u;
+const IDENTITY_SEQUENCE = /\p{Nd}(?:[^\p{L}\p{N}]*\p{Nd}){4,}/u;
 const TRAILING_IDENTITY_SUFFIX = new RegExp(
   `\\s*(?:\\(\\s*)?(?:id\\s*:\\s*)?${IDENTITY_SEQUENCE.source}(?:\\s*\\))?\\s*$`,
   'iu'
