@@ -4,7 +4,12 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const { SettingsStore, validateSettingsPatch } = require('../settings-store');
+const {
+  SettingsStore,
+  defaultSettings,
+  validateMonitorPrerequisites,
+  validateSettingsPatch,
+} = require('../settings-store');
 
 function withTempStore(run) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mhfc-settings-test-'));
@@ -128,4 +133,33 @@ test('environment Telegram credentials stay fixed over saved dashboard values', 
   } finally {
     fs.rmSync(dataDir, { recursive: true, force: true });
   }
+});
+
+test('monitor prerequisites require both a Telegram token and chat ID', () => {
+  assert.throws(
+    () => validateMonitorPrerequisites({ telegramToken: '', telegramChatId: '' }),
+    /Telegram token and chat ID are required/
+  );
+  assert.throws(
+    () => validateMonitorPrerequisites({ telegramToken: 'token', telegramChatId: '' }),
+    /Telegram token and chat ID are required/
+  );
+  assert.throws(
+    () => validateMonitorPrerequisites({ telegramToken: '', telegramChatId: '12345' }),
+    /Telegram token and chat ID are required/
+  );
+  assert.doesNotThrow(() => validateMonitorPrerequisites({
+    telegramToken: 'token',
+    telegramChatId: '12345',
+  }));
+});
+
+test('legacy autoPurchase patches remain accepted but are not public settings', async () => {
+  assert.doesNotThrow(() => validateSettingsPatch({ autoPurchase: false }));
+  assert.equal('autoPurchase' in defaultSettings({}), false);
+
+  await withTempStore(store => {
+    store.update({ autoPurchase: false });
+    assert.equal('autoPurchase' in store.toPublic(), false);
+  });
 });

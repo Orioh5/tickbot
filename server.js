@@ -9,7 +9,11 @@ const WebSocket = require('ws');
 const crypto = require('crypto');
 const path = require('path');
 const Monitor = require('./monitor');
-const { SettingsStore, SettingsValidationError } = require('./settings-store');
+const {
+  SettingsStore,
+  SettingsValidationError,
+  validateMonitorPrerequisites,
+} = require('./settings-store');
 
 const app    = express();
 const server = http.createServer(app);
@@ -180,10 +184,12 @@ app.get('/api/status', (req, res) => {
 app.post('/api/monitor/start', async (req, res) => {
   const settings = loadSettings();
   try {
+    validateMonitorPrerequisites(settings);
     await monitor.start(settings);
     res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+  } catch (error) {
+    const status = error instanceof SettingsValidationError ? 400 : 500;
+    res.status(status).json({ error: error.message });
   }
 });
 

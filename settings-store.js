@@ -32,7 +32,6 @@ function defaultSettings(env = process.env) {
     proxyServer: '',
     proxyUsername: '',
     proxyPassword: '',
-    autoPurchase: false,
     desiredQuantity: 1,
   };
 }
@@ -112,6 +111,12 @@ function validateSettingsPatch(patch) {
   }
 
   return out;
+}
+
+function validateMonitorPrerequisites(settings) {
+  if (!settings.telegramToken || !settings.telegramChatId) {
+    throw new SettingsValidationError('Telegram token and chat ID are required for owner selection');
+  }
 }
 
 class SettingsStore {
@@ -210,6 +215,7 @@ class SettingsStore {
       out[`${field}Set`] = !!out[field];
       out[field] = '';
     }
+    delete out.autoPurchase;
     return out;
   }
 }
@@ -219,5 +225,6 @@ module.exports = {
   SettingsStore,
   SettingsValidationError,
   defaultSettings,
+  validateMonitorPrerequisites,
   validateSettingsPatch,
 };

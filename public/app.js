@@ -257,7 +257,6 @@ function fillForm(s) {
   $('cfgInterval').value       = Math.round((s.intervalMs || 10000) / 1000);
   $('cfgPauseOnHit').checked   = s.pauseOnHit !== false;
   $('cfgHeadful').checked      = !!s.headful;
-  $('cfgAutoPurchase').checked  = !!s.autoPurchase;
   $('cfgDesiredQuantity').value = s.desiredQuantity || 1;
   // Secrets are never sent to the browser — leave blank and hint whether one's saved.
   $('cfgTelegramToken').value       = '';
@@ -284,7 +283,6 @@ function readForm() {
     telegramChatId: $('cfgTelegramChatId').value.trim(),
     loginUsername:  $('cfgUsername').value.trim(),
     loginUrl:       'https://auth.mhaifafc.com/',
-    autoPurchase:    $('cfgAutoPurchase').checked,
     desiredQuantity: parseInt($('cfgDesiredQuantity').value, 10) || 1,
   };
   // Secret fields: only include if the user actually typed a new value — otherwise
