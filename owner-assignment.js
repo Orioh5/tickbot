@@ -75,8 +75,7 @@ async function discoverOwnerCandidates(page) {
   if (await buttons.count() === 0) return { required: false };
   const button = buttons.first();
   await button.click();
-  const discovered = await page.evaluate(() => {
-    const activeButton = document.querySelector('.transaction-ticket .fnAssignButton:not(.hide)');
+  const discovered = await button.evaluate(activeButton => {
     const dropdown = activeButton?.nextElementSibling;
     const ticket = activeButton?.closest('.transaction-ticket');
     return {

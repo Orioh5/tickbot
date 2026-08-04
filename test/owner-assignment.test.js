@@ -76,12 +76,77 @@ function makeOwnerPageFake({ assignmentRequired, owners = [] }) {
       assert.equal(selector, '.transaction-ticket .fnAssignButton:visible');
       return {
         count: async () => assignmentRequired ? 1 : 0,
-        first: () => ({ click: async () => { opened = true; } }),
+        first: () => ({
+          click: async () => { opened = true; },
+          evaluate: async () => {
+            assert.equal(opened, true);
+            return { ticketIndex: 0, items: owners };
+          },
+        }),
       };
     },
-    evaluate: async () => {
-      assert.equal(opened, true);
-      return { ticketIndex: 0, items: owners };
+    evaluate: async () => assert.fail('discovery must stay bound to the clicked locator'),
+  };
+}
+
+function makeLocatorBoundDiscoveryPageFake() {
+  const makeTicket = (owners, visible) => {
+    const dropdown = {
+      querySelectorAll: selector => {
+        assert.equal(selector, '.fnAssignDropdownItem');
+        return owners.map(owner => ({
+          textContent: owner.text,
+          dataset: { useridentifier: owner.identifier },
+        }));
+      },
+    };
+    const ticket = {};
+    const button = {
+      visible,
+      nextElementSibling: dropdown,
+      closest: selector => {
+        assert.equal(selector, '.transaction-ticket');
+        return ticket;
+      },
+    };
+    return { ticket, button };
+  };
+
+  const hidden = makeTicket([
+    { text: 'בעלים מוסתר (000000009)', identifier: '000000009' },
+  ], false);
+  const visible = makeTicket([
+    { text: 'בעלים נראה (000000001)', identifier: '000000001' },
+  ], true);
+  const tickets = [hidden, visible];
+  let clickedButton = null;
+
+  return {
+    document: {
+      querySelector: selector => {
+        assert.equal(selector, '.transaction-ticket .fnAssignButton:not(.hide)');
+        return hidden.button;
+      },
+      querySelectorAll: selector => {
+        assert.equal(selector, '.transaction-ticket');
+        return tickets.map(item => item.ticket);
+      },
+    },
+    page: {
+      locator: selector => {
+        assert.equal(selector, '.transaction-ticket .fnAssignButton:visible');
+        return {
+          count: async () => 1,
+          first: () => ({
+            click: async () => { clickedButton = visible.button; },
+            evaluate: async fn => {
+              assert.equal(clickedButton, visible.button);
+              return fn(visible.button);
+            },
+          }),
+        };
+      },
+      evaluate: async fn => fn(),
     },
   };
 }
@@ -105,6 +170,40 @@ test('discovers every owner from the active assignment dropdown', async () => {
     { key: '0', name: 'בעלים א' },
     { key: '1', name: 'בעלים ב' },
   ]);
+});
+
+test('binds owner discovery and application to the exact visible assignment button clicked', async () => {
+  const discoveryPage = makeLocatorBoundDiscoveryPageFake();
+  const previousDocument = global.document;
+  global.document = discoveryPage.document;
+  let candidate;
+  try {
+    const result = await discoverOwnerCandidates(discoveryPage.page);
+    candidate = result.candidates[0];
+    assert.deepEqual(candidate, {
+      key: '0',
+      name: 'בעלים נראה',
+      identifier: '000000001',
+      ticketIndex: 1,
+    });
+  } finally {
+    if (previousDocument === undefined) delete global.document;
+    else global.document = previousDocument;
+  }
+
+  const assignmentPage = makeTwoTicketPageFake();
+  global.document = assignmentPage.document;
+  try {
+    assert.deepEqual(
+      await applyOwnerCandidate(assignmentPage.page, candidate),
+      { status: 'rejected', reason: 'The ticketing site rejected this owner' }
+    );
+    assert.equal(assignmentPage.tickets[0].ticket.selected, false);
+    assert.equal(assignmentPage.tickets[1].ticket.selected, true);
+  } finally {
+    if (previousDocument === undefined) delete global.document;
+    else global.document = previousDocument;
+  }
 });
 
 function makeAssignmentPageFake({ responseOk, accepted }) {
