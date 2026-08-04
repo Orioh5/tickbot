@@ -205,7 +205,7 @@ test('auto-purchase opens the cart and returns the completed owner-assignment re
   });
   assert.deepEqual(navigations, ['https://tickets.mhaifafc.com/Transaction2/Edit']);
   assert.equal(ownerFlowCalls, 1);
-  assert.deepEqual(statusPhases, ['cart-interaction', 'owner-selection']);
+  assert.deepEqual(statusPhases, ['cart-interaction', 'cart-verification', 'owner-selection']);
 });
 
 function makeCartPage({ finalUrl, ticketCount, incrementFails = false }) {
@@ -240,6 +240,7 @@ async function runCartVerificationCase({ desiredQuantity, finalUrl, ticketCount,
   const monitor = new Monitor();
   const cart = makeCartPage({ finalUrl, ticketCount, incrementFails });
   let ownerFlowCalls = 0;
+  const dashboardAlerts = [];
   monitor.running = true;
   monitor._phase = 'monitoring';
   monitor.settings = {
@@ -253,10 +254,12 @@ async function runCartVerificationCase({ desiredQuantity, finalUrl, ticketCount,
     ownerFlowCalls++;
     return { status: 'complete' };
   };
+  monitor.on('alert', message => dashboardAlerts.push(message));
   return {
     monitor,
     cart,
     ownerFlowCalls: () => ownerFlowCalls,
+    dashboardAlerts,
     result: await monitor._tryAutoPurchase('13'),
   };
 }
@@ -267,8 +270,11 @@ test('does not accept an empty cart as a no-owner-required cart', async () => {
     finalUrl: 'https://tickets.mhaifafc.com/Transaction2/Edit',
     ticketCount: 0,
   });
-  assert.deepEqual(run.result, { cartReady: false, assignments: 'failed' });
+  assert.deepEqual(run.result, { cartReady: false, assignments: 'manual' });
   assert.equal(run.ownerFlowCalls(), 0);
+  assert.equal(run.monitor.running, false);
+  assert.equal(run.monitor.getStatus().busy, true);
+  assert.match(run.dashboardAlerts.at(-1), /\/Transaction2\/Edit/);
 });
 
 test('does not accept a home redirect as a ready cart', async () => {
@@ -277,8 +283,11 @@ test('does not accept a home redirect as a ready cart', async () => {
     finalUrl: 'https://tickets.mhaifafc.com/',
     ticketCount: 1,
   });
-  assert.deepEqual(run.result, { cartReady: false, assignments: 'failed' });
+  assert.deepEqual(run.result, { cartReady: false, assignments: 'manual' });
   assert.equal(run.ownerFlowCalls(), 0);
+  assert.equal(run.monitor.running, false);
+  assert.equal(run.monitor.getStatus().busy, true);
+  assert.match(run.dashboardAlerts.at(-1), /\/Transaction2\/Edit/);
 });
 
 test('does not accept fewer cart tickets than requested', async () => {
@@ -287,8 +296,11 @@ test('does not accept fewer cart tickets than requested', async () => {
     finalUrl: 'https://tickets.mhaifafc.com/Transaction2/Edit',
     ticketCount: 1,
   });
-  assert.deepEqual(run.result, { cartReady: false, assignments: 'failed' });
+  assert.deepEqual(run.result, { cartReady: false, assignments: 'manual' });
   assert.equal(run.ownerFlowCalls(), 0);
+  assert.equal(run.monitor.running, false);
+  assert.equal(run.monitor.getStatus().busy, true);
+  assert.match(run.dashboardAlerts.at(-1), /\/Transaction2\/Edit/);
 });
 
 test('fails cart insertion when a requested quantity increment fails', async () => {
@@ -334,6 +346,8 @@ test('accepts a verified cart that validly requires no owner assignment', async 
 
 test('auto-purchase returns a structured failure when the section cannot be clicked', async () => {
   const monitor = new Monitor();
+  monitor.running = true;
+  monitor._phase = 'monitoring';
   monitor.settings = { desiredQuantity: 1 };
   monitor.page = { $: async () => null };
 
@@ -341,6 +355,8 @@ test('auto-purchase returns a structured failure when the section cannot be clic
     cartReady: false,
     assignments: 'failed',
   });
+  assert.equal(monitor.running, true);
+  assert.equal(monitor.getStatus().phase, 'monitoring');
 });
 
 test('availability does not send a second Telegram alert after the cart owner flow', async () => {

@@ -198,6 +198,42 @@ test('restart stays blocked after Stop until the previous browser loop has fully
   assert.equal(monitor.getStatus().phase, 'stopped');
 });
 
+test('Stop during launch keeps restart blocked and cleans the stale launch before stopping', async () => {
+  const monitor = new Monitor();
+  let releaseLaunch;
+  const launchGate = new Promise(resolve => { releaseLaunch = resolve; });
+  let loopCalls = 0;
+  let browserCloses = 0;
+  const launchedBrowser = { close: async () => { browserCloses++; } };
+  monitor._launch = async () => {
+    await launchGate;
+    monitor.browser = launchedBrowser;
+    monitor.context = { flow: 'stale-launch' };
+    monitor.page = { flow: 'stale-launch' };
+  };
+  monitor._runLoop = async () => { loopCalls++; };
+
+  const firstStart = monitor.start(settings());
+  assert.equal(monitor.getStatus().phase, 'starting');
+  await monitor.stop();
+
+  assert.equal(monitor.getStatus().busy, true);
+  assert.equal(monitor.getStatus().phase, 'stopping');
+  await assert.rejects(monitor.start(settings()), /busy|active/i);
+
+  releaseLaunch();
+  await firstStart;
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.equal(loopCalls, 0);
+  assert.equal(browserCloses, 1);
+  assert.equal(monitor.browser, null);
+  assert.equal(monitor.context, null);
+  assert.equal(monitor.page, null);
+  assert.equal(monitor.getStatus().busy, false);
+  assert.equal(monitor.getStatus().phase, 'stopped');
+});
+
 test('stop cancels Telegram and closes the active browser while owner selection is busy', { timeout: 500 }, async () => {
   const monitor = new Monitor();
   let closed = 0;

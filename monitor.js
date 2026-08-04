@@ -90,6 +90,7 @@ class Monitor extends EventEmitter {
     this._phase = 'stopped';
     this._flowToken = null;
     this._loopPromise = null;
+    this._startInFlight = false;
   }
 
   log(message, level = 'info') {
@@ -101,7 +102,8 @@ class Monitor extends EventEmitter {
     const phase = this._phase === 'stopped' && this.running ? 'monitoring' : this._phase;
     return {
       running: this.running,
-      busy: this.running || phase !== 'stopped' || Boolean(this.browser) || Boolean(this._loopPromise),
+      busy: this.running || phase !== 'stopped' || Boolean(this.browser) ||
+        Boolean(this._loopPromise) || this._startInFlight,
       phase,
       startedAt: this.stats.startedAt,
       lastCheck: this.stats.lastCheck,
@@ -127,8 +129,12 @@ class Monitor extends EventEmitter {
     this._phase = 'stopped';
     this._flowToken = null;
     this._loopPromise = null;
+    this._startInFlight = false;
     this._ownerSelector = null;
     this._ownerSelectionAbort = null;
+    this.browser = null;
+    this.context = null;
+    this.page = null;
     this.emit('status', this.getStatus());
   }
 
@@ -140,16 +146,19 @@ class Monitor extends EventEmitter {
       throw error;
     }
 
+    const ownerSelectionAbort = new AbortController();
+    const ownerSelector = this._ownerSelectorFactory(settings);
     const flowToken = {};
-    this._flowToken = flowToken;
     this._stopRequested = false;
     this._queueDetected = false;
     this._sectorsInfoUrl = null;
     this._labelToOnclickId = {};
     this._onclickIdToLabel = {};
     this.settings = settings;
-    this._ownerSelectionAbort = new AbortController();
-    this._ownerSelector = this._ownerSelectorFactory(settings);
+    this._ownerSelectionAbort = ownerSelectionAbort;
+    this._ownerSelector = ownerSelector;
+    this._flowToken = flowToken;
+    this._startInFlight = true;
 
     // Init section states
     this.sections = {};
@@ -169,7 +178,17 @@ class Monitor extends EventEmitter {
 
     try {
       await this._launch();
+      const launchedBrowser = this.browser;
+      const launchIsStale = this._flowToken !== flowToken || this._stopRequested ||
+        this._ownerSelectionAbort !== ownerSelectionAbort;
+      if (launchIsStale) {
+        await this._cleanupBrowser(launchedBrowser, ownerSelectionAbort);
+        this._finalizeFlow(flowToken);
+        return;
+      }
+
       this.log('Browser ready. Starting monitoring loop...', 'success');
+      this._startInFlight = false;
       this._setPhase('monitoring');
       const loopPromise = this._runLoop(flowToken);
       this._loopPromise = loopPromise;
@@ -177,7 +196,7 @@ class Monitor extends EventEmitter {
     } catch (e) {
       this.log(`Failed to start browser: ${e.message}`, 'error');
       this.running = false;
-      await this._cleanupBrowser();
+      await this._cleanupBrowser(this.browser, ownerSelectionAbort);
       this._finalizeFlow(flowToken);
       throw e;
     }
@@ -188,6 +207,7 @@ class Monitor extends EventEmitter {
     const browser = this.browser;
     const ownerSelectionAbort = this._ownerSelectionAbort;
     const loopPromise = this._loopPromise;
+    const startInFlight = this._startInFlight;
     this._stopRequested = true;
     ownerSelectionAbort?.abort();
     if (!this.getStatus().busy && !browser) return;
@@ -195,7 +215,7 @@ class Monitor extends EventEmitter {
     this._setPhase('stopping');
 
     await this._cleanupBrowser(browser, ownerSelectionAbort);
-    if (!loopPromise) this._finalizeFlow(flowToken);
+    if (!loopPromise && !startInFlight) this._finalizeFlow(flowToken);
 
     this.log('Monitor stopped.', 'info');
   }
@@ -554,12 +574,15 @@ class Monitor extends EventEmitter {
 
       this.stats.alerts++;
       this.emit('stats', this.getStats());
+      const manualRecovery = purchaseResult.assignments === 'manual';
       const msg = purchaseResult.cartReady
         ? `🛒 Tickets added to cart! Section ${newlyAvailable[0]} — complete checkout now!`
-        : `🎟️ Tickets available in sections: ${newlyAvailable.join(', ')}!`;
+        : (manualRecovery
+          ? '⚠️ Cart contents could not be verified. Use the manual cart link to review it.'
+          : `🎟️ Tickets available in sections: ${newlyAvailable.join(', ')}!`);
       this.log(msg, 'alert');
       this.emit('alert', msg);
-      if (!purchaseResult.cartReady) {
+      if (!purchaseResult.cartReady && !manualRecovery) {
         await this._notify(msg);
       }
 
@@ -584,6 +607,7 @@ class Monitor extends EventEmitter {
   async _tryAutoPurchase(sectionId) {
     if (!this.page) return { cartReady: false, assignments: 'failed' };
     let cartReady = false;
+    let confirmationAttempted = false;
     const previousPhase = this._phase;
     try {
       this._setPhase('cart-interaction');
@@ -596,6 +620,7 @@ class Monitor extends EventEmitter {
       const el = await this.page.$(`[onclick*="processSectorById(${onclickId})"]`);
       if (!el) {
         this.log('Auto-purchase: section element not found on page', 'warning');
+        this._restoreScanningPhase(previousPhase);
         return { cartReady: false, assignments: 'failed' };
       }
       await el.click();
@@ -617,6 +642,9 @@ class Monitor extends EventEmitter {
       }
 
       // Confirm the dialog
+      confirmationAttempted = true;
+      this.running = false;
+      this._setPhase('cart-verification');
       await this.page.click(
         'button:has-text("OK"), button:has-text("אישור"), button:has-text("✓"), [class*="confirm"], [class*="ok-btn"]'
       );
@@ -626,27 +654,28 @@ class Monitor extends EventEmitter {
       await this._verifyCart(checkoutUrl, target);
 
       cartReady = true;
-      this.running = false;
       this._setPhase('owner-selection');
       this.log(`Auto-purchase: section ${sectionId} added to cart!`, 'success');
       const assignmentResult = await this._finishCartOwnerFlow();
       return { cartReady: true, assignments: assignmentResult.status };
     } catch (e) {
       this.log(`Auto-purchase failed: ${e.message}`, 'error');
-      if (cartReady) {
-        const fallbackMessage = '⚠️ לא ניתן להשלים את השיוך אוטומטית. יש להשלים ידנית בסל.';
-        const fallbackText = buildNotificationText(
-          this.settings,
-          fallbackMessage,
-          { checkoutReady: true }
-        );
-        const delivered = await this._notify(fallbackMessage, { checkoutReady: true });
-        if (!delivered) this._emitDashboardFallback(fallbackText);
-      } else if (!this._stopRequested && this.running) {
-        this._setPhase(previousPhase === 'stopped' ? 'monitoring' : previousPhase);
+      if (confirmationAttempted) {
+        if (!this._stopRequested) this._setPhase('cart-ready');
+        const fallbackMessage = cartReady
+          ? '⚠️ לא ניתן להשלים את השיוך אוטומטית. יש להשלים ידנית בסל.'
+          : '⚠️ לא ניתן לאמת את תוכן הסל. יש לבדוק ולהשלים ידנית בסל.';
+        await this._sendCartRecovery(fallbackMessage);
+        return { cartReady, assignments: 'manual' };
       }
-      return { cartReady, assignments: 'failed' };
+      this._restoreScanningPhase(previousPhase);
+      return { cartReady: false, assignments: 'failed' };
     }
+  }
+
+  _restoreScanningPhase(previousPhase) {
+    if (this._stopRequested || !this.running) return;
+    this._setPhase(previousPhase === 'stopped' ? 'monitoring' : previousPhase);
   }
 
   async _verifyCart(expectedCheckoutUrl, desiredQuantity) {
@@ -718,10 +747,15 @@ class Monitor extends EventEmitter {
       ? messages.complete
       : (messages[result.reason] || messages.error);
     if (!this._stopRequested) this._setPhase('cart-ready');
+    await this._sendCartRecovery(message);
+    return result;
+  }
+
+  async _sendCartRecovery(message) {
     const dashboardText = buildNotificationText(this.settings, message, { checkoutReady: true });
     const delivered = await this._notify(message, { checkoutReady: true });
     if (!delivered) this._emitDashboardFallback(dashboardText);
-    return result;
+    return delivered;
   }
 
   _emitDashboardFallback(notificationText) {

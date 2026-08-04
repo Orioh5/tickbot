@@ -129,6 +129,7 @@ function handleStatus(status) {
     starting: '● STARTING',
     monitoring: '● MONITORING',
     'cart-interaction': '● ADDING TO CART',
+    'cart-verification': '● VERIFYING CART',
     'owner-selection': '● OWNER SELECTION',
     'cart-ready': '● CART READY',
     stopping: '● STOPPING',
