@@ -1,9 +1,63 @@
+const IDENTITY_SEQUENCE = /\p{Nd}(?:[\s\p{Pd}._/]*\p{Nd}){4,}/u;
+const TRAILING_IDENTITY_SUFFIX = new RegExp(
+  `\\s*(?:\\(\\s*)?(?:id\\s*:\\s*)?${IDENTITY_SEQUENCE.source}(?:\\s*\\))?\\s*$`,
+  'iu'
+);
+const RESPONSE_TIMEOUT_MS = 5000;
+
 function redactOwnerName(displayText) {
   const redacted = String(displayText || '')
-    .replace(/\s*\(\s*(?:id\s*:\s*)?\d{5,}\s*\)\s*$/i, '')
-    .replace(/\s+(?:id\s*:\s*)?\d{5,}\s*$/i, '')
+    .replace(TRAILING_IDENTITY_SUFFIX, '')
     .trim();
-  return /\d{5,}/.test(redacted) ? '' : redacted;
+  return IDENTITY_SEQUENCE.test(redacted) ? '' : redacted;
+}
+
+function observeChangeIdentifierResponse(page) {
+  let listener;
+  let timeoutId;
+  let settled = false;
+  let resolvePromise;
+  let rejectPromise;
+
+  const cleanup = () => {
+    clearTimeout(timeoutId);
+    page.off('response', listener);
+  };
+  const settle = (response, error) => {
+    if (settled) return;
+    settled = true;
+    cleanup();
+    if (error) rejectPromise(error);
+    else resolvePromise(response);
+  };
+  const promise = new Promise((resolve, reject) => {
+    resolvePromise = resolve;
+    rejectPromise = reject;
+  });
+
+  listener = response => {
+    try {
+      if (
+        response.url().includes('/Transaction2/ChangeIdentifier') &&
+        response.request().method() === 'POST'
+      ) {
+        settle(response);
+      }
+    } catch (error) {
+      settle(null, error);
+    }
+  };
+  page.on('response', listener);
+  if (!settled) {
+    timeoutId = setTimeout(() => {
+      settle(null, new Error('Timed out waiting for ChangeIdentifier'));
+    }, RESPONSE_TIMEOUT_MS);
+  }
+
+  return {
+    promise,
+    cancel: () => settle(),
+  };
 }
 
 function parseOwnerCandidates(items) {
@@ -56,28 +110,31 @@ async function applyOwnerCandidate(page, candidate) {
   }, assignment);
   if (!available) throw new Error('Selected owner is no longer available');
 
-  const responsePromise = page.waitForResponse(response =>
-    response.url().includes('/Transaction2/ChangeIdentifier') &&
-    response.request().method() === 'POST'
-  );
-  const clicked = await page.evaluate(({ identifier, ticketIndex: index }) => {
-    const ticket = Array.from(document.querySelectorAll('.transaction-ticket'))[index];
-    const button = ticket?.querySelector('.fnAssignButton:not(.hide)');
-    if (!button) return false;
-    button.click();
-    const dropdown = button.nextElementSibling;
-    const target = Array.from(dropdown?.querySelectorAll('.fnAssignDropdownItem') || [])
-      .find(item => item.dataset.useridentifier === identifier);
-    if (!target) return false;
-    target.click();
-    return true;
-  }, assignment);
+  const responseObserver = observeChangeIdentifierResponse(page);
+  let clicked;
+  try {
+    clicked = await page.evaluate(({ identifier, ticketIndex: index }) => {
+      const ticket = Array.from(document.querySelectorAll('.transaction-ticket'))[index];
+      const button = ticket?.querySelector('.fnAssignButton:not(.hide)');
+      if (!button) return false;
+      button.click();
+      const dropdown = button.nextElementSibling;
+      const target = Array.from(dropdown?.querySelectorAll('.fnAssignDropdownItem') || [])
+        .find(item => item.dataset.useridentifier === identifier);
+      if (!target) return false;
+      target.click();
+      return true;
+    }, assignment);
+  } catch (error) {
+    responseObserver.cancel();
+    throw error;
+  }
   if (!clicked) {
-    responsePromise.catch(() => {});
+    responseObserver.cancel();
     throw new Error('Selected owner is no longer available');
   }
 
-  const response = await responsePromise;
+  const response = await responseObserver.promise;
   if (!response.ok()) throw new Error(`ChangeIdentifier returned HTTP ${response.status()}`);
   try {
     await page.waitForFunction(({ identifier, ticketIndex: index }) => {
