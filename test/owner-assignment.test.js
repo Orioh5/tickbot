@@ -71,6 +71,29 @@ test('omits candidates with embedded punctuation-form identity-like decimal sequ
 
 function makeOwnerPageFake({ assignmentRequired, owners = [] }) {
   let opened = false;
+  let evaluations = 0;
+  const dropdown = {
+    querySelectorAll: selector => {
+      assert.equal(selector, '.fnAssignDropdownItem');
+      return owners.map(owner => ({
+        textContent: owner.text,
+        dataset: { useridentifier: owner.identifier },
+      }));
+    },
+  };
+  const ticket = {
+    querySelector: selector => {
+      assert.equal(selector, '.fnIdentifier');
+      return { value: '', classList: { contains: () => false } };
+    },
+  };
+  const button = {
+    nextElementSibling: dropdown,
+    closest: selector => {
+      assert.equal(selector, '.transaction-ticket');
+      return ticket;
+    },
+  };
   return {
     locator: selector => {
       assert.equal(selector, '.transaction-ticket .fnAssignButton:visible');
@@ -78,9 +101,9 @@ function makeOwnerPageFake({ assignmentRequired, owners = [] }) {
         count: async () => assignmentRequired ? 1 : 0,
         first: () => ({
           click: async () => { opened = true; },
-          evaluate: async () => {
-            assert.equal(opened, true);
-            return { ticketIndex: 0, items: owners };
+          evaluate: async (fn, argument) => {
+            if (evaluations++ > 0) assert.equal(opened, true);
+            return fn(button, argument);
           },
         }),
       };
@@ -100,7 +123,12 @@ function makeLocatorBoundDiscoveryPageFake() {
         }));
       },
     };
-    const ticket = {};
+    const ticket = {
+      querySelector: selector => {
+        assert.equal(selector, '.fnIdentifier');
+        return { value: '', classList: { contains: () => false } };
+      },
+    };
     const button = {
       visible,
       nextElementSibling: dropdown,
@@ -120,6 +148,7 @@ function makeLocatorBoundDiscoveryPageFake() {
   ], true);
   const tickets = [hidden, visible];
   let clickedButton = null;
+  let evaluations = 0;
 
   return {
     document: {
@@ -139,9 +168,9 @@ function makeLocatorBoundDiscoveryPageFake() {
           count: async () => 1,
           first: () => ({
             click: async () => { clickedButton = visible.button; },
-            evaluate: async fn => {
-              assert.equal(clickedButton, visible.button);
-              return fn(visible.button);
+            evaluate: async (fn, argument) => {
+              if (evaluations++ > 0) assert.equal(clickedButton, visible.button);
+              return fn(visible.button, argument);
             },
           }),
         };
@@ -180,26 +209,11 @@ test('binds owner discovery and application to the exact visible assignment butt
   try {
     const result = await discoverOwnerCandidates(discoveryPage.page);
     candidate = result.candidates[0];
-    assert.deepEqual(candidate, {
-      key: '0',
-      name: 'בעלים נראה',
-      identifier: '000000001',
-      ticketIndex: 1,
-    });
-  } finally {
-    if (previousDocument === undefined) delete global.document;
-    else global.document = previousDocument;
-  }
-
-  const assignmentPage = makeTwoTicketPageFake();
-  global.document = assignmentPage.document;
-  try {
-    assert.deepEqual(
-      await applyOwnerCandidate(assignmentPage.page, candidate),
-      { status: 'rejected', reason: 'The ticketing site rejected this owner' }
-    );
-    assert.equal(assignmentPage.tickets[0].ticket.selected, false);
-    assert.equal(assignmentPage.tickets[1].ticket.selected, true);
+    assert.equal(candidate.key, '0');
+    assert.equal(candidate.name, 'בעלים נראה');
+    assert.equal(candidate.identifier, '000000001');
+    assert.equal(typeof candidate.ticketKey, 'string');
+    assert.equal('ticketIndex' in candidate, false);
   } finally {
     if (previousDocument === undefined) delete global.document;
     else global.document = previousDocument;
@@ -243,7 +257,9 @@ function makeAssignmentPageFake({ responseOk, accepted }) {
 test('reports assigned only after ChangeIdentifier and accepted DOM state', async () => {
   const page = makeAssignmentPageFake({ responseOk: true, accepted: true });
   assert.deepEqual(
-    await applyOwnerCandidate(page, { key: '0', name: 'בעלים א', identifier: '000000001' }),
+    await applyOwnerCandidate(page, {
+      key: '0', name: 'בעלים א', identifier: '000000001', ticketKey: 'ticket-a',
+    }),
     { status: 'assigned' }
   );
 });
@@ -251,7 +267,9 @@ test('reports assigned only after ChangeIdentifier and accepted DOM state', asyn
 test('reports rejected when the site keeps the identifier invalid', async () => {
   const page = makeAssignmentPageFake({ responseOk: true, accepted: false });
   assert.deepEqual(
-    await applyOwnerCandidate(page, { key: '0', name: 'בעלים א', identifier: '000000001' }),
+    await applyOwnerCandidate(page, {
+      key: '0', name: 'בעלים א', identifier: '000000001', ticketKey: 'ticket-a',
+    }),
     { status: 'rejected', reason: 'The ticketing site rejected this owner' }
   );
 });
@@ -267,7 +285,9 @@ test('does not register a response wait when the selected owner is no longer ava
   };
 
   await assert.rejects(
-    applyOwnerCandidate(page, { key: '0', name: 'בעלים א', identifier: '000000001', ticketIndex: 0 }),
+    applyOwnerCandidate(page, {
+      key: '0', name: 'בעלים א', identifier: '000000001', ticketKey: 'ticket-a',
+    }),
     /Selected owner is no longer available/
   );
   assert.equal(responseWaits, 0);
@@ -306,7 +326,7 @@ test('cleans response observation when the owner disappears after preflight', as
   try {
     await assert.rejects(
       applyOwnerCandidate(page, {
-        key: '0', name: 'בעלים א', identifier: '000000001', ticketIndex: 0,
+        key: '0', name: 'בעלים א', identifier: '000000001', ticketKey: 'ticket-a',
       }),
       /Selected owner is no longer available/
     );
@@ -342,7 +362,7 @@ test('cleans response observation when the click evaluation fails', async () => 
   try {
     await assert.rejects(
       applyOwnerCandidate(page, {
-        key: '0', name: 'בעלים א', identifier: '000000001', ticketIndex: 0,
+        key: '0', name: 'בעלים א', identifier: '000000001', ticketKey: 'ticket-a',
       }),
       /click evaluation failed/
     );
@@ -438,6 +458,7 @@ function makeTwoTicketPageFake() {
 
 test('verifies the owner assignment in the selected transaction ticket', async () => {
   const { page, document, tickets } = makeTwoTicketPageFake();
+  tickets[1].ticket.__mhfcOwnerFlowTicketKey = 'ticket-b';
   const previousDocument = global.document;
   global.document = document;
   try {
@@ -446,7 +467,7 @@ test('verifies the owner assignment in the selected transaction ticket', async (
         key: '0',
         name: 'בעלים א',
         identifier: '000000001',
-        ticketIndex: 1,
+        ticketKey: 'ticket-b',
       }),
       { status: 'rejected', reason: 'The ticketing site rejected this owner' }
     );
@@ -456,4 +477,189 @@ test('verifies the owner assignment in the selected transaction ticket', async (
     if (previousDocument === undefined) delete global.document;
     else global.document = previousDocument;
   }
+});
+
+function makeStatefulOwnerCart(ticketDefinitions) {
+  const listeners = new Set();
+  let tickets = ticketDefinitions.map((definition, index) => {
+    const ticket = {
+      label: definition.label,
+      selected: false,
+      opened: false,
+    };
+    const input = {
+      value: definition.assigned ? definition.identifier : '',
+      classList: { contains: className => className === 'invalid' ? !definition.accepted : false },
+    };
+    const target = {
+      textContent: definition.text,
+      dataset: { useridentifier: definition.identifier },
+      click: () => {
+        ticket.selected = true;
+        input.value = definition.identifier;
+      },
+    };
+    const dropdown = {
+      querySelectorAll: selector => {
+        assert.equal(selector, '.fnAssignDropdownItem');
+        return [target];
+      },
+    };
+    const button = {
+      classList: { contains: () => false },
+      nextElementSibling: dropdown,
+      closest: selector => {
+        assert.equal(selector, '.transaction-ticket');
+        return ticket;
+      },
+      click: () => { ticket.opened = true; },
+    };
+    ticket.querySelector = selector => {
+      if (selector === '.fnAssignButton:not(.hide)') return button;
+      if (selector === '.fnIdentifier') return input;
+      throw new Error(`Unexpected ticket selector: ${selector}`);
+    };
+    return { index, ticket, button, input, target };
+  });
+
+  const document = {
+    querySelectorAll: selector => {
+      if (selector === '.transaction-ticket') return tickets.map(item => item.ticket);
+      throw new Error(`Unexpected document selector: ${selector}`);
+    },
+  };
+  const response = {
+    url: () => 'https://tickets.mhaifafc.com/Transaction2/ChangeIdentifier',
+    request: () => ({ method: () => 'POST' }),
+    ok: () => true,
+    status: () => 200,
+  };
+
+  const locatorFor = item => ({
+    click: async () => { item.button.click(); },
+    evaluate: async (fn, argument) => fn(item.button, argument),
+  });
+  const page = {
+    locator: selector => {
+      assert.equal(selector, '.transaction-ticket .fnAssignButton:visible');
+      return {
+        count: async () => tickets.length,
+        first: () => locatorFor(tickets[0]),
+        nth: index => locatorFor(tickets[index]),
+      };
+    },
+    on: (event, listener) => {
+      assert.equal(event, 'response');
+      listeners.add(listener);
+    },
+    off: (event, listener) => {
+      assert.equal(event, 'response');
+      listeners.delete(listener);
+    },
+    evaluate: async (fn, argument) => {
+      const selectedBefore = tickets.some(item => item.ticket.selected);
+      const result = fn(argument);
+      const selectedAfter = tickets.some(item => item.ticket.selected);
+      if (!selectedBefore && selectedAfter) {
+        for (const listener of listeners) listener(response);
+      }
+      return result;
+    },
+    waitForFunction: async (fn, argument) => {
+      if (!fn(argument)) {
+        const error = new Error('timeout');
+        error.name = 'TimeoutError';
+        throw error;
+      }
+    },
+  };
+
+  return {
+    page,
+    document,
+    tickets: () => tickets,
+    reorder: order => { tickets = order.map(index => tickets[index]); },
+    replace: index => {
+      const old = tickets[index];
+      const replacement = makeStatefulOwnerCart([{
+        label: `${old.ticket.label}-replacement`,
+        text: old.target.textContent,
+        identifier: old.target.dataset.useridentifier,
+        accepted: true,
+      }]).tickets()[0];
+      tickets[index] = replacement;
+      return replacement;
+    },
+  };
+}
+
+async function withStatefulOwnerCart(cart, operation) {
+  const previousDocument = global.document;
+  global.document = cart.document;
+  try {
+    return await operation();
+  } finally {
+    if (previousDocument === undefined) delete global.document;
+    else global.document = previousDocument;
+  }
+}
+
+test('skips a verified assigned ticket even when its assignment button stays visible', async () => {
+  const cart = makeStatefulOwnerCart([
+    { label: 'first', text: 'בעלים א', identifier: 'owner-ref', accepted: true },
+    { label: 'second', text: 'בעלים ב', identifier: 'owner-ref', accepted: true },
+  ]);
+
+  await withStatefulOwnerCart(cart, async () => {
+    const first = await discoverOwnerCandidates(cart.page);
+    assert.equal(first.required, true);
+    assert.equal(typeof first.candidates[0].ticketKey, 'string');
+    assert.equal('ticketIndex' in first.candidates[0], false);
+    assert.deepEqual(await applyOwnerCandidate(cart.page, first.candidates[0]), { status: 'assigned' });
+
+    const second = await discoverOwnerCandidates(cart.page);
+    assert.equal(second.required, true);
+    assert.equal(second.candidates[0].name, 'בעלים ב');
+    assert.notEqual(second.candidates[0].ticketKey, first.candidates[0].ticketKey);
+  });
+});
+
+test('applies a selection to the same keyed ticket after the DOM order changes', async () => {
+  const cart = makeStatefulOwnerCart([
+    { label: 'first', text: 'בעלים א', identifier: 'owner-ref', accepted: true },
+    { label: 'second', text: 'בעלים א', identifier: 'owner-ref', accepted: true },
+  ]);
+
+  await withStatefulOwnerCart(cart, async () => {
+    const discovery = await discoverOwnerCandidates(cart.page);
+    const originalTicket = cart.tickets()[0].ticket;
+    const otherTicket = cart.tickets()[1].ticket;
+    cart.reorder([1, 0]);
+
+    assert.deepEqual(
+      await applyOwnerCandidate(cart.page, discovery.candidates[0]),
+      { status: 'assigned' }
+    );
+    assert.equal(originalTicket.selected, true);
+    assert.equal(otherTicket.selected, false);
+  });
+});
+
+test('fails closed when the keyed ticket is replaced before the callback is applied', async () => {
+  const cart = makeStatefulOwnerCart([
+    { label: 'first', text: 'בעלים א', identifier: 'owner-ref', accepted: true },
+  ]);
+
+  await withStatefulOwnerCart(cart, async () => {
+    const discovery = await discoverOwnerCandidates(cart.page);
+    const originalTicket = cart.tickets()[0].ticket;
+    const replacement = cart.replace(0);
+
+    await assert.rejects(
+      applyOwnerCandidate(cart.page, discovery.candidates[0]),
+      /no longer available|ticket/i
+    );
+    assert.equal(originalTicket.selected, false);
+    assert.equal(replacement.ticket.selected, false);
+  });
 });

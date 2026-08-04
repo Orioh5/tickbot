@@ -59,7 +59,7 @@ function buildNotificationText(settings, message, { checkoutReady = false } = {}
 }
 
 class Monitor extends EventEmitter {
-  constructor({ ownerSelectorFactory, ownerBrowser } = {}) {
+  constructor({ ownerSelectorFactory, ownerBrowser, notificationFetch } = {}) {
     super();
     this.running = false;
     this.browser = null;
@@ -86,6 +86,10 @@ class Monitor extends EventEmitter {
     };
     this._ownerSelector = null;
     this._ownerSelectionAbort = null;
+    this._notificationFetch = notificationFetch || fetch;
+    this._phase = 'stopped';
+    this._flowToken = null;
+    this._loopPromise = null;
   }
 
   log(message, level = 'info') {
@@ -94,7 +98,14 @@ class Monitor extends EventEmitter {
   }
 
   getStatus() {
-    return { running: this.running, startedAt: this.stats.startedAt, lastCheck: this.stats.lastCheck };
+    const phase = this._phase === 'stopped' && this.running ? 'monitoring' : this._phase;
+    return {
+      running: this.running,
+      busy: this.running || phase !== 'stopped' || Boolean(this.browser) || Boolean(this._loopPromise),
+      phase,
+      startedAt: this.stats.startedAt,
+      lastCheck: this.stats.lastCheck,
+    };
   }
 
   getSections() {
@@ -105,12 +116,32 @@ class Monitor extends EventEmitter {
     return { ...this.stats };
   }
 
+  _setPhase(phase) {
+    this._phase = phase;
+    this.emit('status', this.getStatus());
+  }
+
+  _finalizeFlow(flowToken = this._flowToken) {
+    if (flowToken && this._flowToken !== flowToken) return;
+    this.running = false;
+    this._phase = 'stopped';
+    this._flowToken = null;
+    this._loopPromise = null;
+    this._ownerSelector = null;
+    this._ownerSelectionAbort = null;
+    this.emit('status', this.getStatus());
+  }
+
   async start(settings) {
-    if (this.running) {
-      this.log('Monitor is already running', 'warning');
-      return;
+    if (this.getStatus().busy) {
+      const error = new Error('Monitor is busy with an active browser or cart flow');
+      error.code = 'MONITOR_BUSY';
+      this.log(error.message, 'warning');
+      throw error;
     }
 
+    const flowToken = {};
+    this._flowToken = flowToken;
     this._stopRequested = false;
     this._queueDetected = false;
     this._sectorsInfoUrl = null;
@@ -128,6 +159,7 @@ class Monitor extends EventEmitter {
 
     this.stats = { checks: 0, alerts: 0, errors: 0, startedAt: new Date().toISOString(), lastCheck: null };
     this.running = true;
+    this._phase = 'starting';
 
     this.emit('status', this.getStatus());
     this.emit('sections', this.getSections());
@@ -138,26 +170,34 @@ class Monitor extends EventEmitter {
     try {
       await this._launch();
       this.log('Browser ready. Starting monitoring loop...', 'success');
-      this._runLoop(); // intentionally not awaited
+      this._setPhase('monitoring');
+      const loopPromise = this._runLoop(flowToken);
+      this._loopPromise = loopPromise;
+      void loopPromise.finally(() => this._finalizeFlow(flowToken)).catch(() => {});
     } catch (e) {
       this.log(`Failed to start browser: ${e.message}`, 'error');
       this.running = false;
       await this._cleanupBrowser();
-      this.emit('status', this.getStatus());
+      this._finalizeFlow(flowToken);
       throw e;
     }
   }
 
   async stop() {
+    const flowToken = this._flowToken;
+    const browser = this.browser;
+    const ownerSelectionAbort = this._ownerSelectionAbort;
+    const loopPromise = this._loopPromise;
     this._stopRequested = true;
-    this._ownerSelectionAbort?.abort();
-    if (!this.running && !this.browser) return;
+    ownerSelectionAbort?.abort();
+    if (!this.getStatus().busy && !browser) return;
     this.running = false;
+    this._setPhase('stopping');
 
-    await this._cleanupBrowser();
+    await this._cleanupBrowser(browser, ownerSelectionAbort);
+    if (!loopPromise) this._finalizeFlow(flowToken);
 
     this.log('Monitor stopped.', 'info');
-    this.emit('status', this.getStatus());
   }
 
   async _cleanupBrowser(
@@ -374,14 +414,16 @@ class Monitor extends EventEmitter {
     }
   }
 
-  async _runLoop() {
+  async _runLoop(flowToken = null) {
     let consecutiveErrors = 0;
     let navigated = false;
     const loopBrowser = this.browser;
     const loopOwnerSelectionAbort = this._ownerSelectionAbort;
 
     try {
-      while (this.running && !this._stopRequested) {
+      const flowIsActive = () => this.running && !this._stopRequested &&
+        (!flowToken || this._flowToken === flowToken);
+      while (flowIsActive()) {
         try {
           if (!navigated) {
             this.log('Loading event page...', 'info');
@@ -395,7 +437,7 @@ class Monitor extends EventEmitter {
           consecutiveErrors = 0;
 
         } catch (e) {
-          if (!this.running) break;
+          if (!flowIsActive()) break;
           consecutiveErrors++;
           this.stats.errors++;
           this.emit('stats', this.getStats());
@@ -403,13 +445,13 @@ class Monitor extends EventEmitter {
 
           if (consecutiveErrors >= 3) {
             this.log('Too many errors — waiting 60s before retry...', 'warning');
-            for (let i = 0; i < 60 && this.running; i++) await this._sleep(1000);
+            for (let i = 0; i < 60 && flowIsActive(); i++) await this._sleep(1000);
             consecutiveErrors = 0;
             navigated = false;
           }
         }
 
-        if (this.running) await this._sleep(this.settings.intervalMs);
+        if (flowIsActive()) await this._sleep(this.settings.intervalMs);
       }
     } finally {
       await this._cleanupBrowser(loopBrowser, loopOwnerSelectionAbort);
@@ -542,7 +584,9 @@ class Monitor extends EventEmitter {
   async _tryAutoPurchase(sectionId) {
     if (!this.page) return { cartReady: false, assignments: 'failed' };
     let cartReady = false;
+    const previousPhase = this._phase;
     try {
+      this._setPhase('cart-interaction');
       this.log(`Auto-purchase: clicking section ${sectionId}...`, 'info');
 
       // Resolve visual label → internal onclick ID (e.g. "13" → "1590")
@@ -568,7 +612,7 @@ class Monitor extends EventEmitter {
       for (let i = 1; i < target; i++) {
         await this.page.click(
           'button:has-text("+"), [class*="plus"], [class*="increment"], [aria-label*="increase"]'
-        ).catch(() => {});
+        );
         await this._sleep(300);
       }
 
@@ -577,24 +621,46 @@ class Monitor extends EventEmitter {
         'button:has-text("OK"), button:has-text("אישור"), button:has-text("✓"), [class*="confirm"], [class*="ok-btn"]'
       );
 
-      cartReady = true;
-      this.running = false;
-      this.emit('status', this.getStatus());
-      this.log(`Auto-purchase: section ${sectionId} added to cart!`, 'success');
       const checkoutUrl = new URL('/Transaction2/Edit', this.settings.url).toString();
       await this.page.goto(checkoutUrl, { waitUntil: 'networkidle', timeout: 45000 });
+      await this._verifyCart(checkoutUrl, target);
+
+      cartReady = true;
+      this.running = false;
+      this._setPhase('owner-selection');
+      this.log(`Auto-purchase: section ${sectionId} added to cart!`, 'success');
       const assignmentResult = await this._finishCartOwnerFlow();
       return { cartReady: true, assignments: assignmentResult.status };
     } catch (e) {
       this.log(`Auto-purchase failed: ${e.message}`, 'error');
       if (cartReady) {
-        await this._notify(
-          '⚠️ לא ניתן להשלים את השיוך אוטומטית. יש להשלים ידנית בסל.',
+        const fallbackMessage = '⚠️ לא ניתן להשלים את השיוך אוטומטית. יש להשלים ידנית בסל.';
+        const fallbackText = buildNotificationText(
+          this.settings,
+          fallbackMessage,
           { checkoutReady: true }
         );
+        const delivered = await this._notify(fallbackMessage, { checkoutReady: true });
+        if (!delivered) this._emitDashboardFallback(fallbackText);
+      } else if (!this._stopRequested && this.running) {
+        this._setPhase(previousPhase === 'stopped' ? 'monitoring' : previousPhase);
       }
       return { cartReady, assignments: 'failed' };
     }
+  }
+
+  async _verifyCart(expectedCheckoutUrl, desiredQuantity) {
+    const actualUrl = new URL(this.page.url());
+    const expectedUrl = new URL(expectedCheckoutUrl);
+    if (actualUrl.origin !== expectedUrl.origin || actualUrl.pathname !== expectedUrl.pathname) {
+      throw new Error('Cart navigation was redirected away from the expected cart');
+    }
+
+    const ticketCount = await this.page.locator('.transaction-ticket').count();
+    if (ticketCount < desiredQuantity) {
+      throw new Error(`Cart contains ${ticketCount} ticket(s), expected at least ${desiredQuantity}`);
+    }
+    return ticketCount;
   }
 
   async _completeOwnerAssignments() {
@@ -651,34 +717,46 @@ class Monitor extends EventEmitter {
     const message = result.status === 'complete'
       ? messages.complete
       : (messages[result.reason] || messages.error);
-    await this._notify(message, { checkoutReady: true });
+    if (!this._stopRequested) this._setPhase('cart-ready');
+    const dashboardText = buildNotificationText(this.settings, message, { checkoutReady: true });
+    const delivered = await this._notify(message, { checkoutReady: true });
+    if (!delivered) this._emitDashboardFallback(dashboardText);
     return result;
+  }
+
+  _emitDashboardFallback(notificationText) {
+    this.log(notificationText, 'warning');
+    this.emit('alert', notificationText);
   }
 
   // ── Notifications ─────────────────────────────────────────────────────────
 
   async _notify(message, options = {}) {
     const s = this.settings;
-    if (!s.telegramToken || !s.telegramChatId) return;
+    const notificationText = buildNotificationText(s, message, options);
+    if (!s.telegramToken || !s.telegramChatId) return false;
 
     try {
-      const res = await fetch(`https://api.telegram.org/bot${s.telegramToken}/sendMessage`, {
+      const res = await this._notificationFetch(`https://api.telegram.org/bot${s.telegramToken}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           chat_id: s.telegramChatId,
-          text: buildNotificationText(s, message, options),
+          text: notificationText,
         }),
       });
 
       if (res.ok) {
         this.log('Telegram notification sent ✓', 'success');
+        return true;
       } else {
         const data = await res.json();
         this.log(`Telegram error: ${data.description || res.statusText}`, 'error');
+        return false;
       }
     } catch (e) {
       this.log(`Telegram failed: ${e.message}`, 'error');
+      return false;
     }
   }
 

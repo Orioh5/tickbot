@@ -173,7 +173,7 @@ test('auto-purchase opens the cart and returns the completed owner-assignment re
   const monitor = new Monitor();
   const navigations = [];
   let ownerFlowCalls = 0;
-  let statusEvents = 0;
+  const statusPhases = [];
 
   monitor.running = true;
   monitor.settings = {
@@ -185,6 +185,11 @@ test('auto-purchase opens the cart and returns the completed owner-assignment re
     waitForSelector: async () => {},
     click: async () => {},
     goto: async url => { navigations.push(url); },
+    url: () => 'https://tickets.mhaifafc.com/Transaction2/Edit',
+    locator: selector => {
+      assert.equal(selector, '.transaction-ticket');
+      return { count: async () => 1 };
+    },
   };
   monitor._sleep = async () => {};
   monitor._finishCartOwnerFlow = async () => {
@@ -192,7 +197,7 @@ test('auto-purchase opens the cart and returns the completed owner-assignment re
     assert.equal(monitor.running, false);
     return { status: 'complete' };
   };
-  monitor.on('status', () => { statusEvents++; });
+  monitor.on('status', status => { statusPhases.push(status.phase); });
 
   assert.deepEqual(await monitor._tryAutoPurchase('13'), {
     cartReady: true,
@@ -200,7 +205,131 @@ test('auto-purchase opens the cart and returns the completed owner-assignment re
   });
   assert.deepEqual(navigations, ['https://tickets.mhaifafc.com/Transaction2/Edit']);
   assert.equal(ownerFlowCalls, 1);
-  assert.equal(statusEvents, 1);
+  assert.deepEqual(statusPhases, ['cart-interaction', 'owner-selection']);
+});
+
+function makeCartPage({ finalUrl, ticketCount, incrementFails = false }) {
+  let selectedSection = false;
+  let confirmed = false;
+  let increments = 0;
+  let currentUrl = 'https://tickets.mhaifafc.com/Stadium/Index?eventId=5989';
+  return {
+    state: () => ({ selectedSection, confirmed, increments, currentUrl }),
+    page: {
+      $: async () => ({ click: async () => { selectedSection = true; } }),
+      waitForSelector: async () => {},
+      click: async selector => {
+        if (selector.includes('has-text("+")')) {
+          increments++;
+          if (incrementFails) throw new Error('quantity increment failed');
+          return;
+        }
+        confirmed = true;
+      },
+      goto: async () => { currentUrl = finalUrl; },
+      url: () => currentUrl,
+      locator: selector => {
+        assert.equal(selector, '.transaction-ticket');
+        return { count: async () => ticketCount };
+      },
+    },
+  };
+}
+
+async function runCartVerificationCase({ desiredQuantity, finalUrl, ticketCount, incrementFails }) {
+  const monitor = new Monitor();
+  const cart = makeCartPage({ finalUrl, ticketCount, incrementFails });
+  let ownerFlowCalls = 0;
+  monitor.running = true;
+  monitor._phase = 'monitoring';
+  monitor.settings = {
+    url: 'https://tickets.mhaifafc.com/Stadium/Index?eventId=5989',
+    loginUrl: 'https://auth.mhaifafc.com/',
+    desiredQuantity,
+  };
+  monitor.page = cart.page;
+  monitor._sleep = async () => {};
+  monitor._finishCartOwnerFlow = async () => {
+    ownerFlowCalls++;
+    return { status: 'complete' };
+  };
+  return {
+    monitor,
+    cart,
+    ownerFlowCalls: () => ownerFlowCalls,
+    result: await monitor._tryAutoPurchase('13'),
+  };
+}
+
+test('does not accept an empty cart as a no-owner-required cart', async () => {
+  const run = await runCartVerificationCase({
+    desiredQuantity: 1,
+    finalUrl: 'https://tickets.mhaifafc.com/Transaction2/Edit',
+    ticketCount: 0,
+  });
+  assert.deepEqual(run.result, { cartReady: false, assignments: 'failed' });
+  assert.equal(run.ownerFlowCalls(), 0);
+});
+
+test('does not accept a home redirect as a ready cart', async () => {
+  const run = await runCartVerificationCase({
+    desiredQuantity: 1,
+    finalUrl: 'https://tickets.mhaifafc.com/',
+    ticketCount: 1,
+  });
+  assert.deepEqual(run.result, { cartReady: false, assignments: 'failed' });
+  assert.equal(run.ownerFlowCalls(), 0);
+});
+
+test('does not accept fewer cart tickets than requested', async () => {
+  const run = await runCartVerificationCase({
+    desiredQuantity: 2,
+    finalUrl: 'https://tickets.mhaifafc.com/Transaction2/Edit',
+    ticketCount: 1,
+  });
+  assert.deepEqual(run.result, { cartReady: false, assignments: 'failed' });
+  assert.equal(run.ownerFlowCalls(), 0);
+});
+
+test('fails cart insertion when a requested quantity increment fails', async () => {
+  const run = await runCartVerificationCase({
+    desiredQuantity: 2,
+    finalUrl: 'https://tickets.mhaifafc.com/Transaction2/Edit',
+    ticketCount: 1,
+    incrementFails: true,
+  });
+  assert.deepEqual(run.result, { cartReady: false, assignments: 'failed' });
+  assert.equal(run.ownerFlowCalls(), 0);
+});
+
+test('accepts a verified cart that validly requires no owner assignment', async () => {
+  const monitor = new Monitor();
+  const cart = makeCartPage({
+    finalUrl: 'https://tickets.mhaifafc.com/Transaction2/Edit',
+    ticketCount: 1,
+  });
+  let prompts = 0;
+  monitor.running = true;
+  monitor._phase = 'monitoring';
+  monitor.settings = {
+    url: 'https://tickets.mhaifafc.com/Stadium/Index?eventId=5989',
+    loginUrl: 'https://auth.mhaifafc.com/',
+    telegramToken: 'test-token',
+    telegramChatId: '12345',
+    desiredQuantity: 1,
+  };
+  monitor.page = cart.page;
+  monitor._sleep = async () => {};
+  monitor._ownerSelectionAbort = new AbortController();
+  monitor._ownerSelector = { chooseOwner: async () => { prompts++; } };
+  monitor._ownerBrowser = { discover: async () => ({ required: false }) };
+  monitor._notify = async () => true;
+
+  assert.deepEqual(await monitor._tryAutoPurchase('13'), {
+    cartReady: true,
+    assignments: 'complete',
+  });
+  assert.equal(prompts, 0);
 });
 
 test('auto-purchase returns a structured failure when the section cannot be clicked', async () => {

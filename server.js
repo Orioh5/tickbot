@@ -166,7 +166,7 @@ app.post('/api/settings', (req, res) => {
   }
 
   // If monitor isn't running, push the new section list to all dashboards immediately
-  if (!monitor.running) {
+  if (!monitor.getStatus().busy) {
     const pending = Object.fromEntries(settings.sections.map(s => [s, { status: 'pending' }]));
     broadcast({ type: 'sections', sections: pending });
   }
@@ -188,7 +188,9 @@ app.post('/api/monitor/start', async (req, res) => {
     await monitor.start(settings);
     res.json({ ok: true });
   } catch (error) {
-    const status = error instanceof SettingsValidationError ? 400 : 500;
+    const status = error instanceof SettingsValidationError
+      ? 400
+      : (error.code === 'MONITOR_BUSY' ? 409 : 500);
     res.status(status).json({ error: error.message });
   }
 });

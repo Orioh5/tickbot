@@ -124,15 +124,24 @@ ws.onerror = err => addLog('WebSocket error — is the server running?', 'error'
 
 function handleStatus(status) {
   const running = status.running;
-  isRunning = running;
+  const busy = status.busy ?? running;
+  const phaseLabels = {
+    starting: '● STARTING',
+    monitoring: '● MONITORING',
+    'cart-interaction': '● ADDING TO CART',
+    'owner-selection': '● OWNER SELECTION',
+    'cart-ready': '● CART READY',
+    stopping: '● STOPPING',
+  };
+  isRunning = busy;
 
-  ui.statusBadge.className = `badge ${running ? 'badge-running' : 'badge-stopped'}`;
-  ui.statusBadge.textContent = running ? '● MONITORING' : '● STOPPED';
+  ui.statusBadge.className = `badge ${busy ? 'badge-running' : 'badge-stopped'}`;
+  ui.statusBadge.textContent = busy ? (phaseLabels[status.phase] || '● ACTIVE') : '● STOPPED';
 
-  ui.startBtn.disabled = running;
-  ui.stopBtn.disabled  = !running;
+  ui.startBtn.disabled = busy;
+  ui.stopBtn.disabled  = !busy;
 
-  if (running && status.startedAt) {
+  if (busy && status.startedAt) {
     startedAt = new Date(status.startedAt);
     if (!uptimeInterval) uptimeInterval = setInterval(tickUptime, 1000);
   } else {

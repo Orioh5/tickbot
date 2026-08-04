@@ -150,6 +150,97 @@ test('stop aborts owner selection before a candidate can be applied', { timeout:
   assert.equal(applyCalls, 0);
 });
 
+test('start rejects while an owner flow is active without replacing its resources', async () => {
+  const monitor = new Monitor();
+  const browser = { close: async () => {} };
+  const abort = new AbortController();
+  const selector = { chooseOwner: async () => ({ status: 'timeout' }) };
+  let launches = 0;
+  monitor.running = false;
+  monitor._phase = 'owner-selection';
+  monitor.browser = browser;
+  monitor._ownerSelectionAbort = abort;
+  monitor._ownerSelector = selector;
+  monitor._launch = async () => { launches++; };
+  monitor._runLoop = async () => {};
+
+  await assert.rejects(monitor.start(settings()), /busy|active/i);
+
+  assert.equal(launches, 0);
+  assert.equal(monitor.browser, browser);
+  assert.equal(monitor._ownerSelectionAbort, abort);
+  assert.equal(monitor._ownerSelector, selector);
+});
+
+test('restart stays blocked after Stop until the previous browser loop has fully unwound', async () => {
+  const monitor = new Monitor();
+  let releaseLoop;
+  const loopGate = new Promise(resolve => { releaseLoop = resolve; });
+  let launches = 0;
+  monitor._launch = async () => {
+    launches++;
+    monitor.browser = { close: async () => {} };
+  };
+  monitor._runLoop = async () => loopGate;
+
+  await monitor.start(settings());
+  await monitor.stop();
+
+  assert.equal(monitor.getStatus().busy, true);
+  assert.equal(monitor.getStatus().phase, 'stopping');
+  await assert.rejects(monitor.start(settings()), /busy|active/i);
+  assert.equal(launches, 1);
+
+  releaseLoop();
+  await monitor._loopPromise;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(monitor.getStatus().busy, false);
+  assert.equal(monitor.getStatus().phase, 'stopped');
+});
+
+test('stop cancels Telegram and closes the active browser while owner selection is busy', { timeout: 500 }, async () => {
+  const monitor = new Monitor();
+  let closed = 0;
+  let applyCalls = 0;
+  let selectionStarted;
+  const started = new Promise(resolve => { selectionStarted = resolve; });
+  monitor.running = false;
+  monitor._phase = 'owner-selection';
+  monitor.browser = { close: async () => { closed++; } };
+  monitor._stopRequested = false;
+  monitor._ownerSelectionAbort = new AbortController();
+  monitor._ownerSelector = {
+    chooseOwner: ({ signal }) => new Promise(resolve => {
+      selectionStarted();
+      signal.addEventListener('abort', () => resolve({ status: 'cancelled' }), { once: true });
+    }),
+  };
+  monitor._ownerBrowser = {
+    discover: async () => ({
+      required: true,
+      candidates: [{ key: 'a', name: 'בעלים א', identifier: 'owner-ref-a' }],
+    }),
+    apply: async () => { applyCalls++; },
+  };
+
+  assert.deepEqual(monitor.getStatus(), {
+    running: false,
+    busy: true,
+    phase: 'owner-selection',
+    startedAt: null,
+    lastCheck: null,
+  });
+  const flow = monitor._completeOwnerAssignments();
+  await started;
+  await monitor.stop();
+
+  assert.deepEqual(await flow, { status: 'manual', reason: 'cancelled' });
+  assert.equal(applyCalls, 0);
+  assert.equal(closed, 1);
+  assert.equal(monitor.getStatus().busy, false);
+  assert.equal(monitor.getStatus().phase, 'stopped');
+});
+
 test('a selection resolved during stop is never applied', async () => {
   const monitor = new Monitor();
   let applyCalls = 0;
@@ -201,14 +292,15 @@ test('checkout notification contains no owner identifier', async () => {
     discover: async () => (++discoveryCount === 1 ? {
       required: true,
       candidates: [
-        { key: '0', name: 'בעלים א', identifier: '000000001' },
-        { key: '1', name: 'בעלים ב', identifier: '000000002' },
+        { key: '0', name: 'בעלים א', identifier: '000000001', ticketKey: 'private-ticket-a' },
+        { key: '1', name: 'בעלים ב', identifier: '000000002', ticketKey: 'private-ticket-a' },
       ],
     } : { required: false }),
     apply: async () => ({ status: 'assigned' }),
   };
   monitor._notify = async (message, options) => {
     notifications.push(Monitor.buildNotificationText(monitor.settings, message, options));
+    return true;
   };
 
   assert.deepEqual(await monitor._finishCartOwnerFlow(), { status: 'complete' });
@@ -218,7 +310,91 @@ test('checkout notification contains no owner identifier', async () => {
   ]);
   assert.match(notifications[0], /\/Transaction2\/Edit/);
   assert.doesNotMatch(JSON.stringify(selectorRequests), /000000001|000000002/);
+  assert.doesNotMatch(JSON.stringify(selectorRequests), /private-ticket-a/);
   assert.doesNotMatch(notifications.join('\n'), /000000001|000000002/);
+});
+
+test('returns false when Telegram notification configuration is unavailable', async () => {
+  const monitor = new Monitor();
+  monitor.settings = {
+    url: 'https://tickets.mhaifafc.com/Stadium/Index?eventId=5989',
+    loginUrl: 'https://auth.mhaifafc.com/',
+    telegramToken: '',
+    telegramChatId: '',
+  };
+
+  assert.equal(await monitor._notify('manual recovery'), false);
+});
+
+test('returns false when Telegram rejects a notification request', async () => {
+  const monitor = new Monitor({
+    notificationFetch: async () => ({
+      ok: false,
+      statusText: 'Bad Request',
+      json: async () => ({ description: 'request rejected' }),
+    }),
+  });
+  monitor.settings = {
+    url: 'https://tickets.mhaifafc.com/Stadium/Index?eventId=5989',
+    loginUrl: 'https://auth.mhaifafc.com/',
+    telegramToken: 'test-token',
+    telegramChatId: '12345',
+  };
+
+  assert.equal(await monitor._notify('manual recovery'), false);
+});
+
+test('emits the complete cart recovery message on the dashboard when Telegram delivery fails', async () => {
+  const monitor = new Monitor();
+  const logs = [];
+  const alerts = [];
+  monitor.settings = {
+    url: 'https://tickets.mhaifafc.com/Stadium/Index?eventId=5989',
+    loginUrl: 'https://auth.mhaifafc.com/',
+    telegramToken: '',
+    telegramChatId: '',
+  };
+  monitor._completeOwnerAssignments = async () => ({ status: 'manual', reason: 'error' });
+  monitor.on('log', message => logs.push(message));
+  monitor.on('alert', message => alerts.push(message));
+
+  assert.deepEqual(
+    await monitor._finishCartOwnerFlow(),
+    { status: 'manual', reason: 'error' }
+  );
+
+  const expected = Monitor.buildNotificationText(
+    monitor.settings,
+    '⚠️ לא ניתן להשלים את השיוך אוטומטית. יש להשלים ידנית בסל.',
+    { checkoutReady: true }
+  );
+  assert.equal(alerts.at(-1), expected);
+  assert.equal(logs.at(-1), expected);
+  assert.match(expected, /https:\/\/tickets\.mhaifafc\.com\/Transaction2\/Edit/);
+});
+
+test('emits the cart recovery URL when configured Telegram returns an API failure', async () => {
+  const monitor = new Monitor({
+    notificationFetch: async () => ({
+      ok: false,
+      statusText: 'Bad Request',
+      json: async () => ({ description: 'request rejected' }),
+    }),
+  });
+  const alerts = [];
+  monitor.settings = {
+    url: 'https://tickets.mhaifafc.com/Stadium/Index?eventId=5989',
+    loginUrl: 'https://auth.mhaifafc.com/',
+    telegramToken: 'test-token',
+    telegramChatId: '12345',
+  };
+  monitor._completeOwnerAssignments = async () => ({ status: 'manual', reason: 'error' });
+  monitor.on('alert', message => alerts.push(message));
+
+  await monitor._finishCartOwnerFlow();
+
+  assert.equal(alerts.length, 1);
+  assert.match(alerts[0], /https:\/\/tickets\.mhaifafc\.com\/Transaction2\/Edit/);
 });
 
 test('monitor uses one initial page load and then polls the API without reloading', async () => {

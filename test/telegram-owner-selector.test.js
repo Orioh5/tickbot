@@ -43,6 +43,8 @@ test('sends owner names without identity data and returns the selected opaque ke
     [{ text: 'בעלים ב', callback_data: 'owner:fixednonce:b' }],
   ]);
   assert.doesNotMatch(JSON.stringify(sendBody), /\d{9}/);
+  assert.equal(requests.every(request => request.options.signal === requests[0].options.signal), true);
+  assert.equal(requests[0].options.signal instanceof AbortSignal, true);
 });
 
 test('ignores foreign chat, stale nonce, and unknown candidate callbacks', async () => {
@@ -130,7 +132,7 @@ test('returns cancelled without applying a late callback', async () => {
     }),
     { status: 'cancelled' }
   );
-  assert.deepEqual(methods, ['sendMessage']);
+  assert.deepEqual(methods, []);
 });
 
 test('cancels an outstanding long poll and forwards its abort signal', async () => {
@@ -176,5 +178,140 @@ test('returns an error result when Telegram rejects a request', async () => {
       candidates: [{ key: 'a', name: 'בעלים א' }],
     }),
     { status: 'error', message: 'Telegram sendMessage failed' }
+  );
+});
+
+test('starts the deadline before sendMessage and times out a stalled send', { timeout: 500 }, async () => {
+  let sendSignal;
+  const selector = new TelegramOwnerSelector({
+    token: 'test-token',
+    chatId: '12345',
+    timeoutMs: 20,
+    fetchImpl: async (_url, options = {}) => {
+      sendSignal = options.signal;
+      return new Promise((resolve, reject) => {
+        options.signal.addEventListener('abort', () => {
+          const error = new Error('aborted');
+          error.name = 'AbortError';
+          reject(error);
+        }, { once: true });
+      });
+    },
+  });
+
+  assert.deepEqual(
+    await selector.chooseOwner({
+      ticketNumber: 1,
+      candidates: [{ key: 'a', name: 'בעלים א' }],
+    }),
+    { status: 'timeout' }
+  );
+  assert.equal(sendSignal.aborted, true);
+});
+
+test('returns cancelled when the caller aborts a stalled send', { timeout: 500 }, async () => {
+  const controller = new AbortController();
+  const selector = new TelegramOwnerSelector({
+    token: 'test-token',
+    chatId: '12345',
+    timeoutMs: 200,
+    fetchImpl: async (_url, options = {}) => new Promise((resolve, reject) => {
+      options.signal.addEventListener('abort', () => {
+        const error = new Error('aborted');
+        error.name = 'AbortError';
+        reject(error);
+      }, { once: true });
+    }),
+  });
+
+  const choice = selector.chooseOwner({
+    ticketNumber: 1,
+    candidates: [{ key: 'a', name: 'בעלים א' }],
+    signal: controller.signal,
+  });
+  setImmediate(() => controller.abort());
+
+  assert.deepEqual(await choice, { status: 'cancelled' });
+});
+
+test('times out when callback acknowledgement stalls', { timeout: 500 }, async () => {
+  const methods = [];
+  const signals = [];
+  const selector = new TelegramOwnerSelector({
+    token: 'test-token',
+    chatId: '12345',
+    nonceFactory: () => 'fixednonce',
+    timeoutMs: 20,
+    fetchImpl: async (url, options = {}) => {
+      const method = url.split('/').pop();
+      methods.push(method);
+      signals.push(options.signal);
+      if (method === 'sendMessage') {
+        return { ok: true, json: async () => ({ ok: true, result: { message_id: 51 } }) };
+      }
+      if (method === 'getUpdates') {
+        return { ok: true, json: async () => ({ ok: true, result: [{
+          update_id: 1,
+          callback_query: {
+            id: 'callback-1',
+            data: 'owner:fixednonce:a',
+            message: { chat: { id: 12345 } },
+          },
+        }] }) };
+      }
+      return new Promise((resolve, reject) => {
+        options.signal.addEventListener('abort', () => {
+          const error = new Error('aborted');
+          error.name = 'AbortError';
+          reject(error);
+        }, { once: true });
+      });
+    },
+  });
+
+  assert.deepEqual(
+    await selector.chooseOwner({
+      ticketNumber: 1,
+      candidates: [{ key: 'a', name: 'בעלים א' }],
+    }),
+    { status: 'timeout' }
+  );
+  assert.deepEqual(methods, ['sendMessage', 'getUpdates', 'answerCallbackQuery']);
+  assert.equal(signals.every(signal => signal === signals[0]), true);
+});
+
+test('does not select when acknowledgement completes at the deadline', async () => {
+  let clock = 0;
+  const selector = new TelegramOwnerSelector({
+    token: 'test-token',
+    chatId: '12345',
+    nonceFactory: () => 'fixednonce',
+    now: () => clock,
+    fetchImpl: async url => {
+      const method = url.split('/').pop();
+      if (method === 'sendMessage') {
+        return { ok: true, json: async () => ({ ok: true, result: { message_id: 51 } }) };
+      }
+      if (method === 'getUpdates') {
+        return { ok: true, json: async () => ({ ok: true, result: [{
+          update_id: 1,
+          callback_query: {
+            id: 'callback-1',
+            data: 'owner:fixednonce:a',
+            message: { chat: { id: 12345 } },
+          },
+        }] }) };
+      }
+      clock = 180000;
+      return { ok: true, json: async () => ({ ok: true, result: true }) };
+    },
+  });
+
+  assert.deepEqual(
+    await selector.chooseOwner({
+      ticketNumber: 1,
+      candidates: [{ key: 'a', name: 'בעלים א' }],
+    }),
+    { status: 'timeout' }
   );
 });
