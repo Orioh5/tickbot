@@ -274,7 +274,7 @@ test('auto-purchase activates the zero-size sector list item through its DOM cli
   assert.equal(domClicks, 1);
 });
 
-test('auto-purchase waits for the official fast-seat reservation redirect before verifying the cart', async () => {
+test('auto-purchase verifies the cart when navigation makes the reservation response body unavailable', async () => {
   const monitor = new Monitor();
   const actions = [];
   let currentUrl = 'https://tickets.mhaifafc.com/Stadium/Index?eventId=5989';
@@ -303,7 +303,12 @@ test('auto-purchase waits for the official fast-seat reservation redirect before
         url: () => 'https://tickets.mhaifafc.com/Stadium/GetWglAutoSeats?eventId=5989',
         request: () => ({ method: () => 'POST' }),
         ok: () => true,
-        json: async () => ({ redirectUrl: '/Transaction2/Edit' }),
+        status: () => 200,
+        json: async () => {
+          throw new Error(
+            'Protocol error (Network.getResponseBody): No resource with given identifier found'
+          );
+        },
       };
       assert.equal(predicate(response), true);
       actions.push(['reservation-response']);
@@ -326,8 +331,8 @@ test('auto-purchase waits for the official fast-seat reservation redirect before
     ['dialog', '#seatCountModal', { state: 'visible', timeout: 6000 }],
     ['quantity', '2'],
     ['reservation-response'],
-    ['click', '#fnFastSeats'],
     ['redirect', 'https://tickets.mhaifafc.com/Transaction2/Edit'],
+    ['click', '#fnFastSeats'],
   ]);
 });
 

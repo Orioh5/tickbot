@@ -656,23 +656,25 @@ class Monitor extends EventEmitter {
       confirmationAttempted = true;
       this.running = false;
       this._setPhase('cart-verification');
-      const reservationResponsePromise = this.page.waitForResponse(response =>
-        response.url().includes('/Stadium/GetWglAutoSeats') &&
-        response.request().method() === 'POST',
-      { timeout: 45000 });
+      const checkoutUrl = new URL('/Transaction2/Edit', this.settings.url).toString();
+      const reservationResponsePromise = this.page.waitForResponse(
+        response =>
+          response.url().includes('/Stadium/GetWglAutoSeats') &&
+          response.request().method() === 'POST',
+        { timeout: 45000 }
+      );
+      const cartNavigationPromise = this.page.waitForURL(checkoutUrl, {
+        waitUntil: 'networkidle',
+        timeout: 45000,
+      });
       await this.page.click('#fnFastSeats');
-      const reservationResponse = await reservationResponsePromise;
+      const [reservationResponse] = await Promise.all([
+        reservationResponsePromise,
+        cartNavigationPromise,
+      ]);
       if (!reservationResponse.ok()) {
         throw new Error(`Seat reservation failed with HTTP ${reservationResponse.status()}`);
       }
-      const reservation = await reservationResponse.json();
-      if (!reservation?.redirectUrl) {
-        throw new Error(reservation?.message || 'Seat reservation did not return a cart URL');
-      }
-
-      const checkoutUrl = new URL('/Transaction2/Edit', this.settings.url).toString();
-      const reservationUrl = new URL(reservation.redirectUrl, this.settings.url).toString();
-      await this.page.waitForURL(reservationUrl, { waitUntil: 'networkidle', timeout: 45000 });
       await this._verifyCart(checkoutUrl, target);
 
       cartReady = true;
