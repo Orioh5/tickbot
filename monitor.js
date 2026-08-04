@@ -4,6 +4,8 @@ const EventEmitter = require('events');
 const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
+const TelegramOwnerSelector = require('./telegram-owner-selector');
+const ownerAssignment = require('./owner-assignment');
 
 const STATE_PATH = process.env.DATA_DIR
   ? path.join(process.env.DATA_DIR, 'state.json')
@@ -57,7 +59,7 @@ function buildNotificationText(settings, message, { checkoutReady = false } = {}
 }
 
 class Monitor extends EventEmitter {
-  constructor() {
+  constructor({ ownerSelectorFactory, ownerBrowser } = {}) {
     super();
     this.running = false;
     this.browser = null;
@@ -72,6 +74,18 @@ class Monitor extends EventEmitter {
     this._browserCleanupPromises = new WeakMap();
     this._queueDetected = false;
     this._sectorsInfoUrl = null;
+    this._ownerSelectorFactory = ownerSelectorFactory || (settings =>
+      new TelegramOwnerSelector({
+        token: settings.telegramToken,
+        chatId: settings.telegramChatId,
+      })
+    );
+    this._ownerBrowser = ownerBrowser || {
+      discover: ownerAssignment.discoverOwnerCandidates,
+      apply: ownerAssignment.applyOwnerCandidate,
+    };
+    this._ownerSelector = null;
+    this._ownerSelectionAbort = null;
   }
 
   log(message, level = 'info') {
@@ -103,6 +117,8 @@ class Monitor extends EventEmitter {
     this._labelToOnclickId = {};
     this._onclickIdToLabel = {};
     this.settings = settings;
+    this._ownerSelectionAbort = new AbortController();
+    this._ownerSelector = this._ownerSelectorFactory(settings);
 
     // Init section states
     this.sections = {};
@@ -133,8 +149,9 @@ class Monitor extends EventEmitter {
   }
 
   async stop() {
-    if (!this.running && !this.browser) return;
     this._stopRequested = true;
+    this._ownerSelectionAbort?.abort();
+    if (!this.running && !this.browser) return;
     this.running = false;
 
     await this._cleanupBrowser();
@@ -143,7 +160,11 @@ class Monitor extends EventEmitter {
     this.emit('status', this.getStatus());
   }
 
-  async _cleanupBrowser(browser = this.browser) {
+  async _cleanupBrowser(
+    browser = this.browser,
+    ownerSelectionAbort = this._ownerSelectionAbort
+  ) {
+    ownerSelectionAbort?.abort();
     if (!browser) return;
 
     // Only clear the shared references if they still belong to this browser. This
@@ -357,6 +378,7 @@ class Monitor extends EventEmitter {
     let consecutiveErrors = 0;
     let navigated = false;
     const loopBrowser = this.browser;
+    const loopOwnerSelectionAbort = this._ownerSelectionAbort;
 
     try {
       while (this.running && !this._stopRequested) {
@@ -390,7 +412,7 @@ class Monitor extends EventEmitter {
         if (this.running) await this._sleep(this.settings.intervalMs);
       }
     } finally {
-      await this._cleanupBrowser(loopBrowser);
+      await this._cleanupBrowser(loopBrowser, loopOwnerSelectionAbort);
     }
   }
 
@@ -486,21 +508,23 @@ class Monitor extends EventEmitter {
     const newlyUnavailable = [...wasAvailable].filter(k => !nowAvailable.has(k));
 
     if (newlyAvailable.length > 0) {
-      let purchased = false;
+      let purchaseResult = { cartReady: false, assignments: 'failed' };
       if (this.settings.autoPurchase) {
-        purchased = await this._tryAutoPurchase(newlyAvailable[0]);
+        purchaseResult = await this._tryAutoPurchase(newlyAvailable[0]);
       }
 
       this.stats.alerts++;
       this.emit('stats', this.getStats());
-      const msg = purchased
+      const msg = purchaseResult.cartReady
         ? `🛒 Tickets added to cart! Section ${newlyAvailable[0]} — complete checkout now!`
         : `🎟️ Tickets available in sections: ${newlyAvailable.join(', ')}!`;
       this.log(msg, 'alert');
       this.emit('alert', msg);
-      await this._notify(msg, { checkoutReady: purchased });
+      if (!purchaseResult.cartReady) {
+        await this._notify(msg);
+      }
 
-      if (this.settings.pauseOnHit) {
+      if (this.settings.pauseOnHit && this.running) {
         this.log('Pausing — tickets found! Stop and restart to continue.', 'warning');
         this.running = false;
         this.emit('status', this.getStatus());
@@ -519,7 +543,8 @@ class Monitor extends EventEmitter {
   }
 
   async _tryAutoPurchase(sectionId) {
-    if (!this.page) return false;
+    if (!this.page) return { cartReady: false, assignments: 'failed' };
+    let cartReady = false;
     try {
       this.log(`Auto-purchase: clicking section ${sectionId}...`, 'info');
 
@@ -530,7 +555,7 @@ class Monitor extends EventEmitter {
       const el = await this.page.$(`[onclick*="processSectorById(${onclickId})"]`);
       if (!el) {
         this.log('Auto-purchase: section element not found on page', 'warning');
-        return false;
+        return { cartReady: false, assignments: 'failed' };
       }
       await el.click();
 
@@ -555,12 +580,82 @@ class Monitor extends EventEmitter {
         'button:has-text("OK"), button:has-text("אישור"), button:has-text("✓"), [class*="confirm"], [class*="ok-btn"]'
       );
 
+      cartReady = true;
+      this.running = false;
+      this.emit('status', this.getStatus());
       this.log(`Auto-purchase: section ${sectionId} added to cart!`, 'success');
-      return true;
+      const checkoutUrl = new URL('/Transaction2/Edit', this.settings.url).toString();
+      await this.page.goto(checkoutUrl, { waitUntil: 'networkidle', timeout: 45000 });
+      const assignmentResult = await this._finishCartOwnerFlow();
+      return { cartReady: true, assignments: assignmentResult.status };
     } catch (e) {
       this.log(`Auto-purchase failed: ${e.message}`, 'error');
-      return false;
+      if (cartReady) {
+        await this._notify(
+          '⚠️ לא ניתן להשלים את השיוך אוטומטית. יש להשלים ידנית בסל.',
+          { checkoutReady: true }
+        );
+      }
+      return { cartReady, assignments: 'failed' };
     }
+  }
+
+  async _completeOwnerAssignments() {
+    let ticketNumber = 1;
+    while (!this._stopRequested) {
+      const discovered = await this._ownerBrowser.discover(this.page);
+      if (!discovered.required) return { status: 'complete' };
+      let remaining = discovered.candidates;
+
+      while (remaining.length > 0 && !this._stopRequested) {
+        const choice = await this._ownerSelector.chooseOwner({
+          ticketNumber,
+          candidates: remaining.map(({ key, name }) => ({ key, name })),
+          signal: this._ownerSelectionAbort?.signal,
+        });
+        if (choice.status !== 'selected') {
+          return { status: 'manual', reason: choice.status };
+        }
+        if (this._stopRequested) {
+          return { status: 'manual', reason: 'cancelled' };
+        }
+        const candidate = remaining.find(item => item.key === choice.candidateKey);
+        if (!candidate) return { status: 'manual', reason: 'error' };
+        const result = await this._ownerBrowser.apply(this.page, candidate);
+        if (result.status === 'assigned') break;
+        remaining = remaining.filter(item => item.key !== candidate.key);
+        await this._notify(`⚠️ ${candidate.name} אינו זכאי לכרטיס הזה. בחר בעלים אחר.`);
+      }
+
+      if (remaining.length === 0) {
+        return { status: 'manual', reason: 'no-eligible-owner' };
+      }
+      ticketNumber++;
+    }
+    return { status: 'manual', reason: 'cancelled' };
+  }
+
+  async _finishCartOwnerFlow() {
+    let result;
+    try {
+      result = await this._completeOwnerAssignments();
+    } catch (_) {
+      this.log('Owner assignment failed', 'error');
+      result = { status: 'manual', reason: 'error' };
+    }
+
+    const messages = {
+      complete: '✅ כל הכרטיסים שויכו. הסל מוכן לתשלום.',
+      timeout: '⚠️ זמן הבחירה הסתיים. יש להשלים את השיוך ידנית בסל.',
+      cancelled: '⚠️ בחירת הבעלים בוטלה. יש להשלים את השיוך ידנית בסל.',
+      'no-eligible-owner': '⚠️ אף אחד מהאנשים שנבחרו אינו זכאי. יש להשלים ידנית.',
+      error: '⚠️ לא ניתן להשלים את השיוך אוטומטית. יש להשלים ידנית בסל.',
+    };
+    const message = result.status === 'complete'
+      ? messages.complete
+      : (messages[result.reason] || messages.error);
+    await this._notify(message, { checkoutReady: true });
+    return result;
   }
 
   // ── Notifications ─────────────────────────────────────────────────────────

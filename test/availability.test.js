@@ -167,3 +167,69 @@ test('notifies when previously available sections become unavailable', async () 
   assert.match(notifications[0], /no longer available/i);
   assert.equal(monitor.sections[13].status, 'unavailable');
 });
+
+test('auto-purchase opens the cart and returns the completed owner-assignment result', async () => {
+  const monitor = new Monitor();
+  const navigations = [];
+  let ownerFlowCalls = 0;
+  let statusEvents = 0;
+
+  monitor.running = true;
+  monitor.settings = {
+    url: 'https://tickets.mhaifafc.com/Stadium/Index?eventId=5989',
+    desiredQuantity: 1,
+  };
+  monitor.page = {
+    $: async () => ({ click: async () => {} }),
+    waitForSelector: async () => {},
+    click: async () => {},
+    goto: async url => { navigations.push(url); },
+  };
+  monitor._sleep = async () => {};
+  monitor._finishCartOwnerFlow = async () => {
+    ownerFlowCalls++;
+    assert.equal(monitor.running, false);
+    return { status: 'complete' };
+  };
+  monitor.on('status', () => { statusEvents++; });
+
+  assert.deepEqual(await monitor._tryAutoPurchase('13'), {
+    cartReady: true,
+    assignments: 'complete',
+  });
+  assert.deepEqual(navigations, ['https://tickets.mhaifafc.com/Transaction2/Edit']);
+  assert.equal(ownerFlowCalls, 1);
+  assert.equal(statusEvents, 1);
+});
+
+test('auto-purchase returns a structured failure when the section cannot be clicked', async () => {
+  const monitor = new Monitor();
+  monitor.settings = { desiredQuantity: 1 };
+  monitor.page = { $: async () => null };
+
+  assert.deepEqual(await monitor._tryAutoPurchase('13'), {
+    cartReady: false,
+    assignments: 'failed',
+  });
+});
+
+test('availability does not send a second Telegram alert after the cart owner flow', async () => {
+  const monitor = new Monitor();
+  const notifications = [];
+  monitor.running = true;
+  monitor.settings = {
+    sections: ['13'],
+    pauseOnHit: false,
+    autoPurchase: true,
+  };
+  monitor.sections = { 13: { status: 'pending' } };
+  monitor._notify = async message => { notifications.push(message); };
+  monitor._tryAutoPurchase = async () => {
+    await monitor._notify('✅ הסל מוכן לתשלום.');
+    return { cartReady: true, assignments: 'complete' };
+  };
+
+  await monitor._applyAvailability([{ id: '1590', label: '13' }]);
+
+  assert.deepEqual(notifications, ['✅ הסל מוכן לתשלום.']);
+});
