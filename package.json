@@ -4,7 +4,9 @@
   "description": "MHFC Ticket Monitor - Web Dashboard",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test",
+    "test:coverage": "node --test --experimental-test-coverage"
   },
   "keywords": [],
   "author": "",

@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MHFC Ticket Monitor — Login</title>
+<style>
+  body { font-family: -apple-system, sans-serif; background: #111; color: #eee; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+  form { background: #1c1c1c; padding: 32px; border-radius: 12px; width: 280px; box-shadow: 0 4px 24px rgba(0,0,0,.4); }
+  h1 { font-size: 18px; margin: 0 0 20px; }
+  label { display: block; font-size: 13px; margin: 12px 0 4px; color: #aaa; }
+  input { width: 100%; box-sizing: border-box; padding: 8px 10px; border-radius: 6px; border: 1px solid #333; background: #0d0d0d; color: #eee; }
+  button { width: 100%; margin-top: 20px; padding: 10px; border: none; border-radius: 6px; background: #2e7d32; color: #fff; font-weight: 600; cursor: pointer; }
+  button:disabled { opacity: .6; cursor: default; }
+  #error { color: #e57373; font-size: 13px; margin-top: 12px; min-height: 16px; }
+</style>
+</head>
+<body>
+  <form id="loginForm">
+    <h1>🎟️ MHFC Ticket Monitor</h1>
+    <label for="username">Username</label>
+    <input id="username" name="username" autocomplete="username" value="admin">
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password" autocomplete="current-password">
+    <button type="submit">Log in</button>
+    <div id="error"></div>
+  </form>
+  <script>
+    const form  = document.getElementById('loginForm');
+    const error = document.getElementById('error');
+    form.addEventListener('submit', async e => {
+      e.preventDefault();
+      error.textContent = '';
+      const button = form.querySelector('button');
+      button.disabled = true;
+      try {
+        const res = await fetch('/api/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: document.getElementById('username').value,
+            password: document.getElementById('password').value,
+          }),
+        });
+        if (res.ok) {
+          location.href = '/';
+        } else {
+          const data = await res.json().catch(() => ({}));
+          error.textContent = data.error || 'Login failed.';
+        }
+      } catch (_) {
+        error.textContent = 'Login failed.';
+      } finally {
+        button.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

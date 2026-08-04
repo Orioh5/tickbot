@@ -9,6 +9,53 @@ const STATE_PATH = process.env.DATA_DIR
   ? path.join(process.env.DATA_DIR, 'state.json')
   : path.join(__dirname, 'state.json');
 
+function parseAvailableSections(candidates) {
+  return candidates
+    .map(({ onclick = '', text = '' }) => {
+      const idMatch = onclick.match(/processSectorById\((\d+)\)/);
+      if (!idMatch) return null;
+      const labelMatch = text.trim().match(/(\d+)/);
+      return { id: idMatch[1], label: labelMatch ? labelMatch[1] : idMatch[1] };
+    })
+    .filter(Boolean);
+}
+
+function buildSectorsInfoUrl(eventUrl) {
+  const parsed = new URL(eventUrl);
+  const eventId = parsed.searchParams.get('eventId');
+  if (!eventId || !/^\d+$/.test(eventId)) {
+    throw new Error('Event URL does not contain a valid eventId');
+  }
+
+  const apiUrl = new URL('/Stadium/GetWGLSectorsInfo', parsed.origin);
+  apiUrl.searchParams.set('eventId', eventId);
+  return apiUrl.toString();
+}
+
+function parseSectorsInfo(payload) {
+  if (!payload || !Array.isArray(payload.sectors)) {
+    throw new Error('Invalid sectors-info response');
+  }
+
+  return {
+    timestamp: payload.timestamp || null,
+    sectors: payload.sectors.map(sector => ({
+      id: String(sector.id),
+      freeSeats: Array.isArray(sector.freeSeatsByPriceArea)
+        ? sector.freeSeatsByPriceArea.reduce((total, area) => total + Number(area.freeSeatsNo || 0), 0)
+        : 0,
+    })),
+  };
+}
+
+function buildNotificationText(settings, message, { checkoutReady = false } = {}) {
+  const checkoutUrl = new URL('/Transaction2/Edit', settings.url).toString();
+  const checkout = checkoutReady
+    ? `\n\n💳 Cart is ready — continue to payment:\n${checkoutUrl}`
+    : '';
+  return `${message}${checkout}\n\n🔑 Login & go straight there:\n${settings.loginUrl}?redirectUrl=${encodeURIComponent(settings.url)}\n\n🎟️ Direct event link:\n${settings.url}`;
+}
+
 class Monitor extends EventEmitter {
   constructor() {
     super();
@@ -19,8 +66,12 @@ class Monitor extends EventEmitter {
     this.sections = {};
     this.stats = { checks: 0, alerts: 0, errors: 0, startedAt: null, lastCheck: null };
     this._labelToOnclickId = {};
+    this._onclickIdToLabel = {};
     this.settings = null;
     this._stopRequested = false;
+    this._browserCleanupPromises = new WeakMap();
+    this._queueDetected = false;
+    this._sectorsInfoUrl = null;
   }
 
   log(message, level = 'info') {
@@ -47,6 +98,10 @@ class Monitor extends EventEmitter {
     }
 
     this._stopRequested = false;
+    this._queueDetected = false;
+    this._sectorsInfoUrl = null;
+    this._labelToOnclickId = {};
+    this._onclickIdToLabel = {};
     this.settings = settings;
 
     // Init section states
@@ -71,24 +126,40 @@ class Monitor extends EventEmitter {
     } catch (e) {
       this.log(`Failed to start browser: ${e.message}`, 'error');
       this.running = false;
+      await this._cleanupBrowser();
       this.emit('status', this.getStatus());
+      throw e;
     }
   }
 
   async stop() {
-    if (!this.running) return;
+    if (!this.running && !this.browser) return;
     this._stopRequested = true;
     this.running = false;
 
-    if (this.browser) {
-      try { await this.browser.close(); } catch (_) {}
+    await this._cleanupBrowser();
+
+    this.log('Monitor stopped.', 'info');
+    this.emit('status', this.getStatus());
+  }
+
+  async _cleanupBrowser(browser = this.browser) {
+    if (!browser) return;
+
+    // Only clear the shared references if they still belong to this browser. This
+    // prevents an old loop finishing from clearing a newly-started browser.
+    if (this.browser === browser) {
       this.browser = null;
       this.context = null;
       this.page = null;
     }
 
-    this.log('Monitor stopped.', 'info');
-    this.emit('status', this.getStatus());
+    let cleanup = this._browserCleanupPromises.get(browser);
+    if (!cleanup) {
+      cleanup = Promise.resolve().then(() => browser.close()).catch(() => {});
+      this._browserCleanupPromises.set(browser, cleanup);
+    }
+    await cleanup;
   }
 
   // ── Browser ──────────────────────────────────────────────────────────────
@@ -158,6 +229,9 @@ class Monitor extends EventEmitter {
     // Intercept API responses for availability data
     this.page.on('response', async response => {
       const url = response.url();
+      if (url.includes('/Stadium/GetWGLSectorsInfo?')) {
+        this._sectorsInfoUrl = url;
+      }
       if (url.includes('availability') || url.includes('SeatMap') || url.includes('blocks') || url.includes('seats')) {
         try {
           const ct = response.headers()['content-type'] || '';
@@ -202,38 +276,121 @@ class Monitor extends EventEmitter {
 
   // ── Main loop ─────────────────────────────────────────────────────────────
 
+  async _fetchApiAvailability() {
+    if (!this.context?.request) throw new Error('Browser request context is not available');
+
+    const apiUrl = this._sectorsInfoUrl || buildSectorsInfoUrl(this.settings.url);
+    const response = await this.context.request.post(apiUrl, {
+      headers: {
+        Origin: new URL(this.settings.url).origin,
+        Referer: this.settings.url,
+        'X-Requested-With': 'XMLHttpRequest',
+      },
+    });
+
+    if (!response.ok()) {
+      throw new Error(`Sectors API returned HTTP ${response.status()}`);
+    }
+
+    const responseBody = await response.text();
+    if (!responseBody.trim()) {
+      throw new Error(`Sectors API returned an empty response (HTTP ${response.status()})`);
+    }
+
+    const payload = JSON.parse(responseBody);
+    this.emit('apiData', { url: apiUrl, data: payload });
+    return parseSectorsInfo(payload);
+  }
+
+  async _refreshDomAvailability(reason) {
+    this.log(`${reason} Refreshing the event page once...`, 'warning');
+    await this.page.reload({ waitUntil: 'networkidle', timeout: 45000 });
+    await this._sleep(2000);
+    return this._checkAvailability();
+  }
+
+  async _pollApiAvailability() {
+    const result = await this._fetchApiAvailability();
+    const availableApiSectors = result.sectors.filter(sector => sector.freeSeats > 0);
+    const configured = new Set(this.settings.sections.map(String));
+    const unmapped = availableApiSectors.filter(sector =>
+      !this._onclickIdToLabel[sector.id] && !configured.has(sector.id)
+    );
+
+    if (unmapped.length > 0) {
+      return this._refreshDomAvailability(
+        `API found ${unmapped.length} available sector ID(s) that need visual-label mapping.`
+      );
+    }
+
+    const availableSections = availableApiSectors.map(sector => ({
+      id: sector.id,
+      label: this._onclickIdToLabel[sector.id] || sector.id,
+      freeSeats: sector.freeSeats,
+    }));
+
+    const newlyAvailableForPurchase = this.settings.autoPurchase && availableSections.some(sector => {
+      const watched = configured.has(sector.label) || configured.has(sector.id);
+      const previous = this.sections[sector.label] || this.sections[sector.id];
+      return watched && previous?.status !== 'available';
+    });
+    if (newlyAvailableForPurchase) {
+      return this._refreshDomAvailability('API found tickets for auto-purchase.');
+    }
+
+    const summary = availableSections.length
+      ? availableSections.map(sector => `${sector.label}:${sector.freeSeats}`).join(', ')
+      : 'none';
+    this.log(`API availability [${summary}]${result.timestamp ? ` at ${result.timestamp}` : ''}`, 'info');
+    return this._applyAvailability(availableSections);
+  }
+
+  async _pollApiOrFallback() {
+    try {
+      return await this._pollApiAvailability();
+    } catch (error) {
+      return this._refreshDomAvailability(`API polling failed (${error.message}).`);
+    }
+  }
+
   async _runLoop() {
     let consecutiveErrors = 0;
     let navigated = false;
+    const loopBrowser = this.browser;
 
-    while (this.running && !this._stopRequested) {
-      try {
-        if (!navigated) {
-          this.log('Loading event page...', 'info');
-          await this.page.goto(this.settings.url, { waitUntil: 'networkidle', timeout: 45000 });
-          await this._sleep(2000);
-          navigated = true;
-        }
-
-        await this._checkAvailability();
-        consecutiveErrors = 0;
-
-      } catch (e) {
-        if (!this.running) break;
-        consecutiveErrors++;
-        this.stats.errors++;
-        this.emit('stats', this.getStats());
-        this.log(`Error (${consecutiveErrors}/3): ${e.message}`, 'error');
-
-        if (consecutiveErrors >= 3) {
-          this.log('Too many errors — waiting 60s before retry...', 'warning');
-          for (let i = 0; i < 60 && this.running; i++) await this._sleep(1000);
+    try {
+      while (this.running && !this._stopRequested) {
+        try {
+          if (!navigated) {
+            this.log('Loading event page...', 'info');
+            await this.page.goto(this.settings.url, { waitUntil: 'networkidle', timeout: 45000 });
+            await this._sleep(2000);
+            await this._checkAvailability();
+            navigated = true;
+          } else {
+            await this._pollApiOrFallback();
+          }
           consecutiveErrors = 0;
-          navigated = false;
-        }
-      }
 
-      if (this.running) await this._sleep(this.settings.intervalMs);
+        } catch (e) {
+          if (!this.running) break;
+          consecutiveErrors++;
+          this.stats.errors++;
+          this.emit('stats', this.getStats());
+          this.log(`Error (${consecutiveErrors}/3): ${e.message}`, 'error');
+
+          if (consecutiveErrors >= 3) {
+            this.log('Too many errors — waiting 60s before retry...', 'warning');
+            for (let i = 0; i < 60 && this.running; i++) await this._sleep(1000);
+            consecutiveErrors = 0;
+            navigated = false;
+          }
+        }
+
+        if (this.running) await this._sleep(this.settings.intervalMs);
+      }
+    } finally {
+      await this._cleanupBrowser(loopBrowser);
     }
   }
 
@@ -248,55 +405,72 @@ class Monitor extends EventEmitter {
     ).catch(() => false);
 
     if (isQueued) {
-      this.log('Queue-it detected! You are in a queue.', 'warning');
-      await this._notify('⚠️ Queue-it detected — you\'re in a queue!');
+      if (!this._queueDetected) {
+        this._queueDetected = true;
+        this.log('Queue-it detected! You are in a queue.', 'warning');
+        await this._notify('⚠️ Queue-it detected — you\'re in a queue!');
+      }
       return;
     }
 
-    // Snapshot previous section statuses before this check cycle, so we can detect transitions
-    const prevSections = { ...this.sections };
-
-    // Mark all as checking
-    for (const s of this.settings.sections) {
-      this.sections[s] = { status: 'checking' };
+    if (this._queueDetected) {
+      this._queueDetected = false;
+      this.log('Queue-it cleared. Resuming availability checks.', 'success');
     }
-    this.emit('sections', this.getSections());
 
     // Read available sections from the page — sections appear in the LI list only when available
     // Extract BOTH the onclick internal ID and the visual block label from text content.
     // The ticketing site uses large internal IDs (e.g. 1590) in onclick but shows small visual
     // numbers (e.g. 13) on the map and in the element text ("גוש 13"). Users type visual numbers,
     // so we compare against labels; onclick IDs are kept as a fallback for advanced users.
-    const availableOnPage = await this.page.evaluate(() => {
-      return Array.from(document.querySelectorAll('[onclick*="processSectorById"]'))
-        .map(el => {
-          const m = (el.getAttribute('onclick') || '').match(/processSectorById\((\d+)\)/);
-          if (!m) return null;
-          // Extract the visual block number from text content (e.g. "גוש 13" → "13")
-          const labelMatch = el.textContent.trim().match(/(\d+)/);
-          return { id: m[1], label: labelMatch ? labelMatch[1] : m[1] };
-        })
-        .filter(Boolean);
-    }).catch(() => []);
+    const snapshot = await this.page.evaluate(() => ({
+      mapLoaded: !!document.querySelector('svg'),
+      candidates: Array.from(document.querySelectorAll('[onclick*="processSectorById"]'))
+        .map(el => ({
+          onclick: el.getAttribute('onclick') || '',
+          text: el.textContent || '',
+        })),
+    })).catch(() => null);
+
+    if (!snapshot?.mapLoaded) {
+      throw new Error('Seat map did not load; availability result is not trustworthy');
+    }
+
+    const availableOnPage = parseAvailableSections(snapshot.candidates);
 
     const onPageSummary = availableOnPage.length
       ? availableOnPage.map(s => s.label !== s.id ? `${s.label} (id:${s.id})` : s.id).join(', ')
       : 'none';
     this.log(`Sections on page: [${onPageSummary}]`, 'info');
 
-    const availableLabels = new Set(availableOnPage.map(s => s.label));
-    const availableIds    = new Set(availableOnPage.map(s => s.id));
     // Map from visual label (and onclick ID) → internal onclick ID, for auto-purchase clicks
-    this._labelToOnclickId = {};
     for (const s of availableOnPage) {
       this._labelToOnclickId[s.label] = s.id;
       this._labelToOnclickId[s.id]    = s.id;
+      this._onclickIdToLabel[s.id]    = s.label;
     }
+
+    return this._applyAvailability(availableOnPage);
+  }
+
+  async _applyAvailability(availableSections) {
+    // Snapshot previous section statuses before this check cycle, so we can detect transitions
+    const prevSections = { ...this.sections };
+
+    for (const s of this.settings.sections) {
+      this.sections[s] = { status: 'checking' };
+    }
+    this.emit('sections', this.getSections());
+
+    const availableLabels = new Set(availableSections.map(s => s.label));
+    const availableIds    = new Set(availableSections.map(s => s.id));
 
     for (const section of this.settings.sections) {
       const sec = String(section);
+      const match = availableSections.find(item => item.label === sec || item.id === sec);
       this.sections[section] = {
-        status: (availableLabels.has(sec) || availableIds.has(sec)) ? 'available' : 'unavailable'
+        status: (availableLabels.has(sec) || availableIds.has(sec)) ? 'available' : 'unavailable',
+        ...(match && Number.isFinite(match.freeSeats) ? { freeSeats: match.freeSeats } : {}),
       };
     }
 
@@ -324,7 +498,7 @@ class Monitor extends EventEmitter {
         : `🎟️ Tickets available in sections: ${newlyAvailable.join(', ')}!`;
       this.log(msg, 'alert');
       this.emit('alert', msg);
-      await this._notify(msg);
+      await this._notify(msg, { checkoutReady: purchased });
 
       if (this.settings.pauseOnHit) {
         this.log('Pausing — tickets found! Stop and restart to continue.', 'warning');
@@ -391,7 +565,7 @@ class Monitor extends EventEmitter {
 
   // ── Notifications ─────────────────────────────────────────────────────────
 
-  async _notify(message) {
+  async _notify(message, options = {}) {
     const s = this.settings;
     if (!s.telegramToken || !s.telegramChatId) return;
 
@@ -401,7 +575,7 @@ class Monitor extends EventEmitter {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           chat_id: s.telegramChatId,
-          text: `${message}\n\n🔑 Login & go straight there:\n${s.loginUrl}?redirectUrl=${encodeURIComponent(s.url)}\n\n🎟️ Direct link (if already logged in):\n${s.url}`,
+          text: buildNotificationText(s, message, options),
         }),
       });
 
@@ -422,3 +596,7 @@ class Monitor extends EventEmitter {
 }
 
 module.exports = Monitor;
+module.exports.parseAvailableSections = parseAvailableSections;
+module.exports.buildSectorsInfoUrl = buildSectorsInfoUrl;
+module.exports.parseSectorsInfo = parseSectorsInfo;
+module.exports.buildNotificationText = buildNotificationText;

@@ -3,7 +3,11 @@
     "allow": [
       "Bash(npm install:*)",
       "Bash(cd:*)",
-      "mcp__Claude_Preview__preview_start"
+      "mcp__Claude_Preview__preview_start",
+      "Bash(timeout 15 npx electron .)",
+      "Bash(echo \"exit:$?\")",
+      "Bash(pkill -f \"node_modules/electron/dist/Electron.app\")",
+      "Bash(npm uninstall *)"
     ]
   }
 }

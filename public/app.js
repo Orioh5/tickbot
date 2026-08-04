@@ -259,10 +259,13 @@ function fillForm(s) {
   $('cfgHeadful').checked      = !!s.headful;
   $('cfgAutoPurchase').checked  = !!s.autoPurchase;
   $('cfgDesiredQuantity').value = s.desiredQuantity || 1;
-  $('cfgTelegramToken').value  = s.telegramToken  || '';
-  $('cfgTelegramChatId').value = s.telegramChatId || '';
-  $('cfgUsername').value       = s.loginUsername  || '';
-  $('cfgPassword').value       = s.loginPassword  || '';
+  // Secrets are never sent to the browser — leave blank and hint whether one's saved.
+  $('cfgTelegramToken').value       = '';
+  $('cfgTelegramToken').placeholder = s.telegramTokenSet ? '(already set — leave blank to keep)' : 'Bot Token';
+  $('cfgTelegramChatId').value      = s.telegramChatId || '';
+  $('cfgUsername').value            = s.loginUsername  || '';
+  $('cfgPassword').value            = '';
+  $('cfgPassword').placeholder      = s.loginPasswordSet ? '(already set — leave blank to keep)' : '••••••••';
   // loginUrl is constant — no UI field
 }
 
@@ -271,21 +274,26 @@ function readForm() {
   const sections = custom
     ? custom.split(',').map(s => s.trim()).filter(Boolean)
     : Array.from(selectedSections);
-  return {
+  const out = {
     url:            $('cfgUrl').value.trim(),
     customSections: custom,
     sections,
     intervalMs:     parseInt($('cfgInterval').value, 10) * 1000,
     pauseOnHit:     $('cfgPauseOnHit').checked,
     headful:        $('cfgHeadful').checked,
-    telegramToken:  $('cfgTelegramToken').value.trim(),
     telegramChatId: $('cfgTelegramChatId').value.trim(),
     loginUsername:  $('cfgUsername').value.trim(),
-    loginPassword:  $('cfgPassword').value,
     loginUrl:       'https://auth.mhaifafc.com/',
     autoPurchase:    $('cfgAutoPurchase').checked,
     desiredQuantity: parseInt($('cfgDesiredQuantity').value, 10) || 1,
   };
+  // Secret fields: only include if the user actually typed a new value — otherwise
+  // the server keeps whatever's already saved.
+  const token    = $('cfgTelegramToken').value.trim();
+  const password = $('cfgPassword').value;
+  if (token) out.telegramToken = token;
+  if (password) out.loginPassword = password;
+  return out;
 }
 
 // ── Event listeners ───────────────────────────────────────────────────────────
@@ -350,38 +358,19 @@ ui.saveSettingsBtn.addEventListener('click', async () => {
   ui.saveSettingsBtn.disabled = false;
 });
 
-function buildNotifyText(message) {
-  const eventUrl  = $('cfgUrl') ? $('cfgUrl').value.trim() : '';
-  const loginUrl  = 'https://auth.mhaifafc.com/';
-  if (!eventUrl) return message;
-  return `${message}\n\n🔑 Login & go straight there:\n${loginUrl}?redirectUrl=${encodeURIComponent(eventUrl)}\n\n🎟️ Direct link (if already logged in):\n${eventUrl}`;
-}
-
-// Test Telegram
+// Test Telegram — runs server-side against the saved token, so the bot token
+// never needs to be typed into or held by the browser to test it.
 ui.testTelegramBtn.addEventListener('click', async () => {
-  const token  = $('cfgTelegramToken').value.trim();
-  const chatId = $('cfgTelegramChatId').value.trim();
-
-  if (!token || !chatId) {
-    addLog('Enter Telegram Token and Chat ID first.', 'warning');
-    return;
-  }
-
   ui.testTelegramBtn.textContent = 'Sending…';
   ui.testTelegramBtn.disabled    = true;
 
   try {
-    const res  = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ chat_id: chatId, text: buildNotifyText('🧪 MHFC Monitor — test message. Bot is working!') }),
-    });
+    const res  = await fetch('/api/telegram/test', { method: 'POST' });
     const data = await res.json();
-
-    if (data.ok) {
+    if (res.ok) {
       addLog('Telegram test sent successfully! Check your Telegram.', 'success');
     } else {
-      addLog(`Telegram error: ${data.description}`, 'error');
+      addLog(`Telegram error: ${data.error}`, 'error');
     }
   } catch (e) {
     addLog(`Telegram test failed: ${e.message}`, 'error');
