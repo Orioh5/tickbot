@@ -213,7 +213,7 @@ class TelegramBotService {
 
   async _cmdStart(userId, chatId, fromUser, inviteCode) {
     const user = this.userStore.getUser(userId);
-    if (user && !user.revoked) {
+    if (user) {
       await this.showMainMenu(userId, chatId);
       return;
     }
@@ -328,7 +328,7 @@ class TelegramBotService {
       return;
     }
     const crypto = require('crypto');
-    const code = crypto.randomBytes(4).toString('hex').toUpperCase();
+    const code = crypto.randomBytes(16).toString('hex').toUpperCase();
     this.userStore.createInviteCode({ code, createdBy: userId });
     const deepLink = `https://t.me/${this.botUsername}?start=${code}`;
     await this.sendMessage(chatId, `קישור הזמנה חדש: ${deepLink}\n(תקף ל־24 שעות ולשימוש אחד)`, {

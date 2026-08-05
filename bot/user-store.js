@@ -6,9 +6,10 @@ const fs = require('fs');
 const path = require('path');
 
 class UserStore {
-  constructor({ dbPath = ':memory:' } = {}) {
+  constructor({ dbPath = ':memory:', migrationHook = null } = {}) {
     if (dbPath !== ':memory:') fs.mkdirSync(path.dirname(dbPath), { recursive: true });
     this.db = new DatabaseSync(dbPath);
+    this._migrationHook = migrationHook;
     this._init();
   }
 
@@ -55,12 +56,20 @@ class UserStore {
     `);
     const hashMigration = this.db.prepare("SELECT value FROM schema_metadata WHERE key = 'invite_code_hashing'").get();
     if (!hashMigration) {
-      const legacyInviteCodes = this.db.prepare('SELECT code FROM invite_codes').all();
-      const updateInviteCode = this.db.prepare('UPDATE invite_codes SET code = ? WHERE code = ?');
-      for (const invite of legacyInviteCodes) {
-        updateInviteCode.run(this._hashInviteCode(invite.code), invite.code);
+      this.db.exec('BEGIN IMMEDIATE');
+      try {
+        const legacyInviteCodes = this.db.prepare('SELECT code FROM invite_codes').all();
+        const updateInviteCode = this.db.prepare('UPDATE invite_codes SET code = ? WHERE code = ?');
+        for (const [index, invite] of legacyInviteCodes.entries()) {
+          updateInviteCode.run(this._hashInviteCode(invite.code), invite.code);
+          this._migrationHook?.({ index });
+        }
+        this.db.prepare("INSERT INTO schema_metadata (key, value) VALUES ('invite_code_hashing', 'sha256')").run();
+        this.db.exec('COMMIT');
+      } catch (error) {
+        this.db.exec('ROLLBACK');
+        throw error;
       }
-      this.db.prepare("INSERT INTO schema_metadata (key, value) VALUES ('invite_code_hashing', 'sha256')").run();
     }
 
     this._stmts = {

@@ -2,6 +2,8 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { DatabaseSync } = require('node:sqlite');
+const { Worker } = require('node:worker_threads');
 const UserStore = require('../bot/user-store');
 const fs = require('fs');
 const os = require('os');
@@ -21,6 +23,59 @@ test('creates the parent directory for a file-backed database', () => {
 
 function makeStore() {
   return new UserStore({ dbPath: ':memory:' });
+}
+
+function createLegacyInviteDatabase(dbPath, codes) {
+  const db = new DatabaseSync(dbPath);
+  db.exec(`
+    CREATE TABLE invite_codes (
+      code       TEXT PRIMARY KEY,
+      created_by TEXT NOT NULL,
+      used_by    TEXT,
+      created_at INTEGER NOT NULL
+    );
+  `);
+  const insert = db.prepare('INSERT INTO invite_codes (code, created_by, created_at) VALUES (?, ?, ?)');
+  for (const code of codes) insert.run(code, 'admin', 1);
+  db.close();
+}
+
+function contendForInvite(dbPath, userId, barrier) {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(`
+      const { parentPort, workerData } = require('node:worker_threads');
+      const UserStore = require(workerData.userStorePath);
+      const barrier = new Int32Array(workerData.barrier);
+      Atomics.add(barrier, 0, 1);
+      Atomics.notify(barrier, 0);
+      Atomics.wait(barrier, 1, 0);
+      try {
+        const store = new UserStore({ dbPath: workerData.dbPath });
+        store.redeemInviteCode({ code: 'CONTEND', userId: workerData.userId, now: 2 });
+        parentPort.postMessage({ ok: true, userId: workerData.userId });
+      } catch (error) {
+        parentPort.postMessage({ ok: false, message: error.message });
+      }
+    `, {
+      eval: true,
+      workerData: {
+        dbPath,
+        userId,
+        barrier,
+        userStorePath: path.join(__dirname, '..', 'bot', 'user-store.js'),
+      },
+    });
+    worker.once('message', resolve);
+    worker.once('error', reject);
+  });
+}
+
+async function releaseContentionBarrier(barrier) {
+  while (Atomics.load(barrier, 0) !== 2) {
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  Atomics.store(barrier, 1, 1);
+  Atomics.notify(barrier, 1, 2);
 }
 
 // ── Users ─────────────────────────────────────────────────────────────────────
@@ -113,6 +168,71 @@ test('invite code storage retains only a hash of the redeemable code', () => {
   const stored = store.db.prepare('SELECT code FROM invite_codes').get();
   assert.notEqual(stored.code, 'SECRET-CODE');
   assert.equal(stored.code.length, 64);
+});
+
+test('migrates a legacy file-backed invite database with expiry and hashed codes', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mhfc-legacy-invite-'));
+  const dbPath = path.join(root, 'bot.db');
+  try {
+    createLegacyInviteDatabase(dbPath, ['LEGACY']);
+    const store = new UserStore({ dbPath });
+    const columns = store.db.prepare('PRAGMA table_info(invite_codes)').all();
+    const stored = store.db.prepare('SELECT code, expires_at FROM invite_codes').get();
+
+    assert.ok(columns.some(column => column.name === 'expires_at'));
+    assert.equal(stored.code.length, 64);
+    assert.equal(stored.expires_at, null);
+    assert.equal(store.getInviteCode('LEGACY').created_by, 'admin');
+    assert.equal(store.db.prepare("SELECT value FROM schema_metadata WHERE key = 'invite_code_hashing'").get().value, 'sha256');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('failed legacy hash migration rolls back all code updates and its marker', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mhfc-invite-migration-'));
+  const dbPath = path.join(root, 'bot.db');
+  try {
+    createLegacyInviteDatabase(dbPath, ['FIRST', 'SECOND']);
+
+    assert.throws(() => new UserStore({
+      dbPath,
+      migrationHook: ({ index }) => {
+        if (index === 0) throw new Error('injected migration failure');
+      },
+    }), /injected migration failure/);
+
+    const db = new DatabaseSync(dbPath);
+    const codes = db.prepare('SELECT code FROM invite_codes ORDER BY code').all().map(row => row.code);
+    assert.deepEqual(codes, ['FIRST', 'SECOND']);
+    assert.equal(db.prepare("SELECT value FROM schema_metadata WHERE key = 'invite_code_hashing'").get(), undefined);
+    db.close();
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('two file-backed store connections contending for one invite allow only one redemption', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mhfc-invite-contention-'));
+  const dbPath = path.join(root, 'bot.db');
+  try {
+    const store = new UserStore({ dbPath });
+    store.createInviteCode({ code: 'CONTEND', createdBy: 'admin', now: 1, expiresAt: 10_000 });
+    const barrier = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 2);
+    const first = contendForInvite(dbPath, 'first', barrier);
+    const second = contendForInvite(dbPath, 'second', barrier);
+    await releaseContentionBarrier(new Int32Array(barrier));
+    const results = await Promise.all([first, second]);
+
+    assert.equal(results.filter(result => result.ok).length, 1);
+    assert.equal(results.filter(result => !result.ok).length, 1);
+    const winner = results.find(result => result.ok).userId;
+    assert.equal(store.getInviteCode('CONTEND').used_by, winner);
+    assert.ok(store.getUser(winner));
+    assert.equal(store.listUsers().filter(user => ['first', 'second'].includes(user.telegram_user_id)).length, 1);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 // ── Login tokens ──────────────────────────────────────────────────────────────

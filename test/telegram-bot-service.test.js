@@ -105,6 +105,21 @@ test('/start payload redeems invite without asking for text', async () => {
   assert.match(fetch.calls.at(-1).body.text, /התחבר/);
 });
 
+test('/start payload for a revoked user does not consume an invitation', async () => {
+  const { store, botFactory } = makeBot();
+  store.createUser({ telegramUserId: '2' });
+  store.revokeUser('2');
+  store.createInviteCode({ code: 'FRESH', createdBy: '1', expiresAt: Date.now() + 60_000 });
+  const fetch = makeFetch([{ ok: true, result: {} }]);
+  const bot = botFactory(fetch);
+
+  await bot._dispatch(makeTextUpdate(2, '/start FRESH'));
+
+  assert.equal(store.getInviteCode('FRESH').used_by, null);
+  assert.equal(store.getUser('2').revoked, 1);
+  assert.match(fetch.calls.at(-1).body.text, /אין הרשאה/);
+});
+
 // ── invite code flow ────────────────────────────────────────────────────────
 
 test('valid invite link registers user', async () => {
@@ -136,7 +151,9 @@ test('/invite creates a Telegram deep link for an admin', async () => {
   bot.setBotUsername('MhfcTestBot');
   await bot._dispatch(makeTextUpdate(1, '/invite'));
   const body = fetch.calls[0].body;
-  assert.match(body.text, /https:\/\/t\.me\/MhfcTestBot\?start=/);
+  const match = body.text.match(/https:\/\/t\.me\/MhfcTestBot\?start=([A-Z0-9_-]+)/);
+  assert.ok(match);
+  assert.ok(match[1].length >= 32);
 });
 
 test('admin invite returns a Telegram deep link', async () => {

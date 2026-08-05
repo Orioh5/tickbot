@@ -73,13 +73,15 @@ function start({ botServices, baseUrl, env = process.env }) {
   botServices.userSessionStore   = userSessionStore;
   botServices.maccabiAuthenticator = maccabiAuthenticator;
 
-  void bot.initialize().then(() => bot.start()).catch(error => {
+  void bot.initialize().then(() => {
+    bot.start();
+    console.log('🤖  Telegram bot started');
+  }).catch(error => {
     console.error('[TelegramBotService] initialization failed:', error.message);
   });
   void monitorCoordinator.restoreActiveMonitors().catch(error => {
     console.error('[MonitorCoordinator] restore failed:', error.message);
   });
-  console.log('🤖  Telegram bot started');
   return bot;
 }
 
