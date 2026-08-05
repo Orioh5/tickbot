@@ -1,9 +1,12 @@
 'use strict';
 
 const { DatabaseSync } = require('node:sqlite');
+const fs = require('fs');
+const path = require('path');
 
 class UserStore {
   constructor({ dbPath = ':memory:' } = {}) {
+    if (dbPath !== ':memory:') fs.mkdirSync(path.dirname(dbPath), { recursive: true });
     this.db = new DatabaseSync(dbPath);
     this._init();
   }

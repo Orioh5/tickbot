@@ -13,9 +13,9 @@ const TelegramBotService = require('./telegram-bot-service');
 const MaccabiAuthenticator = require('./maccabi-authenticator');
 
 function start({ botServices, baseUrl, env = process.env }) {
-  const token = env.BOT_TOKEN;
+  const token = env.BOT_TOKEN || env.TELEGRAM_TOKEN;
   if (!token) {
-    console.warn('⚠️  BOT_TOKEN not set — Telegram bot is disabled.');
+    console.warn('⚠️  BOT_TOKEN/TELEGRAM_TOKEN not set — Telegram bot is disabled.');
     return null;
   }
 
@@ -41,7 +41,8 @@ function start({ botServices, baseUrl, env = process.env }) {
 
   const gameDiscovery = new GameDiscoveryService({ userSessionStore, browserFactory });
 
-  const adminUserIds = (env.BOT_ADMIN_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
+  const adminUserIds = (env.BOT_ADMIN_IDS || env.TELEGRAM_CHAT_ID || '')
+    .split(',').map(s => s.trim()).filter(Boolean);
 
   // monitorCoordinator is created after bot so it can hold a reference to it
   let bot;

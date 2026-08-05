@@ -118,7 +118,7 @@ class MonitorCoordinator {
       storageState,
       telegramToken: '',    // notifications go through telegramBotService directly
       telegramChatId: chatId,
-      loginUrl: 'https://auth.mhaifafc.com/',
+      loginUrl: 'https://auth.mhaifafc.com/login',
       loginUsername: '',
       loginPassword: '',
     };

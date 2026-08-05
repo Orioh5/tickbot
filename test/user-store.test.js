@@ -3,6 +3,21 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const UserStore = require('../bot/user-store');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+
+test('creates the parent directory for a file-backed database', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mhfc-user-store-'));
+  const dbPath = path.join(root, 'nested', 'bot.db');
+  try {
+    const store = new UserStore({ dbPath });
+    store.createUser({ telegramUserId: '1' });
+    assert.ok(fs.existsSync(dbPath));
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
 
 function makeStore() {
   return new UserStore({ dbPath: ':memory:' });
