@@ -10,6 +10,7 @@ const STATE = {
   AWAITING_GAME: 'awaiting_game',
   AWAITING_SECTIONS: 'awaiting_sections',
   AWAITING_QUANTITY: 'awaiting_quantity',
+  AWAITING_CONFIRMATION: 'awaiting_confirmation',
 };
 
 const ACTIONS = Object.freeze({
@@ -18,6 +19,7 @@ const ACTIONS = Object.freeze({
   'menu:status': 'status',
   'menu:stop': 'stop',
   'menu:change': 'change',
+  'menu:home': 'home',
   'admin:invite': 'invite',
   'admin:users': 'users',
 });
@@ -286,6 +288,10 @@ class TelegramBotService {
         await this._cmdStop(userId, chatId, fromUser);
         return;
       }
+      case 'home':
+        this._clearState(userId);
+        await this.showMainMenu(userId, chatId);
+        return;
       case 'invite':
         await this._cmdInvite(userId, chatId, fromUser);
         return;
@@ -313,11 +319,17 @@ class TelegramBotService {
       await this.sendMessage(chatId, 'שגיאה: מתאם ניטור אינו זמין.');
       return;
     }
+    this._clearState(userId);
     await this.sendMessage(chatId, '⏳ מחפש משחקים זמינים...');
     try {
       const games = await this.monitorCoordinator.discoverGames(userId);
       if (!games.length) {
-        await this.sendMessage(chatId, 'לא נמצאו משחקים זמינים בחשבון.');
+        await this.sendMessage(chatId, 'לא נמצאו משחקים זמינים כרגע.', {
+          reply_markup: { inline_keyboard: [[
+            { text: '🔄 בדוק שוב', callback_data: 'games:retry' },
+            { text: '🏠 תפריט ראשי', callback_data: 'menu:home' },
+          ]] },
+        });
         return;
       }
       const keyboard = games.map((g, i) => [{ text: g.name, callback_data: `game:${i}` }]);
@@ -407,14 +419,14 @@ class TelegramBotService {
     await this.sendMessage(chatId, `✅ גישה בוטלה למשתמש ${targetId}.`);
   }
 
-  async _startConfiguredMonitor(userId, chatId, data, quantity) {
-    this._clearState(userId);
-    this.userStore.setMonitoringConfig(userId, { gameUrl: data.gameUrl, sections: data.sections, quantity });
-    await this.sendMessage(chatId, `⏳ מתחיל ניטור: גושים ${data.sections.join(', ')}, ${quantity} כרטיסים...`);
+  async _startConfiguredMonitor(userId, chatId, data) {
+    const { gameUrl, sections, quantity } = data;
+    this.userStore.setMonitoringConfig(userId, { gameUrl, sections, quantity });
+    await this.sendMessage(chatId, `⏳ מתחיל ניטור: גושים ${sections.join(', ')}, ${quantity} כרטיסים...`);
     try {
       const result = await this.monitorCoordinator.startMonitor(userId, {
-        gameUrl: data.gameUrl,
-        sections: data.sections,
+        gameUrl,
+        sections,
         quantity,
         chatId,
       });
@@ -467,6 +479,7 @@ class TelegramBotService {
         return;
       }
       const stateData = { gameUrl: game.url, availableSections, sections: [] };
+      stateData.gameName = game.name;
       this._setState(userId, STATE.AWAITING_SECTIONS, stateData);
       await this.sendMessage(chatId, `🎮 ${game.name}\nבחר גושים ולחץ ✅ סיימתי:`, {
         reply_markup: { inline_keyboard: this._buildSectionsKeyboard(stateData) },
@@ -508,14 +521,7 @@ class TelegramBotService {
         return;
       }
       this._setState(userId, STATE.AWAITING_QUANTITY, current.data);
-      await this.sendMessage(chatId, 'כמה כרטיסים לחפש?', {
-        reply_markup: {
-          inline_keyboard: [[1, 2, 3, 4].map(quantity => ({
-            text: String(quantity),
-            callback_data: `quantity:${quantity}`,
-          }))],
-        },
-      });
+      await this._sendQuantityPrompt(chatId);
       return;
     }
 
@@ -526,7 +532,61 @@ class TelegramBotService {
         await this.showMainMenu(userId, chatId);
         return;
       }
-      await this._startConfiguredMonitor(userId, chatId, current.data, Number(quantityMatch[1]));
+      const confirmation = { ...current.data, quantity: Number(quantityMatch[1]) };
+      this._setState(userId, STATE.AWAITING_CONFIRMATION, confirmation);
+      await this.sendMessage(chatId,
+        `סיכום הניטור:\n🎮 משחק: ${confirmation.gameName || 'המשחק שנבחר'}\n` +
+        `🪑 גושים: ${confirmation.sections.join(', ')}\n🎟 כמות: ${confirmation.quantity}\n\nלאשר התחלת ניטור?`,
+        {
+          reply_markup: { inline_keyboard: [
+            [{ text: '✅ אשר ניטור', callback_data: 'setup:confirm' }],
+            [
+              { text: '⬅️ חזור לכמות', callback_data: 'setup:back' },
+              { text: '✖️ ביטול', callback_data: 'setup:cancel' },
+            ],
+          ] },
+        }
+      );
+      return;
+    }
+
+    if (data === 'setup:confirm') {
+      const current = this._getState(userId);
+      if (current.state !== STATE.AWAITING_CONFIRMATION) {
+        await this.showMainMenu(userId, chatId);
+        return;
+      }
+      // Claim this setup before awaiting the coordinator so repeat callbacks are stale.
+      this._clearState(userId);
+      await this._startConfiguredMonitor(userId, chatId, current.data);
+      return;
+    }
+
+    if (data === 'setup:back') {
+      const current = this._getState(userId);
+      if (current.state !== STATE.AWAITING_CONFIRMATION) {
+        await this.showMainMenu(userId, chatId);
+        return;
+      }
+      const { quantity, ...quantityData } = current.data;
+      this._setState(userId, STATE.AWAITING_QUANTITY, quantityData);
+      await this._sendQuantityPrompt(chatId);
+      return;
+    }
+
+    if (data === 'setup:cancel') {
+      const current = this._getState(userId);
+      if (current.state !== STATE.AWAITING_CONFIRMATION) {
+        await this.showMainMenu(userId, chatId);
+        return;
+      }
+      this._clearState(userId);
+      await this.showMainMenu(userId, chatId);
+      return;
+    }
+
+    if (data === 'games:retry') {
+      await this._cmdGames(userId, chatId);
       return;
     }
 
@@ -581,6 +641,17 @@ class TelegramBotService {
     }
     keyboard.push([{ text: `✅ סיימתי (${selected.size})`, callback_data: 'sections_done' }]);
     return keyboard;
+  }
+
+  async _sendQuantityPrompt(chatId) {
+    await this.sendMessage(chatId, 'כמה כרטיסים לחפש?', {
+      reply_markup: {
+        inline_keyboard: [[1, 2, 3, 4].map(quantity => ({
+          text: String(quantity),
+          callback_data: `quantity:${quantity}`,
+        }))],
+      },
+    });
   }
 
   async _call(method, body = {}, options = {}) {

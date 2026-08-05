@@ -505,20 +505,157 @@ test('section selection finishes with quantity buttons restricted to 1-4', async
   assert.deepEqual(keyboard.map(button => button.callback_data), ['quantity:1', 'quantity:2', 'quantity:3', 'quantity:4']);
 });
 
-test('quantity callback reports queued monitoring accurately', async () => {
+test('quantity selection shows a sanitized confirmation summary without starting monitoring', async () => {
+  const startCalls = [];
   const coordinator = {
-    startMonitor: async () => ({ status: 'queued' }),
+    startMonitor: async (...args) => startCalls.push(args),
   };
-  const { botFactory } = makeBot({ extraUserIds: ['7'], monitorCoordinator: coordinator });
+  const { store, botFactory } = makeBot({ extraUserIds: ['7'], monitorCoordinator: coordinator });
   const fetch = makeFetch([
     { ok: true, result: {} },
     { ok: true, result: {} },
     { ok: true, result: {} },
   ]);
   const bot = botFactory(fetch);
-  bot._setState('7', 'awaiting_quantity', { gameUrl: 'u', sections: ['13'] });
+  bot._setState('7', 'awaiting_quantity', {
+    gameUrl: 'https://tickets.mhaifafc.com/game/1',
+    gameName: 'Game',
+    sections: ['13'],
+  });
+
   await bot._dispatch(makeCallbackUpdate(7, 'quantity:2'));
-  assert.match(fetch.calls.at(-1).body.text, /בתור/);
+
+  assert.equal(startCalls.length, 0);
+  assert.equal(store.getMonitoringConfig('7'), null);
+  assert.match(fetch.calls.at(-1).body.text, /Game.*13.*2/s);
+  assert.doesNotMatch(fetch.calls.at(-1).body.text, /tickets\.mhaifafc\.com/);
+  assert.deepEqual(
+    fetch.calls.at(-1).body.reply_markup.inline_keyboard.flat().map(button => button.callback_data),
+    ['setup:confirm', 'setup:back', 'setup:cancel']
+  );
+  assert.deepEqual(bot._getState('7'), {
+    state: 'awaiting_confirmation',
+    data: {
+      gameUrl: 'https://tickets.mhaifafc.com/game/1',
+      gameName: 'Game',
+      sections: ['13'],
+      quantity: 2,
+    },
+  });
+});
+
+test('setup confirmation claims the state before starting so a double click starts one monitor', async () => {
+  const startCalls = [];
+  let resolveStart;
+  const coordinator = {
+    getStatus: () => null,
+    startMonitor: (...args) => {
+      startCalls.push(args);
+      return new Promise(resolve => { resolveStart = resolve; });
+    },
+  };
+  const { store, botFactory } = makeBot({ extraUserIds: ['7'], monitorCoordinator: coordinator });
+  const fetch = makeFetch(Array.from({ length: 8 }, () => ({ ok: true, result: {} })));
+  const bot = botFactory(fetch);
+  bot._setState('7', 'awaiting_confirmation', {
+    gameUrl: 'https://tickets.mhaifafc.com/game/1',
+    gameName: 'Game',
+    sections: ['13'],
+    quantity: 2,
+  });
+
+  const first = bot._dispatch(makeCallbackUpdate(7, 'setup:confirm'));
+  await new Promise(resolve => setImmediate(resolve));
+  const second = bot._dispatch(makeCallbackUpdate(7, 'setup:confirm'));
+  resolveStart({ status: 'queued' });
+  await Promise.all([first, second]);
+
+  assert.equal(startCalls.length, 1);
+  assert.deepEqual(store.getMonitoringConfig('7'), {
+    telegram_user_id: '7',
+    game_url: 'https://tickets.mhaifafc.com/game/1',
+    sections: ['13'],
+    quantity: 2,
+    active: 1,
+  });
+  assert.equal(bot._getState('7').state, 'idle');
+});
+
+test('setup back restores the quantity step without losing its selected game or sections', async () => {
+  const { botFactory } = makeBot({ extraUserIds: ['7'] });
+  const fetch = makeFetch(Array.from({ length: 3 }, () => ({ ok: true, result: {} })));
+  const bot = botFactory(fetch);
+  bot._setState('7', 'awaiting_confirmation', {
+    gameUrl: 'https://tickets.mhaifafc.com/game/1', gameName: 'Game', sections: ['13'], quantity: 2,
+  });
+
+  await bot._dispatch(makeCallbackUpdate(7, 'setup:back'));
+
+  assert.deepEqual(bot._getState('7'), {
+    state: 'awaiting_quantity',
+    data: { gameUrl: 'https://tickets.mhaifafc.com/game/1', gameName: 'Game', sections: ['13'] },
+  });
+  assert.deepEqual(
+    fetch.calls.at(-1).body.reply_markup.inline_keyboard.flat().map(button => button.callback_data),
+    ['quantity:1', 'quantity:2', 'quantity:3', 'quantity:4']
+  );
+});
+
+test('setup cancel clears pending setup and returns to the main menu', async () => {
+  const { botFactory } = makeBot({ extraUserIds: ['7'] });
+  const fetch = makeFetch(Array.from({ length: 3 }, () => ({ ok: true, result: {} })));
+  const bot = botFactory(fetch);
+  bot._setState('7', 'awaiting_confirmation', {
+    gameUrl: 'https://tickets.mhaifafc.com/game/1', gameName: 'Game', sections: ['13'], quantity: 2,
+  });
+
+  await bot._dispatch(makeCallbackUpdate(7, 'setup:cancel'));
+
+  assert.equal(bot._getState('7').state, 'idle');
+  assert.match(fetch.calls.at(-1).body.text, /מה תרצה לעשות/);
+});
+
+test('empty game discovery offers retry and home buttons', async () => {
+  const coordinator = { discoverGames: async () => [] };
+  const { botFactory } = makeBot({ extraUserIds: ['7'], monitorCoordinator: coordinator });
+  const fetch = makeFetch(Array.from({ length: 3 }, () => ({ ok: true, result: {} })));
+  const bot = botFactory(fetch);
+
+  await bot._dispatch(makeCallbackUpdate(7, 'menu:games'));
+
+  const message = fetch.calls.at(-1).body;
+  assert.equal(message.text, 'לא נמצאו משחקים זמינים כרגע.');
+  assert.deepEqual(
+    message.reply_markup.inline_keyboard.flat().map(button => button.callback_data),
+    ['games:retry', 'menu:home']
+  );
+});
+
+test('games retry clears stale game choices before showing an empty-result prompt', async () => {
+  const coordinator = { discoverGames: async () => [], getStatus: () => null };
+  const { botFactory } = makeBot({ extraUserIds: ['7'], monitorCoordinator: coordinator });
+  const fetch = makeFetch(Array.from({ length: 3 }, () => ({ ok: true, result: {} })));
+  const bot = botFactory(fetch);
+  bot._setState('7', 'awaiting_game', { games: [{ name: 'Old game', url: 'https://tickets.mhaifafc.com/game/old' }] });
+
+  await bot._dispatch(makeCallbackUpdate(7, 'games:retry'));
+
+  assert.equal(bot._getState('7').state, 'idle');
+  assert.equal(fetch.calls.at(-1).body.text, 'לא נמצאו משחקים זמינים כרגע.');
+});
+
+test('menu home clears a pending setup safely', async () => {
+  const { botFactory } = makeBot({ extraUserIds: ['7'] });
+  const fetch = makeFetch(Array.from({ length: 2 }, () => ({ ok: true, result: {} })));
+  const bot = botFactory(fetch);
+  bot._setState('7', 'awaiting_confirmation', {
+    gameUrl: 'https://tickets.mhaifafc.com/game/1', gameName: 'Game', sections: ['13'], quantity: 2,
+  });
+
+  await bot._dispatch(makeCallbackUpdate(7, 'menu:home'));
+
+  assert.equal(bot._getState('7').state, 'idle');
+  assert.match(fetch.calls.at(-1).body.text, /מה תרצה לעשות/);
 });
 
 test('free text cannot bypass buttons and redisplays the current menu', async () => {
