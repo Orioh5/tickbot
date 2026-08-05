@@ -1,0 +1,506 @@
+'use strict';
+
+const POLL_TIMEOUT_S = 25; // long-poll seconds
+const STADIUM_CATALOG = require('./stadium-catalog');
+
+// Conversation states tracked per user
+const STATE = {
+  IDLE: 'idle',
+  AWAITING_INVITE: 'awaiting_invite',
+  AWAITING_GAME: 'awaiting_game',
+  AWAITING_SECTIONS: 'awaiting_sections',
+  AWAITING_QUANTITY: 'awaiting_quantity',
+};
+
+class TelegramBotService {
+  constructor({
+    token,
+    adminUserIds = [],
+    userStore,
+    secureLoginService,
+    monitorCoordinator,
+    userSessionStore,
+    fetchImpl = fetch,
+    now = () => Date.now(),
+  }) {
+    this.token = token;
+    this.adminUserIds = new Set(adminUserIds.map(String));
+    this.userStore = userStore;
+    this.secureLoginService = secureLoginService;
+    this.monitorCoordinator = monitorCoordinator;
+    this.userSessionStore = userSessionStore;
+    this.fetchImpl = fetchImpl;
+    this.now = now;
+
+    this._offset = 0;
+    this._running = false;
+    this._stopController = null;
+
+    // nonce → { userId, handler, timer }
+    this._callbackHandlers = new Map();
+
+    // userId → { state, data }
+    this._convState = new Map();
+  }
+
+  // ── Lifecycle ───────────────────────────────────────────────────────────────
+
+  start() {
+    if (this._running) return;
+    this._running = true;
+    this._stopController = new AbortController();
+    this._loop(this._stopController.signal).catch(() => {});
+  }
+
+  async stop() {
+    this._running = false;
+    this._stopController?.abort();
+  }
+
+  // ── Public: send and callbacks ─────────────────────────────────────────────
+
+  async sendMessage(chatId, text, extra = {}) {
+    return this._call('sendMessage', { chat_id: chatId, text, ...extra });
+  }
+
+  async sendMarkdown(chatId, text, extra = {}) {
+    return this._call('sendMessage', { chat_id: chatId, text, parse_mode: 'Markdown', ...extra });
+  }
+
+  // Register a one-time callback handler for an inline-keyboard nonce.
+  // handler(candidateKey) is called once when a matching callback arrives.
+  // Automatically cleaned up after timeoutMs or when called.
+  registerCallbackHandler(nonce, userId, handler, timeoutMs = 180_000) {
+    const timer = setTimeout(() => {
+      if (this._callbackHandlers.has(nonce)) {
+        this._callbackHandlers.delete(nonce);
+        handler(null); // null = timed out
+      }
+    }, timeoutMs);
+    this._callbackHandlers.set(nonce, { userId: String(userId), handler, timer });
+  }
+
+  deregisterCallbackHandler(nonce) {
+    const entry = this._callbackHandlers.get(nonce);
+    if (entry) {
+      clearTimeout(entry.timer);
+      this._callbackHandlers.delete(nonce);
+    }
+  }
+
+  // ── Conversation state helpers ─────────────────────────────────────────────
+
+  _setState(userId, state, data = {}) {
+    this._convState.set(String(userId), { state, data });
+  }
+
+  _getState(userId) {
+    return this._convState.get(String(userId)) ?? { state: STATE.IDLE, data: {} };
+  }
+
+  _clearState(userId) {
+    this._convState.delete(String(userId));
+  }
+
+  // ── Poll loop ──────────────────────────────────────────────────────────────
+
+  async _loop(signal) {
+    while (this._running && !signal.aborted) {
+      try {
+        const updates = await this._call('getUpdates', {
+          offset: this._offset,
+          timeout: POLL_TIMEOUT_S,
+          allowed_updates: ['message', 'callback_query'],
+        }, { signal });
+        for (const update of updates) {
+          this._offset = Math.max(this._offset, update.update_id + 1);
+          await this._dispatch(update).catch(err => {
+            console.error('[TelegramBotService] dispatch error:', err.message);
+          });
+        }
+      } catch (err) {
+        if (signal.aborted || err.name === 'AbortError') break;
+        // Brief back-off on network errors
+        await new Promise(r => setTimeout(r, 3000));
+      }
+    }
+  }
+
+  async _dispatch(update) {
+    if (update.callback_query) {
+      await this._handleCallback(update.callback_query);
+      return;
+    }
+    const msg = update.message;
+    if (!msg?.text) return;
+
+    const userId = String(msg.from?.id ?? '');
+    const chatId = String(msg.chat?.id ?? '');
+    const text = msg.text.trim();
+
+    if (msg.chat?.type && msg.chat.type !== 'private') {
+      await this.sendMessage(chatId, 'מטעמי פרטיות ואבטחה, יש להשתמש בבוט רק בצ׳אט פרטי.');
+      return;
+    }
+
+    // Routing: commands take priority over conversation state
+    if (text.startsWith('/start')) {
+      await this._cmdStart(userId, chatId, msg.from);
+      return;
+    }
+    if (text.startsWith('/login') && this._isUser(userId)) {
+      await this._cmdLogin(userId, chatId);
+      return;
+    }
+    if (text.startsWith('/games') && this._isUser(userId)) {
+      await this._cmdGames(userId, chatId);
+      return;
+    }
+    if (text.startsWith('/stop') && this._isUser(userId)) {
+      await this._cmdStop(userId, chatId);
+      return;
+    }
+    if (text.startsWith('/status') && this._isUser(userId)) {
+      await this._cmdStatus(userId, chatId);
+      return;
+    }
+    // Admin commands
+    if (text.startsWith('/invite') && this._isAdmin(userId)) {
+      await this._cmdInvite(userId, chatId);
+      return;
+    }
+    if (text.startsWith('/users') && this._isAdmin(userId)) {
+      await this._cmdUsers(userId, chatId);
+      return;
+    }
+    if (text.startsWith('/revoke') && this._isAdmin(userId)) {
+      await this._cmdRevoke(userId, chatId, text);
+      return;
+    }
+
+    // Conversation state handler
+    const { state, data } = this._getState(userId);
+    if (state === STATE.AWAITING_INVITE) {
+      await this._handleInviteInput(userId, chatId, text, msg.from);
+      return;
+    }
+    if (state === STATE.AWAITING_SECTIONS) {
+      await this.sendMessage(chatId, 'בחר גושים באמצעות הכפתורים בהודעה האחרונה.');
+      return;
+    }
+    if (state === STATE.AWAITING_QUANTITY) {
+      await this.sendMessage(chatId, 'בחר כמות באמצעות הכפתורים: 1, 2, 3 או 4.');
+      return;
+    }
+
+    // Unrecognized input
+    if (!this._isUser(userId) && !this._isAdmin(userId)) {
+      await this.sendMessage(chatId, 'לא ניתן להשתמש בבוט ללא הזמנה. שלח /start כדי להתחיל.');
+    }
+  }
+
+  // ── Command handlers ───────────────────────────────────────────────────────
+
+  async _cmdStart(userId, chatId, fromUser) {
+    const user = this.userStore.getUser(userId);
+    if (user && !user.revoked) {
+      await this.sendMessage(chatId, `ברוך הבא! שלח /games לבחירת משחק, /login לחיבור חשבון, /status לסטטוס.`);
+      return;
+    }
+    if (this._isAdmin(userId)) {
+      this.userStore.createUser({ telegramUserId: userId, username: fromUser?.username });
+      await this.sendMessage(chatId, 'אדמין מחובר. שלח /invite ליצירת קוד הזמנה.');
+      return;
+    }
+    this._setState(userId, STATE.AWAITING_INVITE);
+    await this.sendMessage(chatId, 'שלום! הזן קוד הזמנה כדי להתחיל:');
+  }
+
+  async _cmdLogin(userId, chatId) {
+    if (!this.secureLoginService) {
+      await this.sendMessage(chatId, 'שגיאה: שירות ההתחברות אינו זמין.');
+      return;
+    }
+    const link = this.secureLoginService.createLoginLink(userId);
+    await this.sendMessage(chatId,
+      `לחץ על הקישור להתחברות לחשבון מכבי חיפה שלך (תקף ל-10 דקות):\n${link}`
+    );
+  }
+
+  async _cmdGames(userId, chatId) {
+    if (!this.monitorCoordinator) {
+      await this.sendMessage(chatId, 'שגיאה: מתאם ניטור אינו זמין.');
+      return;
+    }
+    await this.sendMessage(chatId, '⏳ מחפש משחקים זמינים...');
+    try {
+      const games = await this.monitorCoordinator.discoverGames(userId);
+      if (!games.length) {
+        await this.sendMessage(chatId, 'לא נמצאו משחקים זמינים בחשבון.');
+        return;
+      }
+      const keyboard = games.map((g, i) => [{ text: g.name, callback_data: `game:${i}` }]);
+      this._setState(userId, STATE.AWAITING_GAME, { games });
+      await this.sendMessage(chatId, 'בחר משחק:', {
+        reply_markup: { inline_keyboard: keyboard },
+      });
+    } catch (err) {
+      await this.sendMessage(chatId, `שגיאה בחיפוש משחקים: ${err.message}`);
+    }
+  }
+
+  async _cmdStop(userId, chatId) {
+    if (this.monitorCoordinator?.getStatus(userId)) {
+      await this.monitorCoordinator.stopMonitor(userId);
+      this.userStore.setMonitoringActive(userId, false);
+      await this.sendMessage(chatId, '⏹ ניטור הופסק.');
+    } else {
+      await this.sendMessage(chatId, 'אין ניטור פעיל.');
+    }
+  }
+
+  async _cmdStatus(userId, chatId) {
+    const status = this.monitorCoordinator?.getStatus(userId);
+    if (!status) {
+      await this.sendMessage(chatId, 'אין ניטור פעיל כרגע.');
+      return;
+    }
+    const cfg = this.userStore.getMonitoringConfig(userId);
+    await this.sendMessage(chatId,
+      `📊 סטטוס: ${status.phase}\n` +
+      `🎮 משחק: ${cfg?.game_url || '—'}\n` +
+      `🪑 גושים: ${cfg?.sections?.join(', ') || '—'}`
+    );
+  }
+
+  async _cmdInvite(userId, chatId) {
+    const activeUsers = this.userStore.listUsers().filter(user => !user.revoked).length;
+    if (activeUsers >= 10) {
+      await this.sendMessage(chatId, 'הגעת למגבלת ה־MVP של 10 משתמשים פעילים.');
+      return;
+    }
+    const crypto = require('crypto');
+    const code = crypto.randomBytes(4).toString('hex').toUpperCase();
+    this.userStore.createInviteCode({ code, createdBy: userId });
+    await this.sendMessage(chatId, `קוד הזמנה חדש: \`${code}\`\n(שתף אותו עם המשתמש הרצוי)`, {
+      parse_mode: 'Markdown',
+    });
+  }
+
+  async _cmdUsers(userId, chatId) {
+    const users = this.userStore.listUsers();
+    if (!users.length) {
+      await this.sendMessage(chatId, 'אין משתמשים רשומים.');
+      return;
+    }
+    const lines = users.map(u =>
+      `${u.revoked ? '🚫' : '✅'} ${u.username || '(ללא שם)'} — \`${u.telegram_user_id}\``
+    );
+    await this.sendMarkdown(chatId, `*משתמשים:*\n${lines.join('\n')}`);
+  }
+
+  async _cmdRevoke(userId, chatId, text) {
+    const targetId = text.replace('/revoke', '').trim();
+    if (!targetId) {
+      await this.sendMessage(chatId, 'שימוש: /revoke <telegram_user_id>');
+      return;
+    }
+    const target = this.userStore.getUser(targetId);
+    if (!target) {
+      await this.sendMessage(chatId, 'משתמש לא נמצא.');
+      return;
+    }
+    await this.monitorCoordinator?.stopMonitor(targetId);
+    this.userStore.revokeUser(targetId);
+    this.userStore.setMonitoringActive(targetId, false);
+    this.userSessionStore?.delete(targetId);
+    this._clearState(targetId);
+    for (const [nonce, entry] of this._callbackHandlers) {
+      if (entry.userId === String(targetId)) this.deregisterCallbackHandler(nonce);
+    }
+    await this.sendMessage(chatId, `✅ גישה בוטלה למשתמש ${targetId}.`);
+  }
+
+  // ── Conversation input handlers ────────────────────────────────────────────
+
+  async _handleInviteInput(userId, chatId, text, fromUser) {
+    const code = text.trim().toUpperCase();
+    try {
+      const activeUsers = this.userStore.listUsers().filter(user => !user.revoked).length;
+      if (activeUsers >= 10) throw new Error('המערכת הגיעה למגבלת 10 משתמשים פעילים');
+      this.userStore.redeemInviteCode({ code, userId, username: fromUser?.username });
+      this._clearState(userId);
+      await this.sendMessage(chatId, '✅ הצטרפת בהצלחה! שלח /login לחיבור חשבון מכבי חיפה שלך.');
+    } catch (err) {
+      await this.sendMessage(chatId, `❌ ${err.message}. נסה שוב:`);
+    }
+  }
+
+  async _startConfiguredMonitor(userId, chatId, data, quantity) {
+    this._clearState(userId);
+    this.userStore.setMonitoringConfig(userId, { gameUrl: data.gameUrl, sections: data.sections, quantity });
+    await this.sendMessage(chatId, `⏳ מתחיל ניטור: גושים ${data.sections.join(', ')}, ${quantity} כרטיסים...`);
+    try {
+      const result = await this.monitorCoordinator.startMonitor(userId, {
+        gameUrl: data.gameUrl,
+        sections: data.sections,
+        quantity,
+        chatId,
+      });
+      this.userStore.setMonitoringActive(userId, true);
+      await this.sendMessage(chatId, result?.status === 'queued'
+        ? '🕒 המעקב נשמר ונמצא בתור. הוא יתחיל אוטומטית כשיתפנה דפדפן.'
+        : '✅ ניטור פעיל. תקבל התראה כשייפתחו כרטיסים.');
+    } catch (err) {
+      await this.sendMessage(chatId, `❌ שגיאה בהפעלת ניטור: ${err.message}`);
+    }
+  }
+
+  // ── Callback query handler ─────────────────────────────────────────────────
+
+  async _handleCallback(query) {
+    const userId = String(query.from?.id ?? '');
+    const chatId = String(query.message?.chat?.id ?? '');
+    const data = String(query.data || '');
+
+    if (query.message?.chat?.type && query.message.chat.type !== 'private') return;
+    if (!this._isUser(userId) && !this._isAdmin(userId)) return;
+
+    await this._call('answerCallbackQuery', { callback_query_id: query.id }).catch(() => {});
+
+    if (data === 'noop') return;
+
+    // Game selection
+    const gameMatch = data.match(/^game:(\d+)$/);
+    if (gameMatch) {
+      const { state, data: convData } = this._getState(userId);
+      if (state !== STATE.AWAITING_GAME) return;
+      const game = convData.games?.[parseInt(gameMatch[1], 10)];
+      if (!game) return;
+      const discovered = await this.monitorCoordinator.discoverSections(userId, game.url);
+      const availableSections = [...new Set(discovered.map(section => String(section.label)))];
+      if (!availableSections.length) {
+        await this.sendMessage(chatId, `🎮 ${game.name}\nלא נמצאו גושים במפת המשחק כרגע.`);
+        return;
+      }
+      const stateData = { gameUrl: game.url, availableSections, sections: [] };
+      this._setState(userId, STATE.AWAITING_SECTIONS, stateData);
+      await this.sendMessage(chatId, `🎮 ${game.name}\nבחר גושים ולחץ ✅ סיימתי:`, {
+        reply_markup: { inline_keyboard: this._buildSectionsKeyboard(stateData) },
+      });
+      return;
+    }
+
+    const sectionMatch = data.match(/^section:(\d+)$/);
+    if (sectionMatch) {
+      const current = this._getState(userId);
+      if (current.state !== STATE.AWAITING_SECTIONS) return;
+      const label = sectionMatch[1];
+      if (!current.data.availableSections?.includes(label)) return;
+      const selected = new Set(current.data.sections || []);
+      if (selected.has(label)) selected.delete(label);
+      else selected.add(label);
+      current.data.sections = [...selected];
+      this._setState(userId, STATE.AWAITING_SECTIONS, current.data);
+      await this.sendMessage(chatId, `נבחרו ${selected.size} גושים:`, {
+        reply_markup: { inline_keyboard: this._buildSectionsKeyboard(current.data) },
+      });
+      return;
+    }
+
+    if (data === 'sections_done') {
+      const current = this._getState(userId);
+      if (current.state !== STATE.AWAITING_SECTIONS) return;
+      if (!current.data.sections?.length) {
+        await this.sendMessage(chatId, 'בחר לפחות גוש אחד לפני שממשיכים.');
+        return;
+      }
+      this._setState(userId, STATE.AWAITING_QUANTITY, current.data);
+      await this.sendMessage(chatId, 'כמה כרטיסים לחפש?', {
+        reply_markup: {
+          inline_keyboard: [[1, 2, 3, 4].map(quantity => ({
+            text: String(quantity),
+            callback_data: `quantity:${quantity}`,
+          }))],
+        },
+      });
+      return;
+    }
+
+    const quantityMatch = data.match(/^quantity:([1-4])$/);
+    if (quantityMatch) {
+      const current = this._getState(userId);
+      if (current.state !== STATE.AWAITING_QUANTITY) return;
+      await this._startConfiguredMonitor(userId, chatId, current.data, Number(quantityMatch[1]));
+      return;
+    }
+
+    // Owner-selection or other registered nonces
+    const parts = data.split(':');
+    const nonce = parts[0];
+    const candidateKey = parts.slice(1).join(':');
+    const entry = this._callbackHandlers.get(nonce);
+    if (entry && entry.userId === userId) {
+      clearTimeout(entry.timer);
+      this._callbackHandlers.delete(nonce);
+      entry.handler(candidateKey);
+    }
+  }
+
+  // ── Helpers ────────────────────────────────────────────────────────────────
+
+  _isUser(userId) {
+    const user = this.userStore.getUser(userId);
+    return user != null && !user.revoked;
+  }
+
+  _isAdmin(userId) {
+    return this.adminUserIds.has(String(userId));
+  }
+
+  _buildSectionsKeyboard({ availableSections = [], sections = [] }) {
+    const selected = new Set(sections);
+    const grouped = new Map();
+    for (const label of availableSections) {
+      const stand = Object.entries(STADIUM_CATALOG)
+        .find(([, labels]) => labels.includes(label))?.[0] || 'גושים מהמפה';
+      if (!grouped.has(stand)) grouped.set(stand, []);
+      grouped.get(stand).push(label);
+    }
+
+    const keyboard = [];
+    for (const [stand, labels] of grouped) {
+      keyboard.push([{ text: `— ${stand} —`, callback_data: 'noop' }]);
+      for (let i = 0; i < labels.length; i += 4) {
+        keyboard.push(labels.slice(i, i + 4).map(label => ({
+          text: `${selected.has(label) ? '✅ ' : ''}${label}`,
+          callback_data: `section:${label}`,
+        })));
+      }
+    }
+    keyboard.push([{ text: `✅ סיימתי (${selected.size})`, callback_data: 'sections_done' }]);
+    return keyboard;
+  }
+
+  async _call(method, body = {}, options = {}) {
+    const signal = options.signal;
+    if (signal?.aborted) throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+
+    const response = await this.fetchImpl(
+      `https://api.telegram.org/bot${this.token}/${method}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal,
+      }
+    );
+    const payload = await response.json();
+    if (!response.ok || !payload.ok) {
+      throw new Error(`Telegram ${method} failed: ${payload.description || response.status}`);
+    }
+    return payload.result;
+  }
+}
+
+module.exports = TelegramBotService;

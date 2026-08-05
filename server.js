@@ -2,6 +2,11 @@
 
 require('dotenv').config();
 
+if (!process.env.ENCRYPTION_KEY) {
+  console.error('Fatal: ENCRYPTION_KEY environment variable is required but not set.');
+  process.exit(1);
+}
+
 const express = require('express');
 const http    = require('http');
 const https   = require('https');
@@ -14,6 +19,10 @@ const {
   SettingsValidationError,
   validateMonitorPrerequisites,
 } = require('./settings-store');
+
+// Bot services — populated by bot/bot-server.js after this module is loaded.
+// Kept as a mutable object so bot-server.js can assign into it without circular deps.
+const botServices = { secureLoginService: null, userSessionStore: null, maccabiAuthenticator: null };
 
 const app    = express();
 const server = http.createServer(app);
@@ -123,6 +132,70 @@ app.use(express.json());
 
 // Routes reachable without a session — must come before the auth gate.
 app.get('/login.html', (req, res) => res.sendFile(path.join(__dirname, 'public', 'login.html')));
+
+// ── Bot login flow ─────────────────────────────────────────────────────────
+// GET: show a login form (after validating the one-time token without consuming it).
+// POST: consume the token, use Playwright to authenticate, save storageState.
+// Credentials pass through a single async call — never persisted.
+
+app.get('/bot-login', (req, res) => {
+  const rawToken = String(req.query.t || '');
+  if (!rawToken) return res.status(400).send('חוסר: קישור ללא טוקן.');
+  const svc = botServices.secureLoginService;
+  if (!svc) return res.status(503).send('Bot login not available.');
+  try {
+    svc.verifyToken(rawToken); // peek — does not consume
+  } catch (err) {
+    return res.status(400).send(`קישור לא תקין: ${err.message}`);
+  }
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(`<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head><meta charset="utf-8"><title>התחברות — מכבי חיפה</title>
+<style>body{font-family:sans-serif;max-width:360px;margin:60px auto;padding:0 16px}
+input{display:block;width:100%;margin:8px 0;padding:8px;box-sizing:border-box;font-size:16px}
+button{width:100%;padding:12px;background:#005BAC;color:#fff;border:none;font-size:16px;cursor:pointer;margin-top:8px;border-radius:4px}
+.note{font-size:12px;color:#666;margin-top:12px}</style></head>
+<body>
+<h2>התחבר לחשבון מכבי חיפה</h2>
+<p>הזן את פרטי הגישה שלך. הם ישמשו להתחברות בלבד ולא יישמרו.</p>
+<form method="POST" action="/bot-login">
+  <input type="hidden" name="t" value="${rawToken.replace(/"/g, '&quot;')}">
+  <label>שם משתמש<input type="text" name="username" autocomplete="username" required></label>
+  <label>סיסמה<input type="password" name="password" autocomplete="current-password" required></label>
+  <button type="submit">התחבר</button>
+</form>
+<p class="note">פרטיך לא נשמרים — הם משמשים רק להתחברות חד-פעמית. הקישור תקף ל-10 דקות.</p>
+</body></html>`);
+});
+
+app.post('/bot-login', express.urlencoded({ extended: false }), async (req, res) => {
+  const rawToken = String(req.body?.t || '');
+  const username = String(req.body?.username || '');
+  const password = String(req.body?.password || '');
+  const svc = botServices.secureLoginService;
+  const sessionStore = botServices.userSessionStore;
+  const authenticator = botServices.maccabiAuthenticator;
+  if (!svc || !sessionStore || !authenticator) return res.status(503).send('Bot login not available.');
+  let userId;
+  try {
+    userId = svc.verifyToken(rawToken); // keep valid so a failed login can be retried
+  } catch (err) {
+    return res.status(400).send(`שגיאה: ${err.message}`);
+  }
+  try {
+    const storageState = await authenticator.login(username, password);
+    const redeemedUserId = svc.redeemToken(rawToken);
+    if (redeemedUserId !== userId) throw new Error('Login token user mismatch');
+    await sessionStore.save(userId, storageState);
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.send('<!DOCTYPE html><html lang="he" dir="rtl"><head><meta charset="utf-8"><title>הצלחה</title></head>' +
+      '<body><h2>✅ התחברת בהצלחה!</h2><p>חזור לבוט בטלגרם כדי להמשיך.</p></body></html>');
+  } catch (err) {
+    console.error('[bot-login] Playwright login failed:', err.message);
+    res.status(401).send('ההתחברות נכשלה. בדוק את הפרטים ונסה שוב באמצעות אותו קישור.');
+  }
+});
 
 app.post('/api/login', (req, res) => {
   const { username, password } = req.body || {};
@@ -242,6 +315,10 @@ wss.on('connection', ws => {
 server.listen(PORT, () => {
   console.log(`\n🎟️  MHFC Ticket Monitor`);
   console.log(`   Running at http://localhost:${PORT}\n`);
+
+  const protocol = process.env.NODE_ENV === 'production' ? 'https' : 'http';
+  const baseUrl  = process.env.BASE_URL || `${protocol}://localhost:${PORT}`;
+  require('./bot/bot-server').start({ botServices, baseUrl });
 });
 
-module.exports = { server, PORT };
+module.exports = { server, PORT, botServices };

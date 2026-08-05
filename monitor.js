@@ -292,7 +292,10 @@ class Monitor extends EventEmitter {
       locale: 'he-IL',
     };
 
-    if (fs.existsSync(STATE_PATH)) {
+    if (s.storageState) {
+      ctxOpts.storageState = s.storageState;
+      this.log('Loaded per-user saved session', 'info');
+    } else if (fs.existsSync(STATE_PATH)) {
       try {
         ctxOpts.storageState = STATE_PATH;
         this.log('Loaded saved session', 'info');

@@ -3,6 +3,33 @@ const assert = require('node:assert/strict');
 
 const Monitor = require('../monitor');
 
+test('launch uses the per-user storageState supplied in settings', async () => {
+  const playwright = require('playwright');
+  const originalLaunch = playwright.chromium.launch;
+  const personalState = { cookies: [{ name: 'session', value: 'user-42', domain: '.mhaifafc.com', path: '/' }], origins: [] };
+  let contextOptions;
+  const fakeContext = {
+    route: async () => {},
+    newPage: async () => ({ on: () => {} }),
+  };
+
+  playwright.chromium.launch = async () => ({
+    newContext: async options => {
+      contextOptions = options;
+      return fakeContext;
+    },
+  });
+
+  try {
+    const monitor = new Monitor();
+    monitor.settings = { headful: false, storageState: personalState };
+    await monitor._launch();
+    assert.deepEqual(contextOptions.storageState, personalState);
+  } finally {
+    playwright.chromium.launch = originalLaunch;
+  }
+});
+
 function settings(overrides = {}) {
   return {
     url: 'https://tickets.mhaifafc.com/event',
