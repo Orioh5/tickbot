@@ -18,6 +18,7 @@ class MonitorCoordinator {
     this.telegramBotService = telegramBotService;
     this.maxConcurrent = maxConcurrent;
     this.MonitorClass = MonitorClass;
+    this.ownsPersistence = true;
 
     // userId → Monitor instance
     this._monitors = new Map();
@@ -264,13 +265,33 @@ class MonitorCoordinator {
     if (!session) throw new Error('No saved session. Use /login first.');
 
     const args = { gameUrl, sections, quantity, chatId };
+    this._persistAcceptedMonitoring(uid, args);
     if (this._monitors.size >= this.maxConcurrent) {
       this._queue.push({ userId: uid, args });
       return { status: 'queued' };
     }
 
-    await this._startNow(uid, args, session);
+    try {
+      await this._startNow(uid, args, session);
+    } catch (error) {
+      try { this.userStore.setMonitoringActive?.(uid, false); } catch (_) {}
+      throw error;
+    }
     return { status: 'started' };
+  }
+
+  _persistAcceptedMonitoring(uid, { gameUrl, sections, quantity }) {
+    if (typeof this.userStore.acceptMonitoring === 'function') {
+      this.userStore.acceptMonitoring(uid, { gameUrl, sections, quantity });
+      return;
+    }
+    // Compatibility for narrow stores. Production UserStore uses the atomic
+    // acceptMonitoring transaction above.
+    if (typeof this.userStore.setMonitoringConfig === 'function' &&
+        typeof this.userStore.setMonitoringActive === 'function') {
+      this.userStore.setMonitoringConfig(uid, { gameUrl, sections, quantity });
+      this.userStore.setMonitoringActive(uid, true);
+    }
   }
 
   async _startNow(uid, { gameUrl, sections, quantity = 1, chatId }, suppliedSession = null) {
@@ -287,7 +308,10 @@ class MonitorCoordinator {
     });
     monitor.on('log', (message, level) => {
       if (level === 'error') {
-        this.telegramBotService?.sendMessage(chatId, `⚠️ ${message}`).catch(() => {});
+        Promise.resolve(this.telegramBotService?.sendMessage(
+          chatId,
+          '⚠️ אירעה שגיאה זמנית במעקב. המערכת תנסה שוב אוטומטית.'
+        )).catch(() => {});
       }
     });
     const onSessionExpired = error => {
@@ -344,6 +368,7 @@ class MonitorCoordinator {
 
   async stopMonitor(userId) {
     const uid = String(userId);
+    try { this.userStore.setMonitoringActive?.(uid, false); } catch (_) {}
     const queuedIndex = this._queue.findIndex(job => job.userId === uid);
     if (queuedIndex !== -1) {
       this._queue.splice(queuedIndex, 1);

@@ -26,6 +26,22 @@ const ACTIONS = Object.freeze({
 });
 
 const ADMIN_ACTIONS = new Set(['invite', 'users']);
+const LOG_SAFE_ERROR_CODES = new Set([
+  'ABORT_ERR',
+  'BOT_IDENTITY_UNAVAILABLE',
+  'ECONNRESET',
+  'EAI_AGAIN',
+  'ENETUNREACH',
+  'ENOTFOUND',
+  'ETIMEDOUT',
+  'MONITOR_BUSY',
+  'SESSION_EXPIRED',
+]);
+
+function safeErrorCode(error, fallback) {
+  const code = typeof error?.code === 'string' ? error.code : '';
+  return LOG_SAFE_ERROR_CODES.has(code) ? code : fallback;
+}
 
 class TelegramBotService {
   constructor({
@@ -74,6 +90,26 @@ class TelegramBotService {
       throw new Error('Telegram getMe did not return a bot username');
     }
     this.setBotUsername(identity.username);
+  }
+
+  async initializeWithRetry({
+    maxAttempts = 5,
+    baseDelayMs = 500,
+    sleep = delay => new Promise(resolve => setTimeout(resolve, delay)),
+  } = {}) {
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        await this.initialize();
+        return;
+      } catch (error) {
+        if (attempt === maxAttempts) {
+          throw Object.assign(new Error('Telegram bot identity is unavailable'), {
+            code: safeErrorCode(error, 'BOT_IDENTITY_UNAVAILABLE'),
+          });
+        }
+        await sleep(baseDelayMs * (2 ** (attempt - 1)));
+      }
+    }
   }
 
   setBotUsername(username) {
@@ -143,7 +179,9 @@ class TelegramBotService {
         for (const update of updates) {
           this._offset = Math.max(this._offset, update.update_id + 1);
           await this._dispatch(update).catch(err => {
-            console.error('[TelegramBotService] dispatch error:', err.message);
+            console.error(
+              `[TelegramBotService] dispatch failed code=${safeErrorCode(err, 'DISPATCH_FAILED')}.`
+            );
           });
         }
       } catch (err) {
@@ -237,34 +275,45 @@ class TelegramBotService {
       await this.showMainMenu(userId, chatId);
     } catch (error) {
       this._clearState(userId);
-      await this.sendMessage(chatId, `❌ ${error.message}`);
+      await this.sendMessage(chatId, '❌ קישור ההזמנה אינו תקין, פג תוקף או כבר נוצל.');
     }
   }
 
-  async showMainMenu(userId, chatId) {
+  _getMenuSnapshot(userId) {
     const user = this.userStore.getUser(userId);
-    const hasSession = Boolean(user && !user.revoked && this.userSessionStore?.load(userId));
-    const status = this.monitorCoordinator?.getStatus(userId);
-    const menu = BotMenu.main({
+    let hasSession = false;
+    try {
+      hasSession = Boolean(user && !user.revoked && this.userSessionStore?.load(userId));
+    } catch (_) {
+      console.error('[TelegramBotService] session lookup failed code=SESSION_LOOKUP_FAILED.');
+    }
+    const status = typeof this.monitorCoordinator?.getStatus === 'function'
+      ? this.monitorCoordinator.getStatus(userId)
+      : null;
+    return BotMenu.snapshot({
       isRegistered: Boolean(user),
       isRevoked: Boolean(user?.revoked),
       isAdmin: this._isAdmin(userId),
       hasSession,
-      monitorPhase: status?.phase ?? status?.status ?? null,
+      monitorStatus: status ?? null,
     });
-    const text = !hasSession && user && !user.revoked
+  }
+
+  async showMainMenu(userId, chatId, suppliedSnapshot = null) {
+    const current = suppliedSnapshot || this._getMenuSnapshot(userId);
+    const menu = BotMenu.main(current);
+    const text = !current.hasSession && current.isRegistered && !current.isRevoked &&
+      current.lifecycle === 'idle'
       ? `${menu.text}\nלחץ על 🔐 התחבר כדי לחבר את החשבון שלך.`
       : menu.text;
     await this.sendMessage(chatId, text, { reply_markup: menu.reply_markup });
   }
 
   async _runAction(action, { userId, chatId, fromUser }) {
-    if (!this._isUser(userId)) {
-      await this.showMainMenu(userId, chatId);
-      return;
-    }
-    if (ADMIN_ACTIONS.has(action) && !this._isAdmin(userId)) {
-      await this.showMainMenu(userId, chatId);
+    const current = this._getMenuSnapshot(userId);
+    const allowed = BotMenu.allowedActions(current);
+    if (!allowed.has(action)) {
+      await this.showMainMenu(userId, chatId, current);
       return;
     }
 
@@ -276,12 +325,6 @@ class TelegramBotService {
         await this._cmdGames(userId, chatId, fromUser);
         return;
       case 'change': {
-        const status = this.monitorCoordinator?.getStatus(userId);
-        const phase = status?.phase ?? status?.status;
-        if (phase !== 'monitoring') {
-          await this.showMainMenu(userId, chatId);
-          return;
-        }
         this._setState(userId, STATE.AWAITING_CHANGE_CONFIRMATION);
         await this._sendChangeConfirmationPrompt(chatId);
         return;
@@ -290,12 +333,6 @@ class TelegramBotService {
         await this._cmdStatus(userId, chatId, fromUser);
         return;
       case 'stop': {
-        const status = this.monitorCoordinator?.getStatus(userId);
-        const phase = status?.phase ?? status?.status;
-        if (phase !== 'queued' && phase !== 'monitoring') {
-          await this.showMainMenu(userId, chatId);
-          return;
-        }
         await this._cmdStop(userId, chatId, fromUser);
         return;
       }
@@ -425,31 +462,79 @@ class TelegramBotService {
       await this.sendMessage(chatId, 'משתמש לא נמצא.');
       return;
     }
-    await this.monitorCoordinator?.stopMonitor(targetId);
+    // Authorization and durable access are revoked synchronously before any
+    // browser teardown. A failed or hung close can retain capacity, never access.
     this.userStore.revokeUser(targetId);
     this.userStore.setMonitoringActive(targetId, false);
-    this.userSessionStore?.delete(targetId);
+    this._deleteRevokedSession(targetId);
     this._clearState(targetId);
     for (const [nonce, entry] of this._callbackHandlers) {
       if (entry.userId === String(targetId)) this.deregisterCallbackHandler(nonce);
     }
+
+    let teardown;
+    try {
+      teardown = this.monitorCoordinator?.stopMonitor(targetId);
+    } catch (_) {
+      console.error('[TelegramBotService] revoked monitor teardown failed code=MONITOR_STOP_FAILED.');
+    }
+    void Promise.resolve(teardown).catch(() => {
+      console.error('[TelegramBotService] revoked monitor teardown failed code=MONITOR_STOP_FAILED.');
+    });
     await this.sendMessage(chatId, `✅ גישה בוטלה למשתמש ${targetId}.`);
+  }
+
+  _deleteRevokedSession(userId) {
+    if (!this.userSessionStore) return;
+    try {
+      if (typeof this.userSessionStore.loadWithGeneration === 'function' &&
+          typeof this.userSessionStore.deleteIfGeneration === 'function') {
+        const record = this.userSessionStore.loadWithGeneration(userId);
+        if (record) this.userSessionStore.deleteIfGeneration(userId, record.generation);
+        return;
+      }
+      this.userSessionStore.delete(userId);
+    } catch (_) {
+      // A corrupt encrypted file still carries access material; delete it by its
+      // user-scoped path when generation inspection cannot be completed.
+      try { this.userSessionStore.delete(userId); } catch (_) {}
+      console.error('[TelegramBotService] revoked session cleanup failed code=SESSION_DELETE_FAILED.');
+    }
   }
 
   async _startConfiguredMonitor(userId, chatId, data) {
     const { gameUrl, sections, quantity } = data;
-    await this.sendMessage(chatId, `⏳ מתחיל ניטור: גושים ${sections.join(', ')}, ${quantity} כרטיסים...`);
+    await this.sendMessage(
+      chatId,
+      `⏳ מתחיל ניטור: גושים ${sections.join(', ')}, ${quantity} כרטיסים...`
+    ).catch(() => {
+      console.error('[TelegramBotService] start notice failed code=TELEGRAM_SEND_FAILED.');
+    });
     const result = await this.monitorCoordinator.startMonitor(userId, {
       gameUrl,
       sections,
       quantity,
       chatId,
     });
-    this.userStore.setMonitoringConfig(userId, { gameUrl, sections, quantity });
-    this.userStore.setMonitoringActive(userId, true);
+    if (!this.monitorCoordinator.ownsPersistence) {
+      try {
+        this.userStore.setMonitoringConfig(userId, { gameUrl, sections, quantity });
+        this.userStore.setMonitoringActive(userId, true);
+      } catch (error) {
+        try { await this.monitorCoordinator.stopMonitor(userId); } catch (_) {}
+        try { this.userStore.setMonitoringActive(userId, false); } catch (_) {}
+        throw Object.assign(new Error('Monitoring persistence failed'), {
+          code: 'MONITOR_PERSISTENCE_FAILED',
+          cause: error,
+        });
+      }
+    }
     await this.sendMessage(chatId, result?.status === 'queued'
       ? '🕒 המעקב נשמר ונמצא בתור. הוא יתחיל אוטומטית כשיתפנה דפדפן.'
-      : '✅ ניטור פעיל. תקבל התראה כשייפתחו כרטיסים.');
+      : '✅ ניטור פעיל. תקבל התראה כשייפתחו כרטיסים.').catch(() => {
+      console.error('[TelegramBotService] accepted monitor notice failed code=TELEGRAM_SEND_FAILED.');
+    });
+    return result;
   }
 
   // ── Callback query handler ─────────────────────────────────────────────────
@@ -501,6 +586,10 @@ class TelegramBotService {
     // Game selection
     const gameMatch = data.match(/^game:(\d+)$/);
     if (gameMatch) {
+      if (!this._configurationLifecycleIsIdle(userId)) {
+        await this.showMainMenu(userId, chatId);
+        return;
+      }
       const { state, data: convData } = this._getState(userId);
       if (state !== STATE.AWAITING_GAME) {
         await this.showMainMenu(userId, chatId);
@@ -539,6 +628,10 @@ class TelegramBotService {
 
     const sectionMatch = data.match(/^section:(\d+)$/);
     if (sectionMatch) {
+      if (!this._configurationLifecycleIsIdle(userId)) {
+        await this.showMainMenu(userId, chatId);
+        return;
+      }
       const current = this._getState(userId);
       if (current.state !== STATE.AWAITING_SECTIONS) {
         await this.showMainMenu(userId, chatId);
@@ -561,6 +654,10 @@ class TelegramBotService {
     }
 
     if (data === 'sections_done') {
+      if (!this._configurationLifecycleIsIdle(userId)) {
+        await this.showMainMenu(userId, chatId);
+        return;
+      }
       const current = this._getState(userId);
       if (current.state !== STATE.AWAITING_SECTIONS) {
         await this.showMainMenu(userId, chatId);
@@ -577,6 +674,10 @@ class TelegramBotService {
 
     const quantityMatch = data.match(/^quantity:([1-4])$/);
     if (quantityMatch) {
+      if (!this._configurationLifecycleIsIdle(userId)) {
+        await this.showMainMenu(userId, chatId);
+        return;
+      }
       const current = this._getState(userId);
       if (current.state !== STATE.AWAITING_QUANTITY) {
         await this.showMainMenu(userId, chatId);
@@ -589,6 +690,10 @@ class TelegramBotService {
     }
 
     if (data === 'setup:confirm') {
+      if (!this._configurationLifecycleIsIdle(userId)) {
+        await this.showMainMenu(userId, chatId);
+        return;
+      }
       const current = this._getState(userId);
       if (current.state !== STATE.AWAITING_CONFIRMATION) {
         await this.showMainMenu(userId, chatId);
@@ -606,6 +711,10 @@ class TelegramBotService {
     }
 
     if (data === 'setup:back') {
+      if (!this._configurationLifecycleIsIdle(userId)) {
+        await this.showMainMenu(userId, chatId);
+        return;
+      }
       const current = this._getState(userId);
       if (current.state !== STATE.AWAITING_CONFIRMATION) {
         await this.showMainMenu(userId, chatId);
@@ -629,7 +738,7 @@ class TelegramBotService {
     }
 
     if (data === 'games:retry') {
-      await this._cmdGames(userId, chatId);
+      await this._runAction('games', { userId, chatId, fromUser: query.from });
       return;
     }
 
@@ -660,6 +769,10 @@ class TelegramBotService {
 
   _isPrivateChatForUser(userId, chat) {
     return chat?.type === 'private' && String(chat.id) === String(userId);
+  }
+
+  _configurationLifecycleIsIdle(userId) {
+    return this._getMenuSnapshot(userId).lifecycle === 'idle';
   }
 
   _buildSectionsKeyboard({ availableSections = [], sections = [] }) {

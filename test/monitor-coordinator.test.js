@@ -8,6 +8,7 @@ const os = require('os');
 const path = require('path');
 const MonitorCoordinator = require('../bot/monitor-coordinator');
 const UserSessionStore = require('../bot/user-session-store');
+const UserStore = require('../bot/user-store');
 
 // ── Stubs ─────────────────────────────────────────────────────────────────────
 
@@ -160,6 +161,53 @@ test('startMonitor queues when concurrency cap is reached', async () => {
   assert.equal(coord.getStatus('3').phase, 'queued');
 });
 
+test('coordinator atomically owns durable configuration for accepted active and queued work', async () => {
+  const userStore = new UserStore();
+  userStore.createUser({ telegramUserId: '1' });
+  userStore.createUser({ telegramUserId: '2' });
+  const coord = new MonitorCoordinator({
+    userStore,
+    userSessionStore: makeSessionStore(),
+    gameDiscovery: makeGameDiscovery(),
+    telegramBotService: makeBot(),
+    maxConcurrent: 1,
+    MonitorClass: StubMonitor,
+  });
+
+  await coord.startMonitor('1', { gameUrl: 'u1', sections: ['13'], quantity: 2, chatId: '1' });
+  await coord.startMonitor('2', { gameUrl: 'u2', sections: ['14'], quantity: 3, chatId: '2' });
+
+  assert.deepEqual(userStore.getMonitoringConfig('1'), {
+    telegram_user_id: '1', game_url: 'u1', sections: ['13'], quantity: 2, active: 1,
+  });
+  assert.deepEqual(userStore.getMonitoringConfig('2'), {
+    telegram_user_id: '2', game_url: 'u2', sections: ['14'], quantity: 3, active: 1,
+  });
+  assert.equal(coord.getStatus('2').phase, 'queued');
+});
+
+test('persistence failure rejects before monitor or queue acceptance', async () => {
+  const coord = new MonitorCoordinator({
+    userStore: {
+      getUser: () => ({ telegram_user_id: '1', revoked: 0 }),
+      acceptMonitoring: () => { throw new Error('sqlite secret-path failure'); },
+      setMonitoringActive: () => {},
+    },
+    userSessionStore: makeSessionStore(),
+    gameDiscovery: makeGameDiscovery(),
+    telegramBotService: makeBot(),
+    maxConcurrent: 1,
+    MonitorClass: StubMonitor,
+  });
+
+  await assert.rejects(
+    () => coord.startMonitor('1', { gameUrl: 'u', sections: ['13'], chatId: '1' }),
+    /sqlite secret-path failure/
+  );
+  assert.equal(coord.activeCount(), 0);
+  assert.equal(coord.getStatus('1'), null);
+});
+
 test('stopping a monitor promotes the next queued user', async () => {
   const coord = makeCoord({ maxConcurrent: 1 });
   await coord.startMonitor('1', { gameUrl: 'https://x.com', sections: ['1'], chatId: '1' });
@@ -190,6 +238,30 @@ test('stopMonitor stops the monitor and decrements count', async () => {
   assert.equal(coord.getStatus('1'), null);
 });
 
+test('stopMonitor clears durable authorization before awaiting browser teardown', async () => {
+  DelayedStopMonitor.reset();
+  const activeChanges = [];
+  const coord = new MonitorCoordinator({
+    userStore: {
+      setMonitoringActive: (userId, active) => activeChanges.push([String(userId), active]),
+    },
+    userSessionStore: makeSessionStore(),
+    gameDiscovery: makeGameDiscovery(),
+    telegramBotService: makeBot(),
+    MonitorClass: DelayedStopMonitor,
+  });
+  await coord.startMonitor('1', { gameUrl: 'u', sections: ['13'], chatId: '1' });
+  const monitor = DelayedStopMonitor.instances[0];
+
+  const stopping = coord.stopMonitor('1');
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.deepEqual(activeChanges, [['1', false]]);
+  assert.equal(coord.activeCount(), 1);
+  monitor.releaseStop();
+  await stopping;
+});
+
 test('stopMonitor is a no-op when no monitor running', async () => {
   const coord = makeCoord();
   await assert.doesNotReject(() => coord.stopMonitor('unknown'));
@@ -210,6 +282,29 @@ test('alert event forwards message to bot', async () => {
   // Give the microtask queue a tick
   await new Promise(r => setImmediate(r));
   assert.ok(bot.sent.some(m => m.chatId === 'chat1' && m.text === 'כרטיסים זמינים!'));
+});
+
+test('secret-bearing monitor errors are replaced with stable Telegram text', async () => {
+  const bot = makeBot();
+  const coord = new MonitorCoordinator({
+    userStore: makeUserStore(),
+    userSessionStore: makeSessionStore(),
+    gameDiscovery: makeGameDiscovery(),
+    telegramBotService: bot,
+    MonitorClass: StubMonitor,
+  });
+  await coord.startMonitor('1', { gameUrl: 'u', sections: [], chatId: 'chat1' });
+
+  coord._monitors.get('1').emit(
+    'log',
+    'Playwright failed at https://user:password@example.test/?token=secret-token',
+    'error'
+  );
+  await new Promise(resolve => setImmediate(resolve));
+
+  const outgoing = bot.sent.map(message => message.text).join('\n');
+  assert.match(outgoing, /שגיאה זמנית/);
+  assert.doesNotMatch(outgoing, /password|example\.test|secret-token|Playwright/);
 });
 
 test('discoverGames delegates to gameDiscovery', async () => {

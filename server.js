@@ -199,19 +199,44 @@ app.post('/bot-login', express.urlencoded({ extended: false }), async (req, res)
   }
 
   let redeemedUserId;
+  let sessionSaved = false;
   try {
-    redeemedUserId = svc.redeemToken(rawToken);
-    if (redeemedUserId !== userId) throw new Error('Login token user mismatch');
-  } catch {
+    if (typeof svc.completeLogin === 'function') {
+      redeemedUserId = svc.completeLogin(rawToken, authorizedUserId => {
+        if (authorizedUserId !== userId) throw new Error('Login token user mismatch');
+        try {
+          sessionStore.save(authorizedUserId, storageState);
+          sessionSaved = true;
+        } catch (cause) {
+          throw Object.assign(new Error('Session persistence failed'), {
+            code: 'SESSION_PERSISTENCE_FAILED',
+            cause,
+          });
+        }
+      });
+    } else {
+      // Compatibility path for narrow test doubles and older integrations.
+      // Production SecureLoginService uses completeLogin so authorization and
+      // the synchronous encrypted file write share one SQLite write lock.
+      redeemedUserId = svc.redeemToken(rawToken);
+      if (redeemedUserId !== userId) throw new Error('Login token user mismatch');
+    }
+  } catch (error) {
+    if (error?.code === 'SESSION_PERSISTENCE_FAILED') {
+      console.error('[bot-login] Session persistence failed code=SESSION_PERSISTENCE_FAILED.');
+      return res.status(500).send('לא ניתן היה לשמור את החיבור. בקש קישור חדש מהבוט ונסה שוב.');
+    }
     console.error('[bot-login] Login token redemption failed.');
     return res.status(409).send('קישור ההתחברות אינו זמין עוד. בקש קישור חדש מהבוט.');
   }
 
-  try {
-    await sessionStore.save(redeemedUserId, storageState);
-  } catch {
-    console.error('[bot-login] Session persistence failed.');
-    return res.status(500).send('לא ניתן היה לשמור את החיבור. בקש קישור חדש מהבוט ונסה שוב.');
+  if (!sessionSaved) {
+    try {
+      await sessionStore.save(redeemedUserId, storageState);
+    } catch {
+      console.error('[bot-login] Session persistence failed code=SESSION_PERSISTENCE_FAILED.');
+      return res.status(500).send('לא ניתן היה לשמור את החיבור. בקש קישור חדש מהבוט ונסה שוב.');
+    }
   }
 
   await loginNotifier.loginSucceeded(redeemedUserId).catch(() => {

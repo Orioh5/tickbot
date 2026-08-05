@@ -8,6 +8,9 @@ const SecureLoginService = require('../bot/secure-login-service');
 
 function makeService({ now = () => 1000, randomBytes } = {}) {
   const store = new UserStore();
+  for (const userId of ['1', '7', '42', '99']) {
+    store.createUser({ telegramUserId: userId });
+  }
   const svc = new SecureLoginService({
     userStore: store,
     baseUrl: 'https://example.com',
@@ -90,4 +93,28 @@ test('redeemToken throws on expired token', () => {
   const rawToken = new URL(link).searchParams.get('t');
   clock = 10 * 60 * 1000 + 1; // past TTL
   assert.throws(() => svc.redeemToken(rawToken), /expired/);
+});
+
+test('verifyToken and redeemToken reject links after their user is revoked', () => {
+  const { store, svc } = makeService();
+  const rawToken = new URL(svc.createLoginLink('7')).searchParams.get('t');
+
+  store.revokeUser('7');
+
+  assert.throws(() => svc.verifyToken(rawToken), /used|active|unavailable/i);
+  assert.throws(() => svc.redeemToken(rawToken), /used|active|unavailable/i);
+});
+
+test('completeLogin persists only while the token user remains active', () => {
+  const { store, svc } = makeService();
+  const rawToken = new URL(svc.createLoginLink('7')).searchParams.get('t');
+  const savedFor = [];
+
+  store.revokeUser('7');
+
+  assert.throws(
+    () => svc.completeLogin(rawToken, userId => savedFor.push(userId)),
+    /used|active|unavailable/i
+  );
+  assert.deepEqual(savedFor, []);
 });

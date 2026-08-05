@@ -702,6 +702,27 @@ test('start rejects when the browser cannot be launched', async () => {
   assert.equal(monitor.running, false);
 });
 
+test('monitor logs redact secret-bearing Playwright failures', async () => {
+  const monitor = new Monitor();
+  monitor._launch = async () => {
+    throw new Error('https://user:password@example.test/?token=secret-token');
+  };
+  const emitted = [];
+  monitor.on('log', message => emitted.push(message));
+  const consoleLines = [];
+  const originalConsoleLog = console.log;
+  console.log = (...parts) => { consoleLines.push(parts.join(' ')); };
+  try {
+    await assert.rejects(() => monitor.start(settings()));
+  } finally {
+    console.log = originalConsoleLog;
+  }
+
+  const exposed = [...emitted, ...consoleLines].join('\n');
+  assert.match(exposed, /code=MONITOR_START_FAILED/);
+  assert.doesNotMatch(exposed, /password|example\.test|secret-token/);
+});
+
 test('monitoring loop closes the browser when monitoring stops itself', async () => {
   const monitor = new Monitor();
   let closed = 0;

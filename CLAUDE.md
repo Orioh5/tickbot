@@ -161,4 +161,4 @@ Auth and hosting:
 Telegram bot:
 - `BOT_TOKEN` — optional alias that takes precedence over `TELEGRAM_TOKEN`
 - `BOT_ADMIN_IDS` — comma-separated Telegram user IDs allowed to invite/list/revoke users; falls back to `TELEGRAM_CHAT_ID`
-- `BOT_MAX_BROWSERS` — maximum concurrent per-user monitor browsers; additional monitors queue
+- `BOT_MAX_BROWSERS` — maximum concurrent per-user monitor browsers (integer `1`–`32`, default `3`); additional monitors queue

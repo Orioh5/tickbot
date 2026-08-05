@@ -9,6 +9,7 @@ class UserStore {
   constructor({ dbPath = ':memory:', migrationHook = null } = {}) {
     if (dbPath !== ':memory:') fs.mkdirSync(path.dirname(dbPath), { recursive: true });
     this.db = new DatabaseSync(dbPath);
+    this.db.exec('PRAGMA busy_timeout = 5000');
     this._migrationHook = migrationHook;
     this._init();
   }
@@ -42,22 +43,25 @@ class UserStore {
         quantity         INTEGER NOT NULL DEFAULT 1,
         active           INTEGER NOT NULL DEFAULT 0
       );
-    `);
-
-    const inviteColumns = this.db.prepare('PRAGMA table_info(invite_codes)').all();
-    if (!inviteColumns.some(column => column.name === 'expires_at')) {
-      this.db.exec('ALTER TABLE invite_codes ADD COLUMN expires_at INTEGER');
-    }
-    this.db.exec(`
       CREATE TABLE IF NOT EXISTS schema_metadata (
         key   TEXT PRIMARY KEY,
         value TEXT NOT NULL
       );
     `);
-    const hashMigration = this.db.prepare("SELECT value FROM schema_metadata WHERE key = 'invite_code_hashing'").get();
-    if (!hashMigration) {
-      this.db.exec('BEGIN IMMEDIATE');
-      try {
+
+    // Schema inspection and the migration marker must share the same write
+    // transaction. A second process waits at BEGIN IMMEDIATE, then rechecks the
+    // marker instead of hashing an already-migrated code a second time.
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const inviteColumns = this.db.prepare('PRAGMA table_info(invite_codes)').all();
+      if (!inviteColumns.some(column => column.name === 'expires_at')) {
+        this.db.exec('ALTER TABLE invite_codes ADD COLUMN expires_at INTEGER');
+      }
+      const hashMigration = this.db
+        .prepare("SELECT value FROM schema_metadata WHERE key = 'invite_code_hashing'")
+        .get();
+      if (!hashMigration) {
         const legacyInviteCodes = this.db.prepare('SELECT code FROM invite_codes').all();
         const updateInviteCode = this.db.prepare('UPDATE invite_codes SET code = ? WHERE code = ?');
         for (const [index, invite] of legacyInviteCodes.entries()) {
@@ -65,17 +69,19 @@ class UserStore {
           this._migrationHook?.({ index });
         }
         this.db.prepare("INSERT INTO schema_metadata (key, value) VALUES ('invite_code_hashing', 'sha256')").run();
-        this.db.exec('COMMIT');
-      } catch (error) {
-        this.db.exec('ROLLBACK');
-        throw error;
       }
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
     }
 
     this._stmts = {
       insertUser:         this.db.prepare('INSERT OR IGNORE INTO users (telegram_user_id, username, invited_by, created_at) VALUES (?, ?, ?, ?)'),
       getUser:            this.db.prepare('SELECT * FROM users WHERE telegram_user_id = ?'),
-      revokeUser:         this.db.prepare('UPDATE users SET revoked = 1 WHERE telegram_user_id = ?'),
+      getActiveUser:      this.db.prepare('SELECT * FROM users WHERE telegram_user_id = ? AND revoked = 0'),
+      markUserRevoked:    this.db.prepare('UPDATE users SET revoked = 1 WHERE telegram_user_id = ?'),
+      invalidateUserTokens: this.db.prepare('UPDATE login_tokens SET used = 1 WHERE user_id = ? AND used = 0'),
       listUsers:          this.db.prepare('SELECT * FROM users ORDER BY created_at ASC'),
       insertInvite:       this.db.prepare('INSERT INTO invite_codes (code, created_by, created_at, expires_at) VALUES (?, ?, ?, ?)'),
       getInvite:          this.db.prepare('SELECT * FROM invite_codes WHERE code = ?'),
@@ -83,6 +89,18 @@ class UserStore {
       insertToken:        this.db.prepare('INSERT INTO login_tokens (token_hash, user_id, expires_at) VALUES (?, ?, ?)'),
       getToken:           this.db.prepare('SELECT * FROM login_tokens WHERE token_hash = ?'),
       markTokenUsed:      this.db.prepare('UPDATE login_tokens SET used = 1 WHERE token_hash = ?'),
+      redeemToken:        this.db.prepare(`
+        UPDATE login_tokens
+        SET used = 1
+        WHERE token_hash = ?
+          AND used = 0
+          AND expires_at >= ?
+          AND EXISTS (
+            SELECT 1 FROM users
+            WHERE users.telegram_user_id = login_tokens.user_id
+              AND users.revoked = 0
+          )
+      `),
       upsertMonitoring:   this.db.prepare(`
         INSERT INTO user_monitoring (telegram_user_id, game_url, sections, quantity)
         VALUES (?, ?, ?, ?)
@@ -98,6 +116,15 @@ class UserStore {
         VALUES (?, ?)
         ON CONFLICT(telegram_user_id) DO UPDATE SET active = excluded.active
       `),
+      upsertAcceptedMonitoring: this.db.prepare(`
+        INSERT INTO user_monitoring (telegram_user_id, game_url, sections, quantity, active)
+        VALUES (?, ?, ?, ?, 1)
+        ON CONFLICT(telegram_user_id) DO UPDATE SET
+          game_url = excluded.game_url,
+          sections = excluded.sections,
+          quantity = excluded.quantity,
+          active = 1
+      `),
     };
   }
 
@@ -112,7 +139,16 @@ class UserStore {
   }
 
   revokeUser(telegramUserId) {
-    this._stmts.revokeUser.run(String(telegramUserId));
+    const uid = String(telegramUserId);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this._stmts.markUserRevoked.run(uid);
+      this._stmts.invalidateUserTokens.run(uid);
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   listUsers() {
@@ -173,6 +209,40 @@ class UserStore {
     this._stmts.markTokenUsed.run(tokenHash);
   }
 
+  redeemLoginToken({ tokenHash, now = Date.now(), onAuthorized = null }) {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const result = this._stmts.redeemToken.run(tokenHash, now);
+      if (result.changes !== 1) throw this._classifyLoginTokenFailure(tokenHash, now);
+      const record = this._stmts.getToken.get(tokenHash);
+      const activeUser = this._stmts.getActiveUser.get(record.user_id);
+      if (!activeUser) throw new Error('Login user is not active or unavailable');
+
+      if (onAuthorized) {
+        const callbackResult = onAuthorized(record.user_id);
+        if (callbackResult && typeof callbackResult.then === 'function') {
+          throw new Error('Authorized login persistence must be synchronous');
+        }
+      }
+
+      this.db.exec('COMMIT');
+      return record.user_id;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  _classifyLoginTokenFailure(tokenHash, now) {
+    const record = this._stmts.getToken.get(tokenHash);
+    if (!record) return new Error('Invalid login link');
+    if (record.used) return new Error('Login link already used');
+    if (record.expires_at < now) return new Error('Login link expired');
+    const activeUser = this._stmts.getActiveUser.get(record.user_id);
+    if (!activeUser) return new Error('Login user is not active or unavailable');
+    return new Error('Login link unavailable');
+  }
+
   // ── Monitoring config ──────────────────────────────────────────────────────
 
   setMonitoringConfig(userId, { gameUrl, sections, quantity = 1 }) {
@@ -187,6 +257,26 @@ class UserStore {
 
   setMonitoringActive(userId, active) {
     this._stmts.setActiveFlag.run(String(userId), active ? 1 : 0);
+  }
+
+  acceptMonitoring(userId, { gameUrl, sections, quantity = 1 }) {
+    const uid = String(userId);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      if (!this._stmts.getActiveUser.get(uid)) {
+        throw new Error('Monitoring user is not active or unavailable');
+      }
+      this._stmts.upsertAcceptedMonitoring.run(
+        uid,
+        gameUrl,
+        JSON.stringify(sections),
+        quantity
+      );
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   listActiveMonitoring() {

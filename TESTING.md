@@ -45,7 +45,7 @@ Current automated coverage includes:
 To check the HTTP server without starting Telegram polling, use an isolated temporary `DATA_DIR`. In a clean shell, export non-production values for `ENCRYPTION_KEY`, `APP_PASSWORD`, and `SESSION_SECRET`, and export both `TELEGRAM_TOKEN` and `BOT_TOKEN` as empty strings. Do not source production environment values or point this check at production data.
 
 ```bash
-DATA_DIR=/tmp/mhfc-local-smoke PORT=3001 BASE_URL=http://localhost:3001 npm start
+DATA_DIR=/tmp/mhfc-local-smoke PORT=3000 BASE_URL=http://localhost:3000 npm start
 ```
 
 Confirm `GET /login.html` returns the dashboard login page and an unauthenticated `GET /api/status` returns `401`, then stop the process. This check is local only and does not validate Telegram buttons or the live ticketing site.

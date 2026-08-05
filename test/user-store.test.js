@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 const { DatabaseSync } = require('node:sqlite');
 const { Worker } = require('node:worker_threads');
 const UserStore = require('../bot/user-store');
+const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -61,6 +62,77 @@ function contendForInvite(dbPath, userId, barrier) {
       workerData: {
         dbPath,
         userId,
+        barrier,
+        userStorePath: path.join(__dirname, '..', 'bot', 'user-store.js'),
+      },
+    });
+    worker.once('message', resolve);
+    worker.once('error', reject);
+  });
+}
+
+function contendForLoginToken(dbPath, tokenHash, contender, barrier) {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(`
+      const { parentPort, workerData } = require('node:worker_threads');
+      const UserStore = require(workerData.userStorePath);
+      const barrier = new Int32Array(workerData.barrier);
+      Atomics.add(barrier, 0, 1);
+      Atomics.notify(barrier, 0);
+      Atomics.wait(barrier, 1, 0);
+      try {
+        const store = new UserStore({ dbPath: workerData.dbPath });
+        const userId = store.redeemLoginToken({
+          tokenHash: workerData.tokenHash,
+          now: 2,
+        });
+        parentPort.postMessage({ ok: true, contender: workerData.contender, userId });
+      } catch (error) {
+        parentPort.postMessage({ ok: false, contender: workerData.contender, message: error.message });
+      }
+    `, {
+      eval: true,
+      workerData: {
+        dbPath,
+        tokenHash,
+        contender,
+        barrier,
+        userStorePath: path.join(__dirname, '..', 'bot', 'user-store.js'),
+      },
+    });
+    worker.once('message', resolve);
+    worker.once('error', reject);
+  });
+}
+
+function openLegacyStoreWithMigrationRole(dbPath, role, barrier) {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(`
+      const { parentPort, workerData } = require('node:worker_threads');
+      const UserStore = require(workerData.userStorePath);
+      const barrier = new Int32Array(workerData.barrier);
+      try {
+        if (workerData.role === 'second') {
+          Atomics.store(barrier, 2, 1);
+          Atomics.notify(barrier, 2);
+        }
+        const store = new UserStore({
+          dbPath: workerData.dbPath,
+          migrationHook: workerData.role === 'first' ? () => {
+            Atomics.store(barrier, 0, 1);
+            Atomics.notify(barrier, 0);
+            Atomics.wait(barrier, 1, 0);
+          } : null,
+        });
+        parentPort.postMessage({ ok: true, role: workerData.role });
+      } catch (error) {
+        parentPort.postMessage({ ok: false, role: workerData.role, message: error.message });
+      }
+    `, {
+      eval: true,
+      workerData: {
+        dbPath,
+        role,
         barrier,
         userStorePath: path.join(__dirname, '..', 'bot', 'user-store.js'),
       },
@@ -212,6 +284,37 @@ test('failed legacy hash migration rolls back all code updates and its marker', 
   }
 });
 
+test('concurrent legacy invite migrations serialize and hash each code exactly once', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mhfc-invite-migration-contention-'));
+  const dbPath = path.join(root, 'bot.db');
+  const barrier = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 3);
+  const state = new Int32Array(barrier);
+  try {
+    createLegacyInviteDatabase(dbPath, ['LEGACY']);
+    const first = openLegacyStoreWithMigrationRole(dbPath, 'first', barrier);
+    while (Atomics.load(state, 0) !== 1) await new Promise(resolve => setImmediate(resolve));
+    const second = openLegacyStoreWithMigrationRole(dbPath, 'second', barrier);
+    while (Atomics.load(state, 2) !== 1) await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setTimeout(resolve, 25));
+    Atomics.store(state, 1, 1);
+    Atomics.notify(state, 1);
+
+    const results = await Promise.all([first, second]);
+    assert.deepEqual(results.map(result => result.ok), [true, true]);
+
+    const db = new DatabaseSync(dbPath);
+    const stored = db.prepare('SELECT code FROM invite_codes').get().code;
+    const marker = db.prepare("SELECT value FROM schema_metadata WHERE key = 'invite_code_hashing'").get();
+    db.close();
+    assert.equal(stored, crypto.createHash('sha256').update('LEGACY').digest('hex'));
+    assert.equal(marker.value, 'sha256');
+  } finally {
+    Atomics.store(state, 1, 1);
+    Atomics.notify(state, 1);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('two file-backed store connections contending for one invite allow only one redemption', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mhfc-invite-contention-'));
   const dbPath = path.join(root, 'bot.db');
@@ -251,6 +354,56 @@ test('markLoginTokenUsed sets used flag', () => {
   store.saveLoginToken({ tokenHash: 'h2', userId: '1', expiresAt: 9999 });
   store.markLoginTokenUsed('h2');
   assert.equal(store.getLoginToken('h2').used, 1);
+});
+
+test('login-token redemption requires an active registered user', () => {
+  const store = makeStore();
+  store.saveLoginToken({ tokenHash: 'orphan', userId: 'missing', expiresAt: 9999 });
+
+  assert.throws(
+    () => store.redeemLoginToken({ tokenHash: 'orphan', now: 1 }),
+    /active|unavailable/i
+  );
+  assert.equal(store.getLoginToken('orphan').used, 0);
+});
+
+test('revoking a user atomically invalidates every outstanding login token', () => {
+  const store = makeStore();
+  store.createUser({ telegramUserId: '7' });
+  store.saveLoginToken({ tokenHash: 'first-token', userId: '7', expiresAt: 9999 });
+  store.saveLoginToken({ tokenHash: 'second-token', userId: '7', expiresAt: 9999 });
+
+  store.revokeUser('7');
+
+  assert.equal(store.getUser('7').revoked, 1);
+  assert.equal(store.getLoginToken('first-token').used, 1);
+  assert.equal(store.getLoginToken('second-token').used, 1);
+  assert.throws(
+    () => store.redeemLoginToken({ tokenHash: 'first-token', now: 1 }),
+    /used|active|unavailable/i
+  );
+});
+
+test('two file-backed processes can redeem one login token only once', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mhfc-login-token-contention-'));
+  const dbPath = path.join(root, 'bot.db');
+  try {
+    const store = new UserStore({ dbPath });
+    store.createUser({ telegramUserId: '7' });
+    store.saveLoginToken({ tokenHash: 'shared-token-hash', userId: '7', expiresAt: 9999 });
+    const barrier = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 2);
+    const first = contendForLoginToken(dbPath, 'shared-token-hash', 'first', barrier);
+    const second = contendForLoginToken(dbPath, 'shared-token-hash', 'second', barrier);
+    await releaseContentionBarrier(new Int32Array(barrier));
+
+    const results = await Promise.all([first, second]);
+    assert.equal(results.filter(result => result.ok).length, 1);
+    assert.equal(results.filter(result => !result.ok).length, 1);
+    assert.equal(results.find(result => result.ok).userId, '7');
+    assert.equal(store.getLoginToken('shared-token-hash').used, 1);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 // ── Monitoring config ─────────────────────────────────────────────────────────

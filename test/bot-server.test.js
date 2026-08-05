@@ -2,7 +2,11 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { createLoginNotifier } = require('../bot/bot-server');
+const {
+  createLoginNotifier,
+  parseBotMaxBrowsers,
+  startOperationalBot,
+} = require('../bot/bot-server');
 
 test('login notifier sends the success continuation to the user with both buttons', async () => {
   const calls = [];
@@ -26,4 +30,42 @@ test('login notifier sends the success continuation to the user with both button
       },
     },
   }]);
+});
+
+test('BOT_MAX_BROWSERS accepts only a positive bounded integer', () => {
+  assert.equal(parseBotMaxBrowsers(undefined), 3);
+  assert.equal(parseBotMaxBrowsers('1'), 1);
+  assert.equal(parseBotMaxBrowsers('32'), 32);
+
+  for (const value of ['', '0', '-1', '1.5', '2x', 'NaN', '33', '999999']) {
+    assert.throws(
+      () => parseBotMaxBrowsers(value),
+      /BOT_MAX_BROWSERS/,
+      `value=${JSON.stringify(value)}`
+    );
+  }
+});
+
+test('restored monitors start only after bot identity and polling are operational', async () => {
+  const order = [];
+  let releaseIdentity;
+  const identityReady = new Promise(resolve => { releaseIdentity = resolve; });
+  const bot = {
+    initializeWithRetry: async () => {
+      order.push('identity');
+      await identityReady;
+    },
+    start: () => { order.push('polling'); },
+  };
+  const monitorCoordinator = {
+    restoreActiveMonitors: async () => { order.push('restore'); },
+  };
+
+  const startup = startOperationalBot({ bot, monitorCoordinator });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(order, ['identity']);
+
+  releaseIdentity();
+  await startup;
+  assert.deepEqual(order, ['identity', 'polling', 'restore']);
 });

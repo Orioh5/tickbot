@@ -49,13 +49,16 @@ function makeBot({ adminUserIds = [], extraUserIds = [], monitorCoordinator = nu
   for (const uid of extraUserIds) {
     store.createUser({ telegramUserId: uid, username: `u${uid}` });
   }
+  const effectiveSessionStore = userSessionStore ?? (monitorCoordinator ? {
+    load: () => ({ cookies: [], origins: [] }),
+  } : null);
   const botFactory = (fetchImpl) => new TelegramBotService({
     token: 'test-token',
     adminUserIds,
     userStore: store,
     secureLoginService,
     monitorCoordinator,
-    userSessionStore,
+    userSessionStore: effectiveSessionStore,
     fetchImpl,
     now: () => 0,
   });
@@ -369,6 +372,30 @@ test('initialize rejects a Telegram identity without a string username', async (
   await assert.rejects(bot.initialize(), /bot username/);
 });
 
+test('initializeWithRetry recovers from a transient getMe failure with deterministic backoff', async () => {
+  let attempts = 0;
+  const delays = [];
+  const { botFactory } = makeBot();
+  const bot = botFactory(async () => {
+    attempts += 1;
+    if (attempts === 1) throw new Error('temporary getMe outage with secret-token');
+    return {
+      ok: true,
+      json: async () => ({ ok: true, result: { username: 'RecoveredBot' } }),
+    };
+  });
+
+  await bot.initializeWithRetry({
+    maxAttempts: 3,
+    baseDelayMs: 25,
+    sleep: async delay => { delays.push(delay); },
+  });
+
+  assert.equal(attempts, 2);
+  assert.deepEqual(delays, [25]);
+  assert.equal(bot.botUsername, 'RecoveredBot');
+});
+
 test('invite creation waits for the initialized bot username', async () => {
   const { store, botFactory } = makeBot({ adminUserIds: ['1'] });
   store.createUser({ telegramUserId: '1' });
@@ -441,6 +468,69 @@ test('/revoke stops automation and deletes the target session', async () => {
   assert.equal(store.getMonitoringConfig('2')?.active ?? 0, 0);
 });
 
+test('/revoke fails closed before a hung teardown and preserves a later session generation', async () => {
+  let releaseStop;
+  const stopGate = new Promise(resolve => { releaseStop = resolve; });
+  let session = { generation: 'old', storageState: { cookies: [{ value: 'old' }] } };
+  let stopSnapshot;
+  let bot;
+  let store;
+  const userSessionStore = {
+    load: () => session?.storageState ?? null,
+    loadWithGeneration: () => session,
+    deleteIfGeneration: (_userId, generation) => {
+      if (session?.generation !== generation) return false;
+      session = null;
+      return true;
+    },
+    delete: () => { session = null; },
+  };
+  const monitorCoordinator = {
+    stopMonitor: () => {
+      stopSnapshot = {
+        revoked: store.getUser('2').revoked,
+        tokenUsed: store.getLoginToken('outstanding-token').used,
+        active: store.getMonitoringConfig('2')?.active ?? 0,
+        hasSession: Boolean(session),
+        conversation: bot._getState('2').state,
+        hasCallback: bot._callbackHandlers.has('targetnonce'),
+      };
+      session = { generation: 'fresh', storageState: { cookies: [{ value: 'fresh' }] } };
+      return stopGate;
+    },
+  };
+  const made = makeBot({ adminUserIds: ['1'], monitorCoordinator, userSessionStore });
+  store = made.store;
+  store.createUser({ telegramUserId: '1' });
+  store.createUser({ telegramUserId: '2' });
+  store.setMonitoringConfig('2', { gameUrl: 'u', sections: ['13'] });
+  store.setMonitoringActive('2', true);
+  store.saveLoginToken({ tokenHash: 'outstanding-token', userId: '2', expiresAt: 9999 });
+  bot = made.botFactory(makeFetch([{ ok: true, result: {} }]));
+  bot._setState('2', 'awaiting_confirmation', { gameUrl: 'secret' });
+  bot.registerCallbackHandler('targetnonce', '2', () => {}, 10_000);
+
+  const dispatch = bot._dispatch(makeTextUpdate(1, '/revoke 2'));
+  const outcome = await Promise.race([
+    dispatch.then(() => 'completed'),
+    new Promise(resolve => setTimeout(() => resolve('hung'), 50)),
+  ]);
+  releaseStop();
+  await dispatch;
+
+  assert.equal(outcome, 'completed');
+  assert.deepEqual(stopSnapshot, {
+    revoked: 1,
+    tokenUsed: 1,
+    active: 0,
+    hasSession: false,
+    conversation: 'idle',
+    hasCallback: false,
+  });
+  assert.equal(session.generation, 'fresh');
+  assert.equal(session.storageState.cookies[0].value, 'fresh');
+});
+
 test('sensitive bot commands are rejected outside a private chat', async () => {
   let linkCreated = false;
   const { store, botFactory } = makeBot({
@@ -510,6 +600,52 @@ test('/stop with no queued or active monitor redisplays the current menu', async
   assert.match(fetch.calls[0].body.text, /מה תרצה לעשות/);
 });
 
+test('stale login, games, retry, and setup callbacks cannot mutate any busy lifecycle', async () => {
+  const phases = [
+    'starting',
+    'monitoring',
+    'stopping',
+    'owner-selection',
+    'cart-interaction',
+    'cart-verification',
+    'cart-ready',
+    'cart-recovery',
+  ];
+
+  for (const phase of phases) {
+    for (const callback of ['menu:login', 'menu:games', 'games:retry', 'setup:confirm']) {
+      let links = 0;
+      let discoveries = 0;
+      let starts = 0;
+      const coordinator = {
+        getStatus: () => ({ running: phase !== 'stopping', busy: true, phase }),
+        discoverGames: async () => { discoveries += 1; return []; },
+        startMonitor: async () => { starts += 1; return { status: 'started' }; },
+      };
+      const { botFactory } = makeBot({
+        extraUserIds: ['7'],
+        monitorCoordinator: coordinator,
+        secureLoginService: {
+          createLoginLink: () => { links += 1; return 'https://example.test/bot-login'; },
+        },
+        userSessionStore: { load: () => ({ cookies: [], origins: [] }) },
+      });
+      const bot = botFactory(makeFetch(Array.from({ length: 5 }, () => ({ ok: true, result: {} }))));
+      bot._setState('7', 'awaiting_confirmation', {
+        gameUrl: 'https://tickets.example.test/event/1',
+        sections: ['13'],
+        quantity: 1,
+      });
+
+      await bot._dispatch(makeCallbackUpdate(7, callback));
+
+      assert.equal(links, 0, `${phase}:${callback}`);
+      assert.equal(discoveries, 0, `${phase}:${callback}`);
+      assert.equal(starts, 0, `${phase}:${callback}`);
+    }
+  }
+});
+
 // ── poll loop stop ──────────────────────────────────────────────────────────
 
 test('start() begins polling and stop() halts it', async () => {
@@ -528,6 +664,28 @@ test('start() begins polling and stop() halts it', async () => {
   await new Promise(r => setTimeout(r, 50));
   assert.ok(pollCount >= 1);
   await bot.stop();
+});
+
+test('dispatch logs expose only a stable error code, never exception secrets', async () => {
+  const { botFactory } = makeBot();
+  const bot = botFactory(makeFetch([]));
+  bot._running = true;
+  bot._call = async () => [{ update_id: 1 }];
+  bot._dispatch = async () => {
+    bot._running = false;
+    throw new Error('https://user:password@example.test/?token=secret-token');
+  };
+  const captured = [];
+  const originalConsoleError = console.error;
+  console.error = (...parts) => { captured.push(parts.join(' ')); };
+  try {
+    await bot._loop(new AbortController().signal);
+  } finally {
+    console.error = originalConsoleError;
+  }
+
+  assert.match(captured.join('\n'), /code=DISPATCH_FAILED/);
+  assert.doesNotMatch(captured.join('\n'), /password|example\.test|secret-token/);
 });
 
 test('game selection discovers real sections and renders inline section buttons', async () => {
@@ -691,6 +849,46 @@ test('a failed confirmation restores the same setup and a retry starts monitorin
   assert.equal(attempts, 2);
   assert.equal(bot._getState('7').state, 'idle');
   assert.equal(store.getMonitoringConfig('7').active, 1);
+});
+
+test('a final Telegram failure after coordinator acceptance never restores confirmation', async () => {
+  const startCalls = [];
+  const coordinator = {
+    ownsPersistence: true,
+    getStatus: () => null,
+    startMonitor: async (...args) => {
+      startCalls.push(args);
+      return { status: 'started' };
+    },
+  };
+  const { botFactory } = makeBot({ extraUserIds: ['7'], monitorCoordinator: coordinator });
+  const bot = botFactory(makeFetch([{ ok: true, result: {} }]));
+  bot._setState('7', 'awaiting_confirmation', {
+    gameUrl: 'https://tickets.mhaifafc.com/game/1',
+    gameName: 'Game',
+    sections: ['13'],
+    quantity: 2,
+  });
+  const sent = [];
+  bot.sendMessage = async (_chatId, text) => {
+    sent.push(text);
+    if (text.includes('ניטור פעיל')) {
+      throw new Error('Telegram secret-token https://private.example.test');
+    }
+  };
+  const capturedLogs = [];
+  const originalConsoleError = console.error;
+  console.error = (...parts) => { capturedLogs.push(parts.join(' ')); };
+  try {
+    await bot._dispatch(makeCallbackUpdate(7, 'setup:confirm'));
+  } finally {
+    console.error = originalConsoleError;
+  }
+
+  assert.equal(startCalls.length, 1);
+  assert.equal(bot._getState('7').state, 'idle');
+  assert.equal(sent.filter(text => text.includes('סיכום הניטור')).length, 0);
+  assert.doesNotMatch(capturedLogs.join('\n'), /secret-token|private\.example/);
 });
 
 test('setup back restores the quantity step without losing its selected game or sections', async () => {

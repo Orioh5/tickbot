@@ -205,7 +205,7 @@ class Monitor extends EventEmitter {
       this._loopPromise = loopPromise;
       void loopPromise.finally(() => this._finalizeFlow(flowToken)).catch(() => {});
     } catch (e) {
-      this.log(`Failed to start browser: ${e.message}`, 'error');
+      this.log('Browser startup failed code=MONITOR_START_FAILED.', 'error');
       this.running = false;
       await this._cleanupBrowser(this.browser, ownerSelectionAbort);
       this._finalizeFlow(flowToken);
@@ -365,7 +365,7 @@ class Monitor extends EventEmitter {
       await this.context.storageState({ path: STATE_PATH });
       this.log('Login successful, session saved', 'success');
     } catch (e) {
-      this.log(`Login failed: ${e.message}. Continuing with existing session.`, 'warning');
+      this.log('Login attempt failed code=LOGIN_ATTEMPT_FAILED; continuing with the saved session.', 'warning');
     }
   }
 
@@ -471,7 +471,7 @@ class Monitor extends EventEmitter {
       return await this._pollApiAvailability();
     } catch (error) {
       if (error?.code === 'SESSION_EXPIRED') throw error;
-      return this._refreshDomAvailability(`API polling failed (${error.message}).`);
+      return this._refreshDomAvailability('API polling failed code=AVAILABILITY_API_FAILED.');
     }
   }
 
@@ -507,7 +507,7 @@ class Monitor extends EventEmitter {
           consecutiveErrors++;
           this.stats.errors++;
           this.emit('stats', this.getStats());
-          this.log(`Error (${consecutiveErrors}/3): ${e.message}`, 'error');
+          this.log(`Monitoring check failed (${consecutiveErrors}/3) code=MONITOR_POLL_FAILED.`, 'error');
 
           if (consecutiveErrors >= 3) {
             this.log('Too many errors — waiting 60s before retry...', 'warning');
@@ -724,7 +724,7 @@ class Monitor extends EventEmitter {
       const assignmentResult = await this._finishCartOwnerFlow();
       return { cartReady: true, assignments: assignmentResult.status };
     } catch (e) {
-      this.log(`Auto-purchase failed: ${e.message}`, 'error');
+      this.log('Cart automation failed code=CART_AUTOMATION_FAILED.', 'error');
       if (confirmationAttempted) {
         if (!this._stopRequested) this._setPhase(cartReady ? 'cart-ready' : 'cart-recovery');
         const fallbackMessage = cartReady
@@ -853,11 +853,11 @@ class Monitor extends EventEmitter {
         return true;
       } else {
         const data = await res.json();
-        this.log(`Telegram error: ${data.description || res.statusText}`, 'error');
+        this.log('Telegram request failed code=TELEGRAM_API_FAILED.', 'error');
         return false;
       }
     } catch (e) {
-      this.log(`Telegram failed: ${e.message}`, 'error');
+      this.log('Telegram request failed code=TELEGRAM_SEND_FAILED.', 'error');
       return false;
     }
   }

@@ -3,6 +3,11 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('node:http');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const UserStore = require('../bot/user-store');
+const SecureLoginService = require('../bot/secure-login-service');
 
 // Explicit values keep this test isolated from developer credentials in .env.
 process.env.ENCRYPTION_KEY = 'bot-login-route-test-key';
@@ -340,5 +345,62 @@ test('Telegram notification failure does not fail a completed login', async () =
     assert.deepEqual(calls, ['save', 'notify']);
   } finally {
     console.error = originalConsoleError;
+  }
+});
+
+test('revocation during Playwright login prevents the session from being recreated', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mhfc-revoke-during-login-'));
+  const store = new UserStore({ dbPath: path.join(root, 'bot.db') });
+  store.createUser({ telegramUserId: '42' });
+  const secureLoginService = new SecureLoginService({
+    userStore: store,
+    baseUrl: 'https://example.test',
+    randomBytes: size => Buffer.alloc(size, 0xcd),
+    now: () => 100,
+  });
+  const rawToken = new URL(secureLoginService.createLoginLink('42')).searchParams.get('t');
+  const saved = [];
+  const notified = [];
+  let signalAuthenticationStarted;
+  let releaseAuthentication;
+  const authenticationStarted = new Promise(resolve => { signalAuthenticationStarted = resolve; });
+  const authenticationGate = new Promise(resolve => { releaseAuthentication = resolve; });
+  const app = createApp({
+    botServices: {
+      maccabiAuthenticator: {
+        login: async () => {
+          signalAuthenticationStarted();
+          await authenticationGate;
+          return { cookies: [{ name: 'sid', value: 'secret' }], origins: [] };
+        },
+      },
+      secureLoginService,
+      userSessionStore: {
+        save: (userId, storageState) => saved.push({ userId, storageState }),
+      },
+      loginNotifier: {
+        loginSucceeded: async userId => notified.push(userId),
+      },
+    },
+  });
+
+  try {
+    const request = postForm(app, '/bot-login', {
+      t: rawToken,
+      username: 'u',
+      password: 'p',
+    });
+    await authenticationStarted;
+    store.revokeUser('42');
+    releaseAuthentication();
+    const response = await request;
+
+    assert.equal(response.statusCode, 409);
+    assert.deepEqual(saved, []);
+    assert.deepEqual(notified, []);
+    assert.equal(store.getUser('42').revoked, 1);
+  } finally {
+    releaseAuthentication?.();
+    fs.rmSync(root, { recursive: true, force: true });
   }
 });

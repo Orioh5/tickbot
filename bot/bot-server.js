@@ -12,6 +12,28 @@ const MonitorCoordinator = require('./monitor-coordinator');
 const TelegramBotService = require('./telegram-bot-service');
 const MaccabiAuthenticator = require('./maccabi-authenticator');
 
+const DEFAULT_MAX_BROWSERS = 3;
+const MAX_BROWSER_LIMIT = 32;
+
+function parseBotMaxBrowsers(value) {
+  if (value === undefined) return DEFAULT_MAX_BROWSERS;
+  const raw = String(value);
+  if (!/^[1-9]\d*$/.test(raw)) {
+    throw new Error('BOT_MAX_BROWSERS must be a positive integer');
+  }
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed > MAX_BROWSER_LIMIT) {
+    throw new Error(`BOT_MAX_BROWSERS must be between 1 and ${MAX_BROWSER_LIMIT}`);
+  }
+  return parsed;
+}
+
+async function startOperationalBot({ bot, monitorCoordinator }) {
+  await bot.initializeWithRetry();
+  bot.start();
+  await monitorCoordinator.restoreActiveMonitors();
+}
+
 function createLoginNotifier(bot) {
   return {
     loginSucceeded: userId => bot.sendMessage(userId, '✅ החשבון חובר בהצלחה.', {
@@ -31,6 +53,8 @@ function start({ botServices, baseUrl, env = process.env }) {
     console.warn('⚠️  BOT_TOKEN/TELEGRAM_TOKEN not set — Telegram bot is disabled.');
     return null;
   }
+
+  const maxConcurrent = parseBotMaxBrowsers(env.BOT_MAX_BROWSERS);
 
   const dataDir = env.DATA_DIR || path.join(path.dirname(__dirname), 'data');
   const dbPath  = path.join(dataDir, 'bot.db');
@@ -69,7 +93,7 @@ function start({ botServices, baseUrl, env = process.env }) {
       registerCallbackHandler: (...args) => bot?.registerCallbackHandler(...args),
       deregisterCallbackHandler: (...args) => bot?.deregisterCallbackHandler(...args),
     },
-    maxConcurrent: parseInt(env.BOT_MAX_BROWSERS || '3', 10),
+    maxConcurrent,
   });
 
   bot = new TelegramBotService({
@@ -87,16 +111,19 @@ function start({ botServices, baseUrl, env = process.env }) {
   botServices.maccabiAuthenticator = maccabiAuthenticator;
   botServices.loginNotifier = createLoginNotifier(bot);
 
-  void bot.initialize().then(() => {
-    bot.start();
+  const startupPromise = startOperationalBot({ bot, monitorCoordinator }).then(() => {
     console.log('🤖  Telegram bot started');
-  }).catch(error => {
-    console.error('[TelegramBotService] initialization failed:', error.message);
+  }).catch(() => {
+    console.error('[TelegramBotService] startup failed code=BOT_STARTUP_FAILED.');
   });
-  void monitorCoordinator.restoreActiveMonitors().catch(error => {
-    console.error('[MonitorCoordinator] restore failed:', error.message);
-  });
+  // Expose a handled promise for deterministic startup tests and diagnostics.
+  bot.startupPromise = startupPromise;
   return bot;
 }
 
-module.exports = { start, createLoginNotifier };
+module.exports = {
+  start,
+  createLoginNotifier,
+  parseBotMaxBrowsers,
+  startOperationalBot,
+};
