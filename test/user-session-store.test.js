@@ -31,17 +31,43 @@ test('save and load round-trip', () => withTempStore('key', store => {
   assert.deepEqual(loaded, sampleState);
 }));
 
-test('each save advances the encrypted session generation', () => withTempStore('key', store => {
+test('each save assigns a distinct opaque encrypted session generation', () => withTempStore('key', store => {
   const firstGeneration = store.save('42', sampleState);
   const secondState = { cookies: [{ name: 'sid', value: 'fresh' }], origins: [] };
   const secondGeneration = store.save('42', secondState);
 
-  assert.equal(firstGeneration, 1);
-  assert.equal(secondGeneration, 2);
+  assert.equal(typeof firstGeneration, 'string');
+  assert.ok(firstGeneration.length >= 32);
+  assert.equal(typeof secondGeneration, 'string');
+  assert.notEqual(secondGeneration, firstGeneration);
   assert.deepEqual(store.loadWithGeneration('42'), {
-    generation: 2,
+    generation: secondGeneration,
     storageState: secondState,
   });
+}));
+
+test('loads a legacy numeric-generation envelope and upgrades it on save', () => withTempStore('key', store => {
+  store._writeEncrypted('42', {
+    format: 'mhfc-session-v1',
+    generation: 7,
+    storageState: sampleState,
+  });
+
+  assert.deepEqual(store.loadWithGeneration('42'), {
+    generation: 7,
+    storageState: sampleState,
+  });
+
+  const freshState = { cookies: [{ name: 'sid', value: 'upgraded' }], origins: [] };
+  const upgradedGeneration = store.save('42', freshState);
+
+  assert.equal(typeof upgradedGeneration, 'string');
+  assert.notEqual(upgradedGeneration, '7');
+  assert.deepEqual(store.loadWithGeneration('42'), {
+    generation: upgradedGeneration,
+    storageState: freshState,
+  });
+  assert.equal(store.deleteIfGeneration('42', 7), false);
 }));
 
 test('conditional delete preserves a concurrently refreshed session', () => withTempStore('key', store => {

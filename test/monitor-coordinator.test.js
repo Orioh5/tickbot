@@ -3,7 +3,11 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('events');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const MonitorCoordinator = require('../bot/monitor-coordinator');
+const UserSessionStore = require('../bot/user-session-store');
 
 // ── Stubs ─────────────────────────────────────────────────────────────────────
 
@@ -27,6 +31,14 @@ function makeBot() {
     registerCallbackHandler: () => {},
     deregisterCallbackHandler: () => {},
   };
+}
+
+function withTempSessionStore(run) {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mhfc-coordinator-session-test-'));
+  const store = new UserSessionStore({ dataDir, encryptionKey: 'coordinator-test-key' });
+  return Promise.resolve(run(store)).finally(() => {
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  });
 }
 
 // Minimal Monitor stub
@@ -475,6 +487,77 @@ test('fresh login saved during expiry teardown survives generation-conditional d
   assert.equal(generation, 2);
 });
 
+test('stale expiry token cannot delete a fresh real session or stop its newer monitor', () =>
+  withTempSessionStore(async sessionStore => {
+    const expiredState = { cookies: [{ name: 'sid', value: 'expired' }], origins: [] };
+    const expiredGeneration = sessionStore.save('1', expiredState);
+    const coord = new MonitorCoordinator({
+      userStore: { setMonitoringActive: () => {} },
+      userSessionStore: sessionStore,
+      gameDiscovery: makeGameDiscovery(),
+      telegramBotService: makeBot(),
+      MonitorClass: StubMonitor,
+    });
+    await coord.startMonitor('1', { gameUrl: 'u1', sections: ['13'], chatId: '1' });
+    await coord.handleSessionExpired('1', expiredGeneration);
+    assert.equal(sessionStore.load('1'), null);
+
+    const freshState = { cookies: [{ name: 'sid', value: 'fresh' }], origins: [] };
+    const freshGeneration = sessionStore.save('1', freshState);
+    await coord.startMonitor('1', { gameUrl: 'u2', sections: ['14'], chatId: '1' });
+    const freshMonitor = coord._monitors.get('1');
+
+    await coord.handleSessionExpired('1', expiredGeneration);
+
+    assert.notEqual(freshGeneration, expiredGeneration);
+    assert.equal(coord._monitors.get('1'), freshMonitor);
+    assert.equal(coord.getStatus('1').phase, 'monitoring');
+    assert.deepEqual(sessionStore.load('1'), freshState);
+  }));
+
+test('hung reconnect does not lock out cleanup of a newer session generation', () =>
+  withTempSessionStore(async sessionStore => {
+    const sent = [];
+    const bot = {
+      sendMessage: (chatId, text, extra) => {
+        sent.push({ chatId, text, extra });
+        return new Promise(() => {});
+      },
+    };
+    const coord = new MonitorCoordinator({
+      userStore: { setMonitoringActive: () => {} },
+      userSessionStore: sessionStore,
+      gameDiscovery: makeGameDiscovery(),
+      telegramBotService: bot,
+      MonitorClass: StubMonitor,
+    });
+    const firstGeneration = sessionStore.save('1', { cookies: [], origins: [] });
+    await coord.startMonitor('1', { gameUrl: 'u1', sections: ['13'], chatId: '1' });
+
+    const firstCleanup = coord.handleSessionExpired('1', firstGeneration);
+    const firstResult = await Promise.race([
+      firstCleanup.then(() => 'settled'),
+      new Promise(resolve => setTimeout(() => resolve('timeout'), 50)),
+    ]);
+    assert.equal(firstResult, 'settled');
+    assert.equal(sessionStore.load('1'), null);
+
+    const secondGeneration = sessionStore.save('1', { cookies: [{ value: 'fresh' }], origins: [] });
+    await coord.startMonitor('1', { gameUrl: 'u2', sections: ['14'], chatId: '1' });
+    const secondCleanup = coord.handleSessionExpired('1', secondGeneration);
+    const duplicateCleanup = coord.handleSessionExpired('1', secondGeneration);
+    const secondResult = await Promise.race([
+      Promise.all([secondCleanup, duplicateCleanup]).then(() => 'settled'),
+      new Promise(resolve => setTimeout(() => resolve('timeout'), 50)),
+    ]);
+
+    assert.equal(secondResult, 'settled');
+    assert.equal(coord.getStatus('1'), null);
+    assert.equal(sessionStore.load('1'), null);
+    await coord.handleSessionExpired('1', secondGeneration);
+    assert.equal(sent.length, 2);
+  }));
+
 test('discovery rethrows original expiry without waiting for a hung queue drain', async () => {
   const expired = Object.assign(new Error('Saved session expired'), { code: 'SESSION_EXPIRED' });
   const coord = new MonitorCoordinator({
@@ -499,6 +582,36 @@ test('discovery rethrows original expiry without waiting for a hung queue drain'
   ]);
 
   assert.deepEqual(result, { error: expired });
+});
+
+test('discovery preserves SESSION_EXPIRED and contains a rejected queue drain', async () => {
+  const expired = Object.assign(new Error('Saved session expired'), { code: 'SESSION_EXPIRED' });
+  const unhandled = [];
+  const onUnhandled = reason => { unhandled.push(reason); };
+  const coord = new MonitorCoordinator({
+    userStore: { setMonitoringActive: () => {} },
+    userSessionStore: {
+      load: () => ({}),
+      loadWithGeneration: () => ({ storageState: {}, generation: 'expired-token' }),
+      deleteIfGeneration: () => true,
+    },
+    gameDiscovery: { discoverGames: async () => { throw expired; } },
+    telegramBotService: { sendMessage: async () => { throw new Error('send failed'); } },
+    MonitorClass: StubMonitor,
+  });
+  coord._drainQueue = async () => { throw new Error('drain failed'); };
+  process.on('unhandledRejection', onUnhandled);
+  const originalConsoleError = console.error;
+  console.error = () => {};
+  try {
+    await assert.rejects(() => coord.discoverGames('1'), error => error === expired);
+    await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(unhandled, []);
+  } finally {
+    console.error = originalConsoleError;
+    process.removeListener('unhandledRejection', onUnhandled);
+  }
 });
 
 test('stale discovery expiry after a fresh login neither deletes nor prompts the refreshed session', async () => {

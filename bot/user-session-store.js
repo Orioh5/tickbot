@@ -17,10 +17,9 @@ class UserSessionStore {
   }
 
   save(userId, storageState) {
-    const current = this.loadWithGeneration(userId);
-    const generation = (current?.generation ?? 0) + 1;
+    const generation = crypto.randomBytes(32).toString('base64url');
     this._writeEncrypted(userId, {
-      format: 'mhfc-session-v1',
+      format: 'mhfc-session-v2',
       generation,
       storageState,
     });
@@ -55,6 +54,10 @@ class UserSessionStore {
   loadWithGeneration(userId) {
     const value = this._readEncrypted(userId);
     if (value == null) return null;
+    if (value.format === 'mhfc-session-v2' &&
+        typeof value.generation === 'string' && value.generation.length > 0) {
+      return { generation: value.generation, storageState: value.storageState };
+    }
     if (value.format === 'mhfc-session-v1' && Number.isSafeInteger(value.generation)) {
       return { generation: value.generation, storageState: value.storageState };
     }

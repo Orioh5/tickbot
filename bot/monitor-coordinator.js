@@ -23,7 +23,10 @@ class MonitorCoordinator {
     this._monitors = new Map();
     this._monitorSessionGenerations = new Map();
     this._queue = [];
+    // userId → Map<session generation or monitor identity, cleanup Promise>
     this._expiryCleanups = new Map();
+    this._notifiedExpiryGenerations = new Map();
+    this._notifiedExpiryMonitors = new WeakSet();
     this._tearingDown = new Set();
     this._drainPromise = null;
     this._monitorLifecycleHandlers = new WeakMap();
@@ -75,21 +78,33 @@ class MonitorCoordinator {
 
   handleSessionExpired(userId, expiredGeneration = undefined) {
     const uid = String(userId);
-    const existing = this._expiryCleanups.get(uid);
-    if (existing) return existing;
+    const expiredMonitor = this._monitors.get(uid) ?? null;
     const generation = expiredGeneration === undefined
       ? (this._monitorSessionGenerations.get(uid) ?? this._loadSessionRecord(uid)?.generation ?? null)
       : expiredGeneration;
-    const cleanup = Promise.resolve().then(() => this._performSessionExpiryCleanup(uid, generation));
-    this._expiryCleanups.set(uid, cleanup);
+    const identity = generation ?? expiredMonitor ?? 'no-session-generation';
+    let userCleanups = this._expiryCleanups.get(uid);
+    const existing = userCleanups?.get(identity);
+    if (existing) return existing;
+    if (!userCleanups) {
+      userCleanups = new Map();
+      this._expiryCleanups.set(uid, userCleanups);
+    }
+    const cleanup = Promise.resolve().then(() =>
+      this._performSessionExpiryCleanup(uid, generation, expiredMonitor));
+    userCleanups.set(identity, cleanup);
     void cleanup.finally(() => {
-      if (this._expiryCleanups.get(uid) === cleanup) this._expiryCleanups.delete(uid);
+      const current = this._expiryCleanups.get(uid);
+      if (current?.get(identity) === cleanup) current.delete(identity);
+      if (current?.size === 0) this._expiryCleanups.delete(uid);
     }).catch(() => {});
     return cleanup;
   }
 
-  async _performSessionExpiryCleanup(uid, expiredGeneration) {
-    const monitor = this._monitors.get(uid);
+  async _performSessionExpiryCleanup(uid, expiredGeneration, expiredMonitor) {
+    const currentMonitor = this._monitors.get(uid) ?? null;
+    if (expiredMonitor && currentMonitor !== expiredMonitor) return;
+    const monitor = expiredMonitor || currentMonitor;
     const monitorGeneration = this._monitorSessionGenerations.get(uid);
     if (monitor && expiredGeneration != null && monitorGeneration != null &&
         monitorGeneration !== expiredGeneration) {
@@ -100,7 +115,9 @@ class MonitorCoordinator {
         currentSessionGeneration !== expiredGeneration) {
       return;
     }
-    const reconnect = this._sendReconnect(uid);
+    if (this._markReconnectNotification(uid, expiredGeneration, monitor)) {
+      void this._sendReconnect(uid);
+    }
 
     // Remove the target's queued work before stopping an active monitor, because
     // stop/completion events may immediately drain the remaining shared queue.
@@ -135,7 +152,25 @@ class MonitorCoordinator {
       this._detachMonitorLifecycle(monitor);
     }
     if (settled) this._scheduleDrainQueue();
-    await reconnect;
+  }
+
+  _markReconnectNotification(uid, generation, monitor) {
+    if (generation != null) {
+      let generations = this._notifiedExpiryGenerations.get(uid);
+      if (!generations) {
+        generations = new Set();
+        this._notifiedExpiryGenerations.set(uid, generations);
+      }
+      if (generations.has(generation)) return false;
+      generations.add(generation);
+      if (generations.size > 32) generations.delete(generations.values().next().value);
+      return true;
+    }
+    if (monitor) {
+      if (this._notifiedExpiryMonitors.has(monitor)) return false;
+      this._notifiedExpiryMonitors.add(monitor);
+    }
+    return true;
   }
 
   async _sendReconnect(uid) {
@@ -178,13 +213,19 @@ class MonitorCoordinator {
 
   _scheduleDrainQueue() {
     if (this._drainPromise) return this._drainPromise;
-    const drain = Promise.resolve().then(() => this._drainQueue());
-    this._drainPromise = drain;
-    void drain.catch(() => {
-      console.error('[MonitorCoordinator] Queued monitor promotion failed.');
-    }).finally(() => {
-      if (this._drainPromise === drain) this._drainPromise = null;
+    const drain = Promise.resolve().then(async () => {
+      try {
+        await this._drainQueue();
+      } catch (_) {
+        console.error('[MonitorCoordinator] Queued monitor promotion failed.');
+      } finally {
+        if (this._drainPromise === drain) this._drainPromise = null;
+      }
+      if (this._queue.length && this._monitors.size < this.maxConcurrent) {
+        await this._scheduleDrainQueue();
+      }
     });
+    this._drainPromise = drain;
     return drain;
   }
 
