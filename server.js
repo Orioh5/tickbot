@@ -2,11 +2,6 @@
 
 require('dotenv').config();
 
-if (!process.env.ENCRYPTION_KEY) {
-  console.error('Fatal: ENCRYPTION_KEY environment variable is required but not set.');
-  process.exit(1);
-}
-
 const express = require('express');
 const http    = require('http');
 const https   = require('https');
@@ -22,13 +17,15 @@ const {
 
 // Bot services — populated by bot/bot-server.js after this module is loaded.
 // Kept as a mutable object so bot-server.js can assign into it without circular deps.
-const botServices = { secureLoginService: null, userSessionStore: null, maccabiAuthenticator: null };
+const botServices = {
+  secureLoginService: null,
+  userSessionStore: null,
+  maccabiAuthenticator: null,
+  loginNotifier: null,
+};
 
-const app    = express();
-const server = http.createServer(app);
-// isAuthed is defined below (needs SESSION_SECRET etc.) but only invoked per-connection,
-// well after the whole module has finished loading.
-const wss    = new WebSocket.Server({ server, verifyClient: (info, cb) => cb(isAuthed(info.req)) });
+let server = null;
+let wss = null;
 
 const SETTINGS_PATH = process.env.DATA_DIR
   ? path.join(process.env.DATA_DIR, 'settings.json')
@@ -110,6 +107,7 @@ function loadSettings() {
 // ── Broadcast ─────────────────────────────────────────────────────────────
 
 function broadcast(data) {
+  if (!wss) return;
   const msg = JSON.stringify(data);
   wss.clients.forEach(client => {
     if (client.readyState === WebSocket.OPEN) client.send(msg);
@@ -126,6 +124,11 @@ monitor.on('sections', sections         => broadcast({ type: 'sections', section
 monitor.on('stats',    stats            => broadcast({ type: 'stats', stats }));
 monitor.on('alert',    message          => broadcast({ type: 'alert', message }));
 
+// ── Express app ───────────────────────────────────────────────────────────
+
+function createApp({ botServices: injectedBotServices = botServices } = {}) {
+  const app = express();
+
 // ── Middleware ────────────────────────────────────────────────────────────
 
 app.use(express.json());
@@ -141,7 +144,7 @@ app.get('/login.html', (req, res) => res.sendFile(path.join(__dirname, 'public',
 app.get('/bot-login', (req, res) => {
   const rawToken = String(req.query.t || '');
   if (!rawToken) return res.status(400).send('חוסר: קישור ללא טוקן.');
-  const svc = botServices.secureLoginService;
+  const svc = injectedBotServices.secureLoginService;
   if (!svc) return res.status(503).send('Bot login not available.');
   try {
     svc.verifyToken(rawToken); // peek — does not consume
@@ -173,10 +176,13 @@ app.post('/bot-login', express.urlencoded({ extended: false }), async (req, res)
   const rawToken = String(req.body?.t || '');
   const username = String(req.body?.username || '');
   const password = String(req.body?.password || '');
-  const svc = botServices.secureLoginService;
-  const sessionStore = botServices.userSessionStore;
-  const authenticator = botServices.maccabiAuthenticator;
-  if (!svc || !sessionStore || !authenticator) return res.status(503).send('Bot login not available.');
+  const svc = injectedBotServices.secureLoginService;
+  const sessionStore = injectedBotServices.userSessionStore;
+  const authenticator = injectedBotServices.maccabiAuthenticator;
+  const loginNotifier = injectedBotServices.loginNotifier;
+  if (!svc || !sessionStore || !authenticator || !loginNotifier) {
+    return res.status(503).send('Bot login not available.');
+  }
   let userId;
   try {
     userId = svc.verifyToken(rawToken); // keep valid so a failed login can be retried
@@ -187,7 +193,10 @@ app.post('/bot-login', express.urlencoded({ extended: false }), async (req, res)
     const storageState = await authenticator.login(username, password);
     const redeemedUserId = svc.redeemToken(rawToken);
     if (redeemedUserId !== userId) throw new Error('Login token user mismatch');
-    await sessionStore.save(userId, storageState);
+    await sessionStore.save(redeemedUserId, storageState);
+    await loginNotifier.loginSucceeded(redeemedUserId).catch(error => {
+      console.error('[bot-login] Telegram notification failed:', error.message);
+    });
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     res.send('<!DOCTYPE html><html lang="he" dir="rtl"><head><meta charset="utf-8"><title>הצלחה</title></head>' +
       '<body><h2>✅ התחברת בהצלחה!</h2><p>חזור לבוט בטלגרם כדי להמשיך.</p></body></html>');
@@ -297,28 +306,64 @@ app.post('/api/telegram/test', (req, res) => {
   request.end();
 });
 
+  return app;
+}
+
 // ── WebSocket — only authenticated sessions may connect ────────────────────
 
-wss.on('connection', ws => {
-  ws.send(JSON.stringify({ type: 'status',   status: monitor.getStatus() }));
-  // If monitor is running, show live section statuses; otherwise show configured sections as pending
-  const liveSections = monitor.getSections();
-  const sections = monitor.running || Object.keys(liveSections).length > 0
-    ? liveSections
-    : Object.fromEntries(loadSettings().sections.map(s => [s, { status: 'pending' }]));
-  ws.send(JSON.stringify({ type: 'sections', sections }));
-  ws.send(JSON.stringify({ type: 'stats',    stats:    monitor.getStats()    }));
-});
+function attachWebSocketHandlers(webSocketServer) {
+  webSocketServer.on('connection', ws => {
+    ws.send(JSON.stringify({ type: 'status',   status: monitor.getStatus() }));
+    // If monitor is running, show live section statuses; otherwise show configured sections as pending
+    const liveSections = monitor.getSections();
+    const sections = monitor.running || Object.keys(liveSections).length > 0
+      ? liveSections
+      : Object.fromEntries(loadSettings().sections.map(s => [s, { status: 'pending' }]));
+    ws.send(JSON.stringify({ type: 'sections', sections }));
+    ws.send(JSON.stringify({ type: 'stats',    stats:    monitor.getStats()    }));
+  });
+}
 
 // ── Start ─────────────────────────────────────────────────────────────────
 
-server.listen(PORT, () => {
-  console.log(`\n🎟️  MHFC Ticket Monitor`);
-  console.log(`   Running at http://localhost:${PORT}\n`);
+function startServer() {
+  if (!process.env.ENCRYPTION_KEY) {
+    throw new Error('ENCRYPTION_KEY environment variable is required but not set.');
+  }
 
-  const protocol = process.env.NODE_ENV === 'production' ? 'https' : 'http';
-  const baseUrl  = process.env.BASE_URL || `${protocol}://localhost:${PORT}`;
-  require('./bot/bot-server').start({ botServices, baseUrl });
-});
+  const app = createApp({ botServices });
+  server = http.createServer(app);
+  wss = new WebSocket.Server({
+    server,
+    verifyClient: (info, callback) => callback(isAuthed(info.req)),
+  });
+  attachWebSocketHandlers(wss);
 
-module.exports = { server, PORT, botServices };
+  server.listen(PORT, () => {
+    console.log(`\n🎟️  MHFC Ticket Monitor`);
+    console.log(`   Running at http://localhost:${PORT}\n`);
+
+    const protocol = process.env.NODE_ENV === 'production' ? 'https' : 'http';
+    const baseUrl  = process.env.BASE_URL || `${protocol}://localhost:${PORT}`;
+    require('./bot/bot-server').start({ botServices, baseUrl });
+  });
+
+  return server;
+}
+
+if (require.main === module) {
+  try {
+    startServer();
+  } catch (error) {
+    console.error(`Fatal: ${error.message}`);
+    process.exit(1);
+  }
+}
+
+module.exports = {
+  createApp,
+  startServer,
+  PORT,
+  botServices,
+  get server() { return server; },
+};

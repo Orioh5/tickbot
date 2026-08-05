@@ -72,6 +72,16 @@ function start({ botServices, baseUrl, env = process.env }) {
   botServices.secureLoginService = secureLoginService;
   botServices.userSessionStore   = userSessionStore;
   botServices.maccabiAuthenticator = maccabiAuthenticator;
+  botServices.loginNotifier = {
+    loginSucceeded: userId => bot.sendMessage(userId, '✅ החשבון חובר בהצלחה.', {
+      reply_markup: {
+        inline_keyboard: [[
+          { text: '⚽ בחר משחק', callback_data: 'menu:games' },
+          { text: '🏠 תפריט ראשי', callback_data: 'menu:home' },
+        ]],
+      },
+    }),
+  };
 
   void bot.initialize().then(() => {
     bot.start();
