@@ -12,6 +12,19 @@ const MonitorCoordinator = require('./monitor-coordinator');
 const TelegramBotService = require('./telegram-bot-service');
 const MaccabiAuthenticator = require('./maccabi-authenticator');
 
+function createLoginNotifier(bot) {
+  return {
+    loginSucceeded: userId => bot.sendMessage(userId, '✅ החשבון חובר בהצלחה.', {
+      reply_markup: {
+        inline_keyboard: [[
+          { text: '⚽ בחר משחק', callback_data: 'menu:games' },
+          { text: '🏠 תפריט ראשי', callback_data: 'menu:home' },
+        ]],
+      },
+    }),
+  };
+}
+
 function start({ botServices, baseUrl, env = process.env }) {
   const token = env.BOT_TOKEN || env.TELEGRAM_TOKEN;
   if (!token) {
@@ -72,16 +85,7 @@ function start({ botServices, baseUrl, env = process.env }) {
   botServices.secureLoginService = secureLoginService;
   botServices.userSessionStore   = userSessionStore;
   botServices.maccabiAuthenticator = maccabiAuthenticator;
-  botServices.loginNotifier = {
-    loginSucceeded: userId => bot.sendMessage(userId, '✅ החשבון חובר בהצלחה.', {
-      reply_markup: {
-        inline_keyboard: [[
-          { text: '⚽ בחר משחק', callback_data: 'menu:games' },
-          { text: '🏠 תפריט ראשי', callback_data: 'menu:home' },
-        ]],
-      },
-    }),
-  };
+  botServices.loginNotifier = createLoginNotifier(bot);
 
   void bot.initialize().then(() => {
     bot.start();
@@ -95,4 +99,4 @@ function start({ botServices, baseUrl, env = process.env }) {
   return bot;
 }
 
-module.exports = { start };
+module.exports = { start, createLoginNotifier };

@@ -148,8 +148,8 @@ app.get('/bot-login', (req, res) => {
   if (!svc) return res.status(503).send('Bot login not available.');
   try {
     svc.verifyToken(rawToken); // peek — does not consume
-  } catch (err) {
-    return res.status(400).send(`קישור לא תקין: ${err.message}`);
+  } catch {
+    return res.status(400).send('קישור ההתחברות אינו תקין או אינו זמין עוד. בקש קישור חדש מהבוט.');
   }
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.send(`<!DOCTYPE html>
@@ -186,24 +186,40 @@ app.post('/bot-login', express.urlencoded({ extended: false }), async (req, res)
   let userId;
   try {
     userId = svc.verifyToken(rawToken); // keep valid so a failed login can be retried
-  } catch (err) {
-    return res.status(400).send(`שגיאה: ${err.message}`);
+  } catch {
+    return res.status(400).send('קישור ההתחברות אינו תקין או אינו זמין עוד. בקש קישור חדש מהבוט.');
   }
+
+  let storageState;
   try {
-    const storageState = await authenticator.login(username, password);
-    const redeemedUserId = svc.redeemToken(rawToken);
-    if (redeemedUserId !== userId) throw new Error('Login token user mismatch');
-    await sessionStore.save(redeemedUserId, storageState);
-    await loginNotifier.loginSucceeded(redeemedUserId).catch(error => {
-      console.error('[bot-login] Telegram notification failed:', error.message);
-    });
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.send('<!DOCTYPE html><html lang="he" dir="rtl"><head><meta charset="utf-8"><title>הצלחה</title></head>' +
-      '<body><h2>✅ התחברת בהצלחה!</h2><p>חזור לבוט בטלגרם כדי להמשיך.</p></body></html>');
-  } catch (err) {
-    console.error('[bot-login] Playwright login failed:', err.message);
-    res.status(401).send('ההתחברות נכשלה. בדוק את הפרטים ונסה שוב באמצעות אותו קישור.');
+    storageState = await authenticator.login(username, password);
+  } catch {
+    console.error('[bot-login] Maccabi authentication failed.');
+    return res.status(401).send('ההתחברות נכשלה. בדוק את הפרטים ונסה שוב באמצעות אותו קישור.');
   }
+
+  let redeemedUserId;
+  try {
+    redeemedUserId = svc.redeemToken(rawToken);
+    if (redeemedUserId !== userId) throw new Error('Login token user mismatch');
+  } catch {
+    console.error('[bot-login] Login token redemption failed.');
+    return res.status(409).send('קישור ההתחברות אינו זמין עוד. בקש קישור חדש מהבוט.');
+  }
+
+  try {
+    await sessionStore.save(redeemedUserId, storageState);
+  } catch {
+    console.error('[bot-login] Session persistence failed.');
+    return res.status(500).send('לא ניתן היה לשמור את החיבור. בקש קישור חדש מהבוט ונסה שוב.');
+  }
+
+  await loginNotifier.loginSucceeded(redeemedUserId).catch(() => {
+    console.error('[bot-login] Telegram notification failed.');
+  });
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send('<!DOCTYPE html><html lang="he" dir="rtl"><head><meta charset="utf-8"><title>הצלחה</title></head>' +
+    '<body><h2>✅ התחברת בהצלחה!</h2><p>חזור לבוט בטלגרם כדי להמשיך.</p></body></html>');
 });
 
 app.post('/api/login', (req, res) => {
