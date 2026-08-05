@@ -11,6 +11,7 @@ const STATE = {
   AWAITING_SECTIONS: 'awaiting_sections',
   AWAITING_QUANTITY: 'awaiting_quantity',
   AWAITING_CONFIRMATION: 'awaiting_confirmation',
+  AWAITING_CHANGE_CONFIRMATION: 'awaiting_change_confirmation',
 };
 
 const ACTIONS = Object.freeze({
@@ -272,9 +273,19 @@ class TelegramBotService {
         await this._cmdLogin(userId, chatId, fromUser);
         return;
       case 'games':
-      case 'change':
         await this._cmdGames(userId, chatId, fromUser);
         return;
+      case 'change': {
+        const status = this.monitorCoordinator?.getStatus(userId);
+        const phase = status?.phase ?? status?.status;
+        if (phase !== 'monitoring') {
+          await this.showMainMenu(userId, chatId);
+          return;
+        }
+        this._setState(userId, STATE.AWAITING_CHANGE_CONFIRMATION);
+        await this._sendChangeConfirmationPrompt(chatId);
+        return;
+      }
       case 'status':
         await this._cmdStatus(userId, chatId, fromUser);
         return;
@@ -338,7 +349,13 @@ class TelegramBotService {
         reply_markup: { inline_keyboard: keyboard },
       });
     } catch (err) {
-      await this.sendMessage(chatId, `שגיאה בחיפוש משחקים: ${err.message}`);
+      if (err?.code === 'SESSION_EXPIRED') return;
+      await this.sendMessage(chatId, 'לא ניתן היה לחפש משחקים כרגע. אפשר לנסות שוב.', {
+        reply_markup: { inline_keyboard: [[
+          { text: '🔄 נסה שוב', callback_data: 'games:retry' },
+          { text: '🏠 תפריט ראשי', callback_data: 'menu:home' },
+        ]] },
+      });
     }
   }
 
@@ -455,6 +472,32 @@ class TelegramBotService {
       return;
     }
 
+    if (data === 'change:confirm') {
+      const current = this._getState(userId);
+      if (current.state !== STATE.AWAITING_CHANGE_CONFIRMATION) {
+        await this.showMainMenu(userId, chatId);
+        return;
+      }
+      // Claim the confirmation before awaiting stop so a double-click cannot
+      // stop newly-selected work after the first callback advances the flow.
+      this._clearState(userId);
+      await this.monitorCoordinator.stopMonitor(userId);
+      this.userStore.setMonitoringActive(userId, false);
+      await this._cmdGames(userId, chatId, query.from);
+      return;
+    }
+
+    if (data === 'change:cancel') {
+      const current = this._getState(userId);
+      if (current.state !== STATE.AWAITING_CHANGE_CONFIRMATION) {
+        await this.showMainMenu(userId, chatId);
+        return;
+      }
+      this._clearState(userId);
+      await this.showMainMenu(userId, chatId);
+      return;
+    }
+
     // Game selection
     const gameMatch = data.match(/^game:(\d+)$/);
     if (gameMatch) {
@@ -468,7 +511,18 @@ class TelegramBotService {
         await this.showMainMenu(userId, chatId);
         return;
       }
-      const discovered = await this.monitorCoordinator.discoverSections(userId, game.url);
+      let discovered;
+      try {
+        discovered = await this.monitorCoordinator.discoverSections(userId, game.url);
+      } catch (error) {
+        if (error?.code === 'SESSION_EXPIRED') return;
+        await this.sendMessage(chatId, 'לא ניתן היה לטעון את מפת הגושים כרגע.', {
+          reply_markup: { inline_keyboard: [[
+            { text: '🏠 תפריט ראשי', callback_data: 'menu:home' },
+          ]] },
+        });
+        return;
+      }
       const availableSections = [...new Set(discovered.map(section => String(section.label)))];
       if (!availableSections.length) {
         await this.sendMessage(chatId, `🎮 ${game.name}\nלא נמצאו גושים במפת המשחק כרגע.`);
@@ -658,6 +712,15 @@ class TelegramBotService {
         ] },
       }
     );
+  }
+
+  async _sendChangeConfirmationPrompt(chatId) {
+    await this.sendMessage(chatId, 'שינוי הבחירה יפסיק את המעקב הפעיל. להמשיך?', {
+      reply_markup: { inline_keyboard: [[
+        { text: '✅ כן, שנה בחירה', callback_data: 'change:confirm' },
+        { text: '❌ לא, השאר מעקב', callback_data: 'change:cancel' },
+      ]] },
+    });
   }
 
   async _call(method, body = {}, options = {}) {

@@ -24,20 +24,26 @@ function makeBrowser(pages = []) {
 function makeEmptyPage() {
   return {
     goto: async () => {},
+    url: () => 'https://tickets.mhaifafc.com/',
+    locator: () => ({ first: () => ({ isVisible: async () => false }) }),
     evaluate: async () => [],
   };
 }
 
-function makeGamePage(games) {
+function makeGamePage(games, { url = 'https://tickets.mhaifafc.com/', loginFormVisible = false } = {}) {
   return {
     goto: async () => {},
+    url: () => url,
+    locator: () => ({ first: () => ({ isVisible: async () => loginFormVisible }) }),
     evaluate: async () => games,
   };
 }
 
-function makeSectionPage(sections) {
+function makeSectionPage(sections, { url = 'https://tickets.mhaifafc.com/event/123', loginFormVisible = false } = {}) {
   return {
     goto: async () => {},
+    url: () => url,
+    locator: () => ({ first: () => ({ isVisible: async () => loginFormVisible }) }),
     evaluate: async () => sections,
   };
 }
@@ -74,6 +80,33 @@ test('discoverGames throws when no session saved', async () => {
   await assert.rejects(() => svc.discoverGames('42'), /No saved session/);
 });
 
+test('redirect to the Maccabi login page is reported as SESSION_EXPIRED', async () => {
+  const svc = new GameDiscoveryService({
+    userSessionStore: makeSessionStore(),
+    browserFactory: makeBrowser([makeGamePage([], { url: 'https://auth.mhaifafc.com/login' })]),
+  });
+
+  await assert.rejects(
+    () => svc.discoverGames('42'),
+    error => error.code === 'SESSION_EXPIRED' && error.message === 'Saved session expired'
+  );
+});
+
+test('a navigation failure is not misclassified as SESSION_EXPIRED', async () => {
+  const navigationError = new Error('ticket site unavailable');
+  const page = makeGamePage([]);
+  page.goto = async () => { throw navigationError; };
+  const svc = new GameDiscoveryService({
+    userSessionStore: makeSessionStore(),
+    browserFactory: makeBrowser([page]),
+  });
+
+  await assert.rejects(
+    () => svc.discoverGames('42'),
+    error => error === navigationError && error.code === undefined
+  );
+});
+
 // ── discoverSections ──────────────────────────────────────────────────────────
 
 test('discoverSections returns sections from game page', async () => {
@@ -95,6 +128,18 @@ test('discoverSections throws when no session saved', async () => {
     browserFactory: makeBrowser(),
   });
   await assert.rejects(() => svc.discoverSections('42', 'https://example.com'), /No saved session/);
+});
+
+test('a visible login form after game navigation is reported as SESSION_EXPIRED', async () => {
+  const svc = new GameDiscoveryService({
+    userSessionStore: makeSessionStore(),
+    browserFactory: makeBrowser([makeSectionPage([], { loginFormVisible: true })]),
+  });
+
+  await assert.rejects(
+    () => svc.discoverSections('42', 'https://tickets.mhaifafc.com/event/123'),
+    error => error.code === 'SESSION_EXPIRED'
+  );
 });
 
 test('browser is always closed even on page error', async () => {

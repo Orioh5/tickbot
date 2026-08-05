@@ -200,6 +200,78 @@ test('menu:games discovers games for the clicking user', async () => {
   assert.deepEqual(discoverCalls, ['7']);
 });
 
+test('change selection requires confirmation before stopping and then opens game selection', async () => {
+  const lifecycle = [];
+  const coordinator = {
+    getStatus: () => ({ phase: 'monitoring' }),
+    stopMonitor: async userId => lifecycle.push(`stop:${userId}`),
+    discoverGames: async userId => {
+      lifecycle.push(`games:${userId}`);
+      return [];
+    },
+  };
+  const { store, botFactory } = makeBot({ extraUserIds: ['7'], monitorCoordinator: coordinator });
+  const fetch = makeFetch(Array.from({ length: 8 }, () => ({ ok: true, result: {} })));
+  const bot = botFactory(fetch);
+
+  await bot._dispatch(makeCallbackUpdate(7, 'menu:change'));
+
+  assert.deepEqual(lifecycle, []);
+  assert.deepEqual(
+    fetch.calls.at(-1).body.reply_markup.inline_keyboard.flat().map(button => button.callback_data),
+    ['change:confirm', 'change:cancel']
+  );
+  assert.deepEqual(
+    fetch.calls.at(-1).body.reply_markup.inline_keyboard.flat().map(button => button.text),
+    ['✅ כן, שנה בחירה', '❌ לא, השאר מעקב']
+  );
+
+  await bot._dispatch(makeCallbackUpdate(7, 'change:confirm'));
+
+  assert.deepEqual(lifecycle, ['stop:7', 'games:7']);
+  assert.equal(store.getMonitoringConfig('7').active, 0);
+});
+
+test('cancelling change selection preserves the current monitor and returns its lifecycle menu', async () => {
+  const stopCalls = [];
+  const coordinator = {
+    getStatus: () => ({ phase: 'monitoring' }),
+    stopMonitor: async userId => stopCalls.push(String(userId)),
+  };
+  const { botFactory } = makeBot({
+    extraUserIds: ['7'],
+    monitorCoordinator: coordinator,
+    userSessionStore: { load: () => ({ cookies: [], origins: [] }) },
+  });
+  const fetch = makeFetch(Array.from({ length: 6 }, () => ({ ok: true, result: {} })));
+  const bot = botFactory(fetch);
+
+  await bot._dispatch(makeCallbackUpdate(7, 'menu:change'));
+  await bot._dispatch(makeCallbackUpdate(7, 'change:cancel'));
+
+  assert.deepEqual(stopCalls, []);
+  assert.equal(bot._getState('7').state, 'idle');
+  assert.ok(fetch.calls.at(-1).body.reply_markup.inline_keyboard.flat()
+    .some(button => button.callback_data === 'menu:change'));
+});
+
+test('one user cannot confirm another user change selection', async () => {
+  const stopCalls = [];
+  const coordinator = {
+    getStatus: () => ({ phase: 'monitoring' }),
+    stopMonitor: async userId => stopCalls.push(String(userId)),
+  };
+  const { botFactory } = makeBot({ extraUserIds: ['7', '8'], monitorCoordinator: coordinator });
+  const fetch = makeFetch(Array.from({ length: 6 }, () => ({ ok: true, result: {} })));
+  const bot = botFactory(fetch);
+
+  await bot._dispatch(makeCallbackUpdate(7, 'menu:change'));
+  await bot._dispatch(makeCallbackUpdate(8, 'change:confirm'));
+
+  assert.deepEqual(stopCalls, []);
+  assert.equal(bot._getState('7').state, 'awaiting_change_confirmation');
+});
+
 test('stale callback only redisplays current menu', async () => {
   const stopCalls = [];
   const coordinator = {
@@ -667,6 +739,48 @@ test('empty game discovery offers retry and home buttons', async () => {
   assert.equal(message.text, 'לא נמצאו משחקים זמינים כרגע.');
   assert.deepEqual(
     message.reply_markup.inline_keyboard.flat().map(button => button.callback_data),
+    ['games:retry', 'menu:home']
+  );
+});
+
+test('session expiry during game discovery does not expose an internal error', async () => {
+  const error = Object.assign(new Error('Saved session expired: cookie details'), { code: 'SESSION_EXPIRED' });
+  const coordinator = { discoverGames: async () => { throw error; } };
+  const { botFactory } = makeBot({ extraUserIds: ['7'], monitorCoordinator: coordinator });
+  const fetch = makeFetch(Array.from({ length: 4 }, () => ({ ok: true, result: {} })));
+  const bot = botFactory(fetch);
+
+  await assert.doesNotReject(() => bot._dispatch(makeCallbackUpdate(7, 'menu:games')));
+
+  assert.ok(fetch.calls.every(call => !String(call.body.text || '').includes('cookie details')));
+});
+
+test('session expiry during section discovery exits safely after coordinator cleanup', async () => {
+  const error = Object.assign(new Error('Saved session expired'), { code: 'SESSION_EXPIRED' });
+  const coordinator = { discoverSections: async () => { throw error; } };
+  const { botFactory } = makeBot({ extraUserIds: ['7'], monitorCoordinator: coordinator });
+  const fetch = makeFetch(Array.from({ length: 3 }, () => ({ ok: true, result: {} })));
+  const bot = botFactory(fetch);
+  bot._setState('7', 'awaiting_game', {
+    games: [{ name: 'Game', url: 'https://tickets.mhaifafc.com/event/1' }],
+  });
+
+  await assert.doesNotReject(() => bot._dispatch(makeCallbackUpdate(7, 'game:0')));
+
+  assert.ok(fetch.calls.every(call => !String(call.body.text || '').includes('Saved session expired')));
+});
+
+test('site errors during game discovery are rendered without internal details', async () => {
+  const coordinator = { discoverGames: async () => { throw new Error('proxy password secret-value'); } };
+  const { botFactory } = makeBot({ extraUserIds: ['7'], monitorCoordinator: coordinator });
+  const fetch = makeFetch(Array.from({ length: 4 }, () => ({ ok: true, result: {} })));
+  const bot = botFactory(fetch);
+
+  await bot._dispatch(makeCallbackUpdate(7, 'menu:games'));
+
+  assert.doesNotMatch(fetch.calls.at(-1).body.text, /secret-value/);
+  assert.deepEqual(
+    fetch.calls.at(-1).body.reply_markup.inline_keyboard.flat().map(button => button.callback_data),
     ['games:retry', 'menu:home']
   );
 });

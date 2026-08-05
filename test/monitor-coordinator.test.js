@@ -153,6 +153,93 @@ test('discoverGames delegates to gameDiscovery', async () => {
   assert.deepEqual(games, [{ name: 'Game A', url: 'https://x.com/1' }]);
 });
 
+test('session expiry stops and removes only the affected active user and offers reconnect', async () => {
+  const activeChanges = [];
+  const sessions = new Map([
+    ['1', { cookies: [{ name: 'session-a' }], origins: [] }],
+    ['2', { cookies: [{ name: 'session-b' }], origins: [] }],
+  ]);
+  const sessionStore = {
+    load: userId => sessions.get(String(userId)) ?? null,
+    delete: userId => sessions.delete(String(userId)),
+  };
+  const bot = makeBot();
+  const coord = new MonitorCoordinator({
+    userStore: { setMonitoringActive: (id, active) => activeChanges.push([String(id), active]) },
+    userSessionStore: sessionStore,
+    gameDiscovery: makeGameDiscovery(),
+    telegramBotService: bot,
+    MonitorClass: StubMonitor,
+  });
+  await coord.startMonitor('1', { gameUrl: 'u1', sections: ['13'], chatId: '1' });
+  await coord.startMonitor('2', { gameUrl: 'u2', sections: ['14'], chatId: '2' });
+
+  await coord.handleSessionExpired('1');
+
+  assert.equal(coord.getStatus('1'), null);
+  assert.equal(coord.getStatus('2').phase, 'monitoring');
+  assert.equal(sessions.has('1'), false);
+  assert.equal(sessions.has('2'), true);
+  assert.ok(activeChanges.some(change => change[0] === '1' && change[1] === false));
+  assert.ok(!activeChanges.some(change => change[0] === '2'));
+  assert.equal(bot.sent.length, 1);
+  assert.equal(bot.sent[0].chatId, '1');
+  assert.match(bot.sent[0].text, /🔐 התחבר מחדש/);
+  assert.deepEqual(
+    bot.sent[0].extra.reply_markup.inline_keyboard.flat().map(button => button.callback_data),
+    ['menu:login']
+  );
+});
+
+test('session expiry removes only the affected queued work', async () => {
+  const sessions = new Map([['1', {}], ['2', {}], ['3', {}]]);
+  const coord = new MonitorCoordinator({
+    userStore: { setMonitoringActive: () => {} },
+    userSessionStore: {
+      load: userId => sessions.get(String(userId)) ?? null,
+      delete: userId => sessions.delete(String(userId)),
+    },
+    gameDiscovery: makeGameDiscovery(),
+    telegramBotService: makeBot(),
+    maxConcurrent: 1,
+    MonitorClass: StubMonitor,
+  });
+  await coord.startMonitor('1', { gameUrl: 'u1', sections: ['13'], chatId: '1' });
+  await coord.startMonitor('2', { gameUrl: 'u2', sections: ['14'], chatId: '2' });
+  await coord.startMonitor('3', { gameUrl: 'u3', sections: ['15'], chatId: '3' });
+
+  await coord.handleSessionExpired('2');
+  await coord.stopMonitor('1');
+
+  assert.equal(coord.getStatus('2'), null);
+  assert.equal(coord.getStatus('3').phase, 'monitoring');
+  assert.equal(sessions.has('2'), false);
+  assert.equal(sessions.has('3'), true);
+});
+
+test('discovery expiry performs target cleanup and rethrows SESSION_EXPIRED', async () => {
+  const expired = Object.assign(new Error('Saved session expired'), { code: 'SESSION_EXPIRED' });
+  const deleted = [];
+  const activeChanges = [];
+  const bot = makeBot();
+  const coord = new MonitorCoordinator({
+    userStore: { setMonitoringActive: (id, active) => activeChanges.push([String(id), active]) },
+    userSessionStore: {
+      load: () => ({ cookies: [], origins: [] }),
+      delete: id => deleted.push(String(id)),
+    },
+    gameDiscovery: { discoverGames: async () => { throw expired; } },
+    telegramBotService: bot,
+    MonitorClass: StubMonitor,
+  });
+
+  await assert.rejects(() => coord.discoverGames('7'), error => error === expired);
+
+  assert.deepEqual(deleted, ['7']);
+  assert.deepEqual(activeChanges, [['7', false]]);
+  assert.match(bot.sent[0].text, /🔐 התחבר מחדש/);
+});
+
 test('owner selection fails immediately when Telegram cannot send the question', async () => {
   const bot = {
     registerCallbackHandler: () => {},

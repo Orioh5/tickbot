@@ -38,11 +38,48 @@ class MonitorCoordinator {
   }
 
   async discoverGames(userId) {
-    return this.gameDiscovery.discoverGames(userId);
+    return this._runDiscovery(userId, () => this.gameDiscovery.discoverGames(userId));
   }
 
   async discoverSections(userId, gameUrl) {
-    return this.gameDiscovery.discoverSections(userId, gameUrl);
+    return this._runDiscovery(userId, () => this.gameDiscovery.discoverSections(userId, gameUrl));
+  }
+
+  async _runDiscovery(userId, operation) {
+    try {
+      return await operation();
+    } catch (error) {
+      if (error?.code === 'SESSION_EXPIRED') await this.handleSessionExpired(userId);
+      throw error;
+    }
+  }
+
+  async handleSessionExpired(userId) {
+    const uid = String(userId);
+
+    // Remove the target's queued work before stopping an active monitor, because
+    // stop/completion events may immediately drain the remaining shared queue.
+    this._queue = this._queue.filter(job => job.userId !== uid);
+    const monitor = this._monitors.get(uid);
+    if (monitor) {
+      this._monitors.delete(uid);
+      try {
+        await monitor.stop();
+      } catch (_) {
+        // Expiry cleanup must continue even if the browser was already closing.
+      }
+    }
+
+    try { this.userStore.setMonitoringActive?.(uid, false); } catch (_) {}
+    try { await this.userSessionStore.delete(uid); } catch (_) {}
+    await this._drainQueue();
+    try {
+      await this.telegramBotService?.sendMessage(uid, '🔐 התחבר מחדש כדי להמשיך לבחור משחקים ולנטר כרטיסים.', {
+        reply_markup: { inline_keyboard: [[
+          { text: '🔐 התחבר מחדש', callback_data: 'menu:login' },
+        ]] },
+      });
+    } catch (_) {}
   }
 
   async restoreActiveMonitors() {

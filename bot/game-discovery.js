@@ -7,6 +7,27 @@
 const EVENTS_URL = 'https://tickets.mhaifafc.com/';
 const NAV_OPTS = { waitUntil: 'networkidle', timeout: 45_000 };
 
+function sessionExpiredError() {
+  return Object.assign(new Error('Saved session expired'), { code: 'SESSION_EXPIRED' });
+}
+
+async function assertAuthenticated(page) {
+  let redirectedToLogin = false;
+  try {
+    const currentUrl = new URL(page.url());
+    redirectedToLogin = currentUrl.hostname === 'auth.mhaifafc.com'
+      && /^\/login(?:\/|$)/i.test(currentUrl.pathname);
+  } catch (_) {
+    // A malformed or unavailable URL is not proof that authentication was lost.
+  }
+
+  const loginFormVisible = await page
+    .locator('form:has(input[type="password"])')
+    .first()
+    .isVisible();
+  if (redirectedToLogin || loginFormVisible) throw sessionExpiredError();
+}
+
 class GameDiscoveryService {
   constructor({ userSessionStore, browserFactory }) {
     this.userSessionStore = userSessionStore;
@@ -22,6 +43,7 @@ class GameDiscoveryService {
       const context = await browser.newContext({ storageState });
       const page = await context.newPage();
       await page.goto(EVENTS_URL, NAV_OPTS);
+      await assertAuthenticated(page);
       const games = await page.evaluate(() => {
         // Each event is a link with a title; selector may need refinement per site structure
         return Array.from(document.querySelectorAll('a[href*="/event/"], a[href*="/EventPage/"]'))
@@ -46,6 +68,7 @@ class GameDiscoveryService {
       const context = await browser.newContext({ storageState });
       const page = await context.newPage();
       await page.goto(gameUrl, NAV_OPTS);
+      await assertAuthenticated(page);
       // Uses same extraction logic as monitor._checkAvailability
       const sections = await page.evaluate(() =>
         Array.from(document.querySelectorAll('[onclick*="processSectorById"]'))
