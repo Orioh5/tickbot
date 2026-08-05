@@ -380,9 +380,10 @@ function startServer() {
   });
   attachWebSocketHandlers(wss);
 
-  server.listen(PORT, () => {
+  const host = process.env.HOST || '127.0.0.1';
+  server.listen(PORT, host, () => {
     console.log(`\n🎟️  MHFC Ticket Monitor`);
-    console.log(`   Running at http://localhost:${PORT}\n`);
+    console.log(`   Running at http://${host}:${PORT}\n`);
 
     const protocol = process.env.NODE_ENV === 'production' ? 'https' : 'http';
     const baseUrl  = process.env.BASE_URL || `${protocol}://localhost:${PORT}`;

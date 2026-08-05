@@ -434,9 +434,10 @@ class TelegramBotService {
     const code = crypto.randomBytes(16).toString('hex').toUpperCase();
     this.userStore.createInviteCode({ code, createdBy: userId });
     const deepLink = `https://t.me/${this.botUsername}?start=${code}`;
-    await this.sendMessage(chatId, `קישור הזמנה חדש: ${deepLink}\n(תקף ל־24 שעות ולשימוש אחד)`, {
-      parse_mode: 'Markdown',
-    });
+    // Telegram auto-links plain URLs. Avoid Markdown here because bot
+    // usernames may contain characters that Telegram's legacy Markdown
+    // parser interprets as formatting and rejects.
+    await this.sendMessage(chatId, `קישור הזמנה חדש: ${deepLink}\n(תקף ל־24 שעות ולשימוש אחד)`);
   }
 
   async _cmdUsers(userId, chatId) {

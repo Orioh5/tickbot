@@ -169,6 +169,7 @@ test('admin invite returns a Telegram deep link', async () => {
   await bot._dispatch(makeCallbackUpdate(1, 'admin:invite'));
 
   assert.match(fetch.calls.at(-1).body.text, /https:\/\/t\.me\/MhfcTestBot\?start=/);
+  assert.equal(fetch.calls.at(-1).body.parse_mode, undefined);
 });
 
 // ── main-menu callback routing ─────────────────────────────────────────────
