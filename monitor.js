@@ -11,6 +11,10 @@ const STATE_PATH = process.env.DATA_DIR
   ? path.join(process.env.DATA_DIR, 'state.json')
   : path.join(__dirname, 'state.json');
 
+function sessionExpiredError() {
+  return Object.assign(new Error('Saved session expired'), { code: 'SESSION_EXPIRED' });
+}
+
 function parseAvailableSections(candidates) {
   return candidates
     .map(({ onclick = '', text = '' }) => {
@@ -96,6 +100,7 @@ class Monitor extends EventEmitter {
     this._flowToken = null;
     this._loopPromise = null;
     this._startInFlight = false;
+    this._sessionExpiryReported = false;
   }
 
   log(message, level = 'info') {
@@ -157,6 +162,7 @@ class Monitor extends EventEmitter {
     this._stopRequested = false;
     this._queueDetected = false;
     this._sectorsInfoUrl = null;
+    this._sessionExpiryReported = false;
     this._labelToOnclickId = {};
     this._onclickIdToLabel = {};
     this.settings = settings;
@@ -391,10 +397,36 @@ class Monitor extends EventEmitter {
     return parseSectorsInfo(payload);
   }
 
+  async _assertSessionActive() {
+    if (!this.page) return;
+    let redirectedToLogin = false;
+    try {
+      const currentUrl = new URL(this.page.url());
+      redirectedToLogin = currentUrl.hostname === 'auth.mhaifafc.com'
+        && /^\/login(?:\/|$)/i.test(currentUrl.pathname);
+    } catch (_) {
+      // URL failures alone are not proof that the saved session expired.
+    }
+
+    const loginForm = this.page.locator?.('form:has(input[type="password"])')?.first?.();
+    const loginFormVisible = loginForm ? await loginForm.isVisible() : false;
+    if (redirectedToLogin || loginFormVisible) throw sessionExpiredError();
+  }
+
+  _reportSessionExpired(error) {
+    if (this._sessionExpiryReported) return;
+    this._sessionExpiryReported = true;
+    this.running = false;
+    this._setPhase('session-expired');
+    this.log('Saved session expired; reconnect is required.', 'warning');
+    this.emit('sessionExpired', error);
+  }
+
   async _refreshDomAvailability(reason) {
     this.log(`${reason} Refreshing the event page once...`, 'warning');
     await this.page.reload({ waitUntil: 'networkidle', timeout: 45000 });
     await this._sleep(2000);
+    await this._assertSessionActive();
     return this._checkAvailability();
   }
 
@@ -438,6 +470,7 @@ class Monitor extends EventEmitter {
     try {
       return await this._pollApiAvailability();
     } catch (error) {
+      if (error?.code === 'SESSION_EXPIRED') throw error;
       return this._refreshDomAvailability(`API polling failed (${error.message}).`);
     }
   }
@@ -457,6 +490,7 @@ class Monitor extends EventEmitter {
             this.log('Loading event page...', 'info');
             await this.page.goto(this.settings.url, { waitUntil: 'networkidle', timeout: 45000 });
             await this._sleep(2000);
+            await this._assertSessionActive();
             await this._checkAvailability();
             navigated = true;
           } else {
@@ -466,6 +500,10 @@ class Monitor extends EventEmitter {
 
         } catch (e) {
           if (!flowIsActive()) break;
+          if (e?.code === 'SESSION_EXPIRED') {
+            this._reportSessionExpired(e);
+            break;
+          }
           consecutiveErrors++;
           this.stats.errors++;
           this.emit('stats', this.getStats());

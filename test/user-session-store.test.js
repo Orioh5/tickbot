@@ -31,6 +31,35 @@ test('save and load round-trip', () => withTempStore('key', store => {
   assert.deepEqual(loaded, sampleState);
 }));
 
+test('each save advances the encrypted session generation', () => withTempStore('key', store => {
+  const firstGeneration = store.save('42', sampleState);
+  const secondState = { cookies: [{ name: 'sid', value: 'fresh' }], origins: [] };
+  const secondGeneration = store.save('42', secondState);
+
+  assert.equal(firstGeneration, 1);
+  assert.equal(secondGeneration, 2);
+  assert.deepEqual(store.loadWithGeneration('42'), {
+    generation: 2,
+    storageState: secondState,
+  });
+}));
+
+test('conditional delete preserves a concurrently refreshed session', () => withTempStore('key', store => {
+  const expiredGeneration = store.save('42', sampleState);
+  const freshState = { cookies: [{ name: 'sid', value: 'fresh' }], origins: [] };
+  store.save('42', freshState);
+
+  assert.equal(store.deleteIfGeneration('42', expiredGeneration), false);
+  assert.deepEqual(store.load('42'), freshState);
+}));
+
+test('conditional delete removes the unchanged expired generation', () => withTempStore('key', store => {
+  const expiredGeneration = store.save('42', sampleState);
+
+  assert.equal(store.deleteIfGeneration('42', expiredGeneration), true);
+  assert.equal(store.load('42'), null);
+}));
+
 test('file is not plaintext JSON', () => withTempStore('key', (store, dataDir) => {
   store.save('42', sampleState);
   const files = fs.readdirSync(dataDir);

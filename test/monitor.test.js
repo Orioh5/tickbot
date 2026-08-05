@@ -628,6 +628,70 @@ test('API polling falls back to one DOM refresh when the request fails', async (
   assert.equal(domChecks, 1);
 });
 
+test('initial event navigation reports one SESSION_EXPIRED event for an exact login redirect', async () => {
+  const monitor = new Monitor();
+  const expiries = [];
+  monitor.running = true;
+  monitor.settings = settings();
+  monitor.page = {
+    goto: async () => {},
+    url: () => 'https://auth.mhaifafc.com/login?returnUrl=%2FStadium',
+    locator: () => ({ first: () => ({ isVisible: async () => false }) }),
+  };
+  monitor._sleep = async () => {};
+  monitor._checkAvailability = async () => { monitor.running = false; };
+  monitor.on('sessionExpired', error => expiries.push(error));
+
+  await monitor._runLoop();
+
+  assert.equal(expiries.length, 1);
+  assert.equal(expiries[0].code, 'SESSION_EXPIRED');
+  assert.equal(monitor.stats.errors, 0);
+});
+
+test('fallback reload reports visible login form as SESSION_EXPIRED instead of retrying', async () => {
+  const monitor = new Monitor();
+  const expiries = [];
+  let loginFormVisible = false;
+  let reloads = 0;
+  let domChecks = 0;
+  monitor.running = true;
+  monitor.settings = settings();
+  monitor.page = {
+    goto: async () => {},
+    reload: async () => {
+      reloads += 1;
+      loginFormVisible = true;
+    },
+    url: () => 'https://tickets.mhaifafc.com/Stadium/Index?eventId=6121',
+    locator: () => ({ first: () => ({ isVisible: async () => loginFormVisible }) }),
+  };
+  monitor._sleep = async () => {};
+  monitor._checkAvailability = async () => {
+    domChecks += 1;
+    if (domChecks > 1) monitor.running = false;
+  };
+  monitor._pollApiAvailability = async () => { throw new Error('API returned HTML'); };
+  monitor.on('sessionExpired', error => expiries.push(error));
+
+  await monitor._runLoop();
+
+  assert.equal(reloads, 1);
+  assert.equal(expiries.length, 1);
+  assert.equal(expiries[0].code, 'SESSION_EXPIRED');
+});
+
+test('API fallback preserves an existing SESSION_EXPIRED error without another reload', async () => {
+  const monitor = new Monitor();
+  const expired = Object.assign(new Error('Saved session expired'), { code: 'SESSION_EXPIRED' });
+  let refreshes = 0;
+  monitor._pollApiAvailability = async () => { throw expired; };
+  monitor._refreshDomAvailability = async () => { refreshes += 1; };
+
+  await assert.rejects(() => monitor._pollApiOrFallback(), error => error === expired);
+  assert.equal(refreshes, 0);
+});
+
 test('start rejects when the browser cannot be launched', async () => {
   const monitor = new Monitor();
   monitor._launch = async () => {

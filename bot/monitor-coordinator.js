@@ -21,7 +21,12 @@ class MonitorCoordinator {
 
     // userId → Monitor instance
     this._monitors = new Map();
+    this._monitorSessionGenerations = new Map();
     this._queue = [];
+    this._expiryCleanups = new Map();
+    this._tearingDown = new Set();
+    this._drainPromise = null;
+    this._monitorLifecycleHandlers = new WeakMap();
   }
 
   activeCount() {
@@ -46,40 +51,141 @@ class MonitorCoordinator {
   }
 
   async _runDiscovery(userId, operation) {
+    const uid = String(userId);
+    const expiredGeneration = this._loadSessionRecord(uid)?.generation ?? null;
     try {
       return await operation();
     } catch (error) {
-      if (error?.code === 'SESSION_EXPIRED') await this.handleSessionExpired(userId);
+      if (error?.code === 'SESSION_EXPIRED') {
+        void this.handleSessionExpired(uid, expiredGeneration).catch(() => {
+          console.error('[MonitorCoordinator] Session expiry cleanup failed.');
+        });
+      }
       throw error;
     }
   }
 
-  async handleSessionExpired(userId) {
+  _loadSessionRecord(userId) {
+    if (typeof this.userSessionStore.loadWithGeneration === 'function') {
+      return this.userSessionStore.loadWithGeneration(userId);
+    }
+    const storageState = this.userSessionStore.load(userId);
+    return storageState ? { storageState, generation: null } : null;
+  }
+
+  handleSessionExpired(userId, expiredGeneration = undefined) {
     const uid = String(userId);
+    const existing = this._expiryCleanups.get(uid);
+    if (existing) return existing;
+    const generation = expiredGeneration === undefined
+      ? (this._monitorSessionGenerations.get(uid) ?? this._loadSessionRecord(uid)?.generation ?? null)
+      : expiredGeneration;
+    const cleanup = Promise.resolve().then(() => this._performSessionExpiryCleanup(uid, generation));
+    this._expiryCleanups.set(uid, cleanup);
+    void cleanup.finally(() => {
+      if (this._expiryCleanups.get(uid) === cleanup) this._expiryCleanups.delete(uid);
+    }).catch(() => {});
+    return cleanup;
+  }
+
+  async _performSessionExpiryCleanup(uid, expiredGeneration) {
+    const monitor = this._monitors.get(uid);
+    const monitorGeneration = this._monitorSessionGenerations.get(uid);
+    if (monitor && expiredGeneration != null && monitorGeneration != null &&
+        monitorGeneration !== expiredGeneration) {
+      return;
+    }
+    const currentSessionGeneration = this._loadSessionRecord(uid)?.generation ?? null;
+    if (!monitor && expiredGeneration != null && currentSessionGeneration != null &&
+        currentSessionGeneration !== expiredGeneration) {
+      return;
+    }
+    const reconnect = this._sendReconnect(uid);
 
     // Remove the target's queued work before stopping an active monitor, because
     // stop/completion events may immediately drain the remaining shared queue.
     this._queue = this._queue.filter(job => job.userId !== uid);
-    const monitor = this._monitors.get(uid);
+    let settled = !monitor;
     if (monitor) {
-      this._monitors.delete(uid);
+      this._tearingDown.add(uid);
       try {
         await monitor.stop();
+        await this._waitForMonitorSettlement(monitor);
+        settled = true;
       } catch (_) {
-        // Expiry cleanup must continue even if the browser was already closing.
+        settled = this._isMonitorSettled(monitor);
+        console.error('[MonitorCoordinator] Monitor stop failed during session expiry cleanup.');
+      } finally {
+        this._tearingDown.delete(uid);
       }
     }
 
     try { this.userStore.setMonitoringActive?.(uid, false); } catch (_) {}
-    try { await this.userSessionStore.delete(uid); } catch (_) {}
-    await this._drainQueue();
+    try {
+      if (expiredGeneration != null && typeof this.userSessionStore.deleteIfGeneration === 'function') {
+        await this.userSessionStore.deleteIfGeneration(uid, expiredGeneration);
+      } else {
+        await this.userSessionStore.delete(uid);
+      }
+    } catch (_) {}
+
+    if (settled && this._monitors.get(uid) === monitor) {
+      this._monitors.delete(uid);
+      this._monitorSessionGenerations.delete(uid);
+      this._detachMonitorLifecycle(monitor);
+    }
+    if (settled) this._scheduleDrainQueue();
+    await reconnect;
+  }
+
+  async _sendReconnect(uid) {
     try {
       await this.telegramBotService?.sendMessage(uid, '🔐 התחבר מחדש כדי להמשיך לבחור משחקים ולנטר כרטיסים.', {
         reply_markup: { inline_keyboard: [[
           { text: '🔐 התחבר מחדש', callback_data: 'menu:login' },
         ]] },
       });
-    } catch (_) {}
+    } catch (_) {
+      console.error('[MonitorCoordinator] Telegram reconnect notification failed.');
+    }
+  }
+
+  _isMonitorSettled(monitor) {
+    const status = monitor?.getStatus?.();
+    return !status?.running && !status?.busy;
+  }
+
+  _detachMonitorLifecycle(monitor) {
+    const handlers = this._monitorLifecycleHandlers.get(monitor);
+    if (!handlers) return;
+    monitor.removeListener('status', handlers.onStatus);
+    monitor.removeListener('sessionExpired', handlers.onSessionExpired);
+    this._monitorLifecycleHandlers.delete(monitor);
+  }
+
+  async _waitForMonitorSettlement(monitor) {
+    if (this._isMonitorSettled(monitor)) return;
+    await new Promise(resolve => {
+      const onStatus = () => {
+        if (!this._isMonitorSettled(monitor)) return;
+        monitor.removeListener('status', onStatus);
+        resolve();
+      };
+      monitor.on('status', onStatus);
+      onStatus();
+    });
+  }
+
+  _scheduleDrainQueue() {
+    if (this._drainPromise) return this._drainPromise;
+    const drain = Promise.resolve().then(() => this._drainQueue());
+    this._drainPromise = drain;
+    void drain.catch(() => {
+      console.error('[MonitorCoordinator] Queued monitor promotion failed.');
+    }).finally(() => {
+      if (this._drainPromise === drain) this._drainPromise = null;
+    });
+    return drain;
   }
 
   async restoreActiveMonitors() {
@@ -113,8 +219,8 @@ class MonitorCoordinator {
       throw Object.assign(new Error('Monitor already queued for this user'), { code: 'MONITOR_BUSY' });
     }
 
-    const storageState = this.userSessionStore.load(uid);
-    if (!storageState) throw new Error('No saved session. Use /login first.');
+    const session = this._loadSessionRecord(uid);
+    if (!session) throw new Error('No saved session. Use /login first.');
 
     const args = { gameUrl, sections, quantity, chatId };
     if (this._monitors.size >= this.maxConcurrent) {
@@ -122,13 +228,14 @@ class MonitorCoordinator {
       return { status: 'queued' };
     }
 
-    await this._startNow(uid, args, storageState);
+    await this._startNow(uid, args, session);
     return { status: 'started' };
   }
 
-  async _startNow(uid, { gameUrl, sections, quantity = 1, chatId }, suppliedStorageState = null) {
-    const storageState = suppliedStorageState || this.userSessionStore.load(uid);
-    if (!storageState) throw new Error('No saved session. Use /login first.');
+  async _startNow(uid, { gameUrl, sections, quantity = 1, chatId }, suppliedSession = null) {
+    const session = suppliedSession || this._loadSessionRecord(uid);
+    if (!session) throw new Error('No saved session. Use /login first.');
+    const { storageState, generation } = session;
 
     const monitor = new this.MonitorClass({
       ownerSelectorFactory: (settings) => this._makeOwnerSelector(uid, chatId, settings),
@@ -142,8 +249,32 @@ class MonitorCoordinator {
         this.telegramBotService?.sendMessage(chatId, `⚠️ ${message}`).catch(() => {});
       }
     });
+    const onSessionExpired = error => {
+      if (error?.code !== 'SESSION_EXPIRED') return;
+      void this.handleSessionExpired(uid, generation).catch(() => {
+        console.error('[MonitorCoordinator] Active monitor expiry cleanup failed.');
+      });
+    };
+    monitor.once('sessionExpired', onSessionExpired);
+
+    const onStatus = status => {
+      if (status.running || status.busy) return;
+      if (this._monitors.get(uid) !== monitor) {
+        this._detachMonitorLifecycle(monitor);
+        return;
+      }
+      if (this._tearingDown.has(uid)) return;
+      this._monitors.delete(uid);
+      this._monitorSessionGenerations.delete(uid);
+      this._detachMonitorLifecycle(monitor);
+      try { this.userStore.setMonitoringActive?.(uid, false); } catch (_) {}
+      this._scheduleDrainQueue();
+    };
+    monitor.on('status', onStatus);
+    this._monitorLifecycleHandlers.set(monitor, { onStatus, onSessionExpired });
 
     this._monitors.set(uid, monitor);
+    this._monitorSessionGenerations.set(uid, generation);
 
     const settings = {
       url: gameUrl,
@@ -163,17 +294,11 @@ class MonitorCoordinator {
     try {
       await monitor.start(settings);
     } catch (err) {
-      this._monitors.delete(uid);
+      if (this._monitors.get(uid) === monitor) this._monitors.delete(uid);
+      this._monitorSessionGenerations.delete(uid);
+      this._detachMonitorLifecycle(monitor);
       throw err;
     }
-
-    monitor.once('status', status => {
-      if (!status.running) {
-        this._monitors.delete(uid);
-        this.userStore.setMonitoringActive?.(uid, false);
-        void this._drainQueue();
-      }
-    });
   }
 
   async stopMonitor(userId) {
@@ -185,9 +310,21 @@ class MonitorCoordinator {
     }
     const monitor = this._monitors.get(uid);
     if (!monitor) return;
-    this._monitors.delete(uid);
-    await monitor.stop();
-    await this._drainQueue();
+    this._tearingDown.add(uid);
+    let settled = false;
+    try {
+      await monitor.stop();
+      await this._waitForMonitorSettlement(monitor);
+      settled = true;
+    } finally {
+      this._tearingDown.delete(uid);
+      if (settled && this._monitors.get(uid) === monitor) {
+        this._monitors.delete(uid);
+        this._monitorSessionGenerations.delete(uid);
+        this._detachMonitorLifecycle(monitor);
+      }
+    }
+    if (settled) await this._scheduleDrainQueue();
   }
 
   async _drainQueue() {
@@ -197,10 +334,12 @@ class MonitorCoordinator {
         await this._startNow(job.userId, job.args);
       } catch (error) {
         this.userStore.setMonitoringActive?.(job.userId, false);
-        await this.telegramBotService?.sendMessage(
-          job.args.chatId,
-          `❌ לא ניתן היה להתחיל את המעקב שבתור: ${error.message}`
-        ).catch(() => {});
+        try {
+          await this.telegramBotService?.sendMessage(
+            job.args.chatId,
+            '❌ לא ניתן היה להתחיל את המעקב שבתור. התחבר מחדש ונסה שוב.'
+          );
+        } catch (_) {}
       }
     }
   }

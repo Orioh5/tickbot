@@ -17,9 +17,20 @@ class UserSessionStore {
   }
 
   save(userId, storageState) {
+    const current = this.loadWithGeneration(userId);
+    const generation = (current?.generation ?? 0) + 1;
+    this._writeEncrypted(userId, {
+      format: 'mhfc-session-v1',
+      generation,
+      storageState,
+    });
+    return generation;
+  }
+
+  _writeEncrypted(userId, value) {
     const iv = crypto.randomBytes(12);
     const cipher = crypto.createCipheriv('aes-256-gcm', this._key, iv);
-    const plain = JSON.stringify(storageState);
+    const plain = JSON.stringify(value);
     const encrypted = Buffer.concat([cipher.update(plain, 'utf8'), cipher.final()]);
     const tag = cipher.getAuthTag();
     const payload = Buffer.concat([iv, tag, encrypted]).toString('base64');
@@ -28,7 +39,7 @@ class UserSessionStore {
     fs.writeFileSync(filePath, payload, { mode: 0o600 });
   }
 
-  load(userId) {
+  _readEncrypted(userId) {
     const filePath = this._filePath(userId);
     if (!fs.existsSync(filePath)) return null;
     const buffer = Buffer.from(fs.readFileSync(filePath, 'utf8'), 'base64');
@@ -39,6 +50,27 @@ class UserSessionStore {
     decipher.setAuthTag(tag);
     const plain = Buffer.concat([decipher.update(encrypted), decipher.final()]).toString('utf8');
     return JSON.parse(plain);
+  }
+
+  loadWithGeneration(userId) {
+    const value = this._readEncrypted(userId);
+    if (value == null) return null;
+    if (value.format === 'mhfc-session-v1' && Number.isSafeInteger(value.generation)) {
+      return { generation: value.generation, storageState: value.storageState };
+    }
+    // Existing encrypted files contained storageState directly.
+    return { generation: 0, storageState: value };
+  }
+
+  load(userId) {
+    return this.loadWithGeneration(userId)?.storageState ?? null;
+  }
+
+  deleteIfGeneration(userId, generation) {
+    const current = this.loadWithGeneration(userId);
+    if (!current || current.generation !== generation) return false;
+    this.delete(userId);
+    return true;
   }
 
   delete(userId) {
