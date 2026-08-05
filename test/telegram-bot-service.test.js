@@ -25,7 +25,7 @@ function makeTextUpdate(userId, text, updateId = 1) {
     update_id: updateId,
     message: {
       from: { id: userId, username: `user${userId}` },
-      chat: { id: userId },
+      chat: { id: userId, type: 'private' },
       text,
     },
   };
@@ -37,7 +37,7 @@ function makeCallbackUpdate(userId, data, updateId = 2) {
     callback_query: {
       id: 'cq1',
       from: { id: userId },
-      message: { chat: { id: userId } },
+      message: { chat: { id: userId, type: 'private' } },
       data,
     },
   };
@@ -255,6 +255,23 @@ test('callbacks cannot run a registered user action in another private chat', as
   const bot = botFactory(fetch);
   const update = makeCallbackUpdate(7, 'menu:games');
   update.callback_query.message.chat = { id: 8, type: 'private' };
+
+  await bot._dispatch(update);
+
+  assert.deepEqual(discoverCalls, []);
+  assert.equal(fetch.calls[0].method, 'answerCallbackQuery');
+});
+
+test('callbacks without an explicit private chat type cannot run menu actions', async () => {
+  const discoverCalls = [];
+  const { botFactory } = makeBot({
+    extraUserIds: ['7'],
+    monitorCoordinator: { discoverGames: async userId => discoverCalls.push(String(userId)) },
+  });
+  const fetch = makeFetch([{ ok: true, result: {} }]);
+  const bot = botFactory(fetch);
+  const update = makeCallbackUpdate(7, 'menu:games');
+  delete update.callback_query.message.chat.type;
 
   await bot._dispatch(update);
 

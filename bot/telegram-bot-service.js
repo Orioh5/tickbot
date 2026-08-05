@@ -556,7 +556,7 @@ class TelegramBotService {
   }
 
   _isPrivateChatForUser(userId, chat) {
-    return (!chat?.type || chat.type === 'private') && String(chat?.id ?? '') === String(userId);
+    return chat?.type === 'private' && String(chat.id) === String(userId);
   }
 
   _buildSectionsKeyboard({ availableSections = [], sections = [] }) {
