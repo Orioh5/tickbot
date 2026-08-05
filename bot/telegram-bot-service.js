@@ -12,6 +12,18 @@ const STATE = {
   AWAITING_QUANTITY: 'awaiting_quantity',
 };
 
+const ACTIONS = Object.freeze({
+  'menu:login': 'login',
+  'menu:games': 'games',
+  'menu:status': 'status',
+  'menu:stop': 'stop',
+  'menu:change': 'change',
+  'admin:invite': 'invite',
+  'admin:users': 'users',
+});
+
+const ADMIN_ACTIONS = new Set(['invite', 'users']);
+
 class TelegramBotService {
   constructor({
     token,
@@ -155,6 +167,7 @@ class TelegramBotService {
       await this.sendMessage(chatId, 'מטעמי פרטיות ואבטחה, יש להשתמש בבוט רק בצ׳אט פרטי.');
       return;
     }
+    if (!this._isPrivateChatForUser(userId, msg.chat)) return;
 
     // Routing: commands take priority over conversation state
     const startMatch = text.match(/^\/start(?:@\w+)?(?:\s+([A-Za-z0-9_-]+))?$/);
@@ -162,29 +175,17 @@ class TelegramBotService {
       await this._cmdStart(userId, chatId, msg.from, startMatch[1]);
       return;
     }
-    if (text.startsWith('/login') && this._isUser(userId)) {
-      await this._cmdLogin(userId, chatId);
-      return;
-    }
-    if (text.startsWith('/games') && this._isUser(userId)) {
-      await this._cmdGames(userId, chatId);
-      return;
-    }
-    if (text.startsWith('/stop') && this._isUser(userId)) {
-      await this._cmdStop(userId, chatId);
-      return;
-    }
-    if (text.startsWith('/status') && this._isUser(userId)) {
-      await this._cmdStatus(userId, chatId);
-      return;
-    }
-    // Admin commands
-    if (text.startsWith('/invite') && this._isAdmin(userId)) {
-      await this._cmdInvite(userId, chatId);
-      return;
-    }
-    if (text.startsWith('/users') && this._isAdmin(userId)) {
-      await this._cmdUsers(userId, chatId);
+    const command = text.match(/^\/([a-z]+)(?:@\w+)?(?:\s|$)/)?.[1];
+    const action = {
+      login: 'login',
+      games: 'games',
+      stop: 'stop',
+      status: 'status',
+      invite: 'invite',
+      users: 'users',
+    }[command];
+    if (action && this._isUser(userId) && (!ADMIN_ACTIONS.has(action) || this._isAdmin(userId))) {
+      await this._runAction(action, { userId, chatId, fromUser: msg.from });
       return;
     }
     if (text.startsWith('/revoke') && this._isAdmin(userId)) {
@@ -192,14 +193,8 @@ class TelegramBotService {
       return;
     }
 
-    // Conversation state handler
-    const { state, data } = this._getState(userId);
-    if (state === STATE.AWAITING_SECTIONS) {
-      await this.sendMessage(chatId, 'בחר גושים באמצעות הכפתורים בהודעה האחרונה.');
-      return;
-    }
-    if (state === STATE.AWAITING_QUANTITY) {
-      await this.sendMessage(chatId, 'בחר כמות באמצעות הכפתורים: 1, 2, 3 או 4.');
+    if (this._isUser(userId)) {
+      await this.showMainMenu(userId, chatId);
       return;
     }
 
@@ -258,6 +253,48 @@ class TelegramBotService {
       ? `${menu.text}\nלחץ על 🔐 התחבר כדי לחבר את החשבון שלך.`
       : menu.text;
     await this.sendMessage(chatId, text, { reply_markup: menu.reply_markup });
+  }
+
+  async _runAction(action, { userId, chatId, fromUser }) {
+    if (!this._isUser(userId)) {
+      await this.showMainMenu(userId, chatId);
+      return;
+    }
+    if (ADMIN_ACTIONS.has(action) && !this._isAdmin(userId)) {
+      await this.showMainMenu(userId, chatId);
+      return;
+    }
+
+    switch (action) {
+      case 'login':
+        await this._cmdLogin(userId, chatId, fromUser);
+        return;
+      case 'games':
+      case 'change':
+        await this._cmdGames(userId, chatId, fromUser);
+        return;
+      case 'status':
+        await this._cmdStatus(userId, chatId, fromUser);
+        return;
+      case 'stop': {
+        const status = this.monitorCoordinator?.getStatus(userId);
+        const phase = status?.phase ?? status?.status;
+        if (phase !== 'queued' && phase !== 'monitoring') {
+          await this.showMainMenu(userId, chatId);
+          return;
+        }
+        await this._cmdStop(userId, chatId, fromUser);
+        return;
+      }
+      case 'invite':
+        await this._cmdInvite(userId, chatId, fromUser);
+        return;
+      case 'users':
+        await this._cmdUsers(userId, chatId, fromUser);
+        return;
+      default:
+        await this.showMainMenu(userId, chatId);
+    }
   }
 
   async _cmdLogin(userId, chatId) {
@@ -397,15 +434,16 @@ class TelegramBotService {
     const chatId = String(query.message?.chat?.id ?? '');
     const data = String(query.data || '');
 
-    if (query.message?.chat?.type && query.message.chat.type !== 'private') return;
-    if (!this._isUser(userId) && !this._isAdmin(userId)) return;
-
     await this._call('answerCallbackQuery', { callback_query_id: query.id }).catch(() => {});
+
+    if (!this._isPrivateChatForUser(userId, query.message?.chat)) return;
+    if (!this._isUser(userId)) return;
 
     if (data === 'noop') return;
 
-    if (data === 'admin:invite' && this._isAdmin(userId)) {
-      await this._cmdInvite(userId, chatId);
+    const action = ACTIONS[data];
+    if (action) {
+      await this._runAction(action, { userId, chatId, fromUser: query.from });
       return;
     }
 
@@ -413,9 +451,15 @@ class TelegramBotService {
     const gameMatch = data.match(/^game:(\d+)$/);
     if (gameMatch) {
       const { state, data: convData } = this._getState(userId);
-      if (state !== STATE.AWAITING_GAME) return;
+      if (state !== STATE.AWAITING_GAME) {
+        await this.showMainMenu(userId, chatId);
+        return;
+      }
       const game = convData.games?.[parseInt(gameMatch[1], 10)];
-      if (!game) return;
+      if (!game) {
+        await this.showMainMenu(userId, chatId);
+        return;
+      }
       const discovered = await this.monitorCoordinator.discoverSections(userId, game.url);
       const availableSections = [...new Set(discovered.map(section => String(section.label)))];
       if (!availableSections.length) {
@@ -433,9 +477,15 @@ class TelegramBotService {
     const sectionMatch = data.match(/^section:(\d+)$/);
     if (sectionMatch) {
       const current = this._getState(userId);
-      if (current.state !== STATE.AWAITING_SECTIONS) return;
+      if (current.state !== STATE.AWAITING_SECTIONS) {
+        await this.showMainMenu(userId, chatId);
+        return;
+      }
       const label = sectionMatch[1];
-      if (!current.data.availableSections?.includes(label)) return;
+      if (!current.data.availableSections?.includes(label)) {
+        await this.showMainMenu(userId, chatId);
+        return;
+      }
       const selected = new Set(current.data.sections || []);
       if (selected.has(label)) selected.delete(label);
       else selected.add(label);
@@ -449,7 +499,10 @@ class TelegramBotService {
 
     if (data === 'sections_done') {
       const current = this._getState(userId);
-      if (current.state !== STATE.AWAITING_SECTIONS) return;
+      if (current.state !== STATE.AWAITING_SECTIONS) {
+        await this.showMainMenu(userId, chatId);
+        return;
+      }
       if (!current.data.sections?.length) {
         await this.sendMessage(chatId, 'בחר לפחות גוש אחד לפני שממשיכים.');
         return;
@@ -469,7 +522,10 @@ class TelegramBotService {
     const quantityMatch = data.match(/^quantity:([1-4])$/);
     if (quantityMatch) {
       const current = this._getState(userId);
-      if (current.state !== STATE.AWAITING_QUANTITY) return;
+      if (current.state !== STATE.AWAITING_QUANTITY) {
+        await this.showMainMenu(userId, chatId);
+        return;
+      }
       await this._startConfiguredMonitor(userId, chatId, current.data, Number(quantityMatch[1]));
       return;
     }
@@ -483,7 +539,9 @@ class TelegramBotService {
       clearTimeout(entry.timer);
       this._callbackHandlers.delete(nonce);
       entry.handler(candidateKey);
+      return;
     }
+    await this.showMainMenu(userId, chatId);
   }
 
   // ── Helpers ────────────────────────────────────────────────────────────────
@@ -495,6 +553,10 @@ class TelegramBotService {
 
   _isAdmin(userId) {
     return this.adminUserIds.has(String(userId));
+  }
+
+  _isPrivateChatForUser(userId, chat) {
+    return (!chat?.type || chat.type === 'private') && String(chat?.id ?? '') === String(userId);
   }
 
   _buildSectionsKeyboard({ availableSections = [], sections = [] }) {

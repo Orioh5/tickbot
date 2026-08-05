@@ -168,6 +168,100 @@ test('admin invite returns a Telegram deep link', async () => {
   assert.match(fetch.calls.at(-1).body.text, /https:\/\/t\.me\/MhfcTestBot\?start=/);
 });
 
+// ── main-menu callback routing ─────────────────────────────────────────────
+
+test('menu:login uses the same action as /login', async () => {
+  const { botFactory } = makeBot({
+    extraUserIds: ['7'],
+    secureLoginService: { createLoginLink: () => 'http://localhost/bot-login' },
+  });
+  const fetch = makeFetch([{ ok: true, result: {} }, { ok: true, result: {} }]);
+  const bot = botFactory(fetch);
+
+  await bot._dispatch(makeCallbackUpdate(7, 'menu:login'));
+
+  assert.match(fetch.calls.at(-1).body.text, /http:\/\/localhost.*bot-login/);
+});
+
+test('menu:games discovers games for the clicking user', async () => {
+  const discoverCalls = [];
+  const coordinator = {
+    discoverGames: async userId => {
+      discoverCalls.push(String(userId));
+      return [];
+    },
+  };
+  const { botFactory } = makeBot({ extraUserIds: ['7'], monitorCoordinator: coordinator });
+  const fetch = makeFetch([{ ok: true, result: {} }, { ok: true, result: {} }, { ok: true, result: {} }]);
+  const bot = botFactory(fetch);
+
+  await bot._dispatch(makeCallbackUpdate(7, 'menu:games'));
+
+  assert.deepEqual(discoverCalls, ['7']);
+});
+
+test('stale callback only redisplays current menu', async () => {
+  const stopCalls = [];
+  const coordinator = {
+    getStatus: () => ({ phase: 'idle' }),
+    stopMonitor: async userId => stopCalls.push(String(userId)),
+  };
+  const { botFactory } = makeBot({ extraUserIds: ['7'], monitorCoordinator: coordinator });
+  const fetch = makeFetch([{ ok: true, result: {} }, { ok: true, result: {} }]);
+  const bot = botFactory(fetch);
+
+  await bot._dispatch(makeCallbackUpdate(7, 'menu:stop'));
+
+  assert.deepEqual(stopCalls, []);
+  assert.match(fetch.calls.at(-1).body.text, /מה תרצה לעשות/);
+});
+
+test('admin menu callbacks require administrator authorization', async () => {
+  const { store, botFactory } = makeBot({ extraUserIds: ['7'] });
+  const fetch = makeFetch([{ ok: true, result: {} }, { ok: true, result: {} }]);
+  const bot = botFactory(fetch);
+  bot.setBotUsername('MhfcTestBot');
+
+  await bot._dispatch(makeCallbackUpdate(7, 'admin:invite'));
+
+  assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM invite_codes').get().count, 0);
+  assert.match(fetch.calls.at(-1).body.text, /מה תרצה לעשות/);
+});
+
+test('callbacks are acknowledged before private-chat authorization rejects them', async () => {
+  const discoverCalls = [];
+  const { botFactory } = makeBot({
+    extraUserIds: ['7'],
+    monitorCoordinator: { discoverGames: async userId => discoverCalls.push(String(userId)) },
+  });
+  const fetch = makeFetch([{ ok: true, result: {} }]);
+  const bot = botFactory(fetch);
+  const update = makeCallbackUpdate(7, 'menu:games');
+  update.callback_query.message.chat = { id: -100123, type: 'supergroup' };
+
+  await bot._dispatch(update);
+
+  assert.deepEqual(discoverCalls, []);
+  assert.equal(fetch.calls[0].method, 'answerCallbackQuery');
+});
+
+test('callbacks cannot run a registered user action in another private chat', async () => {
+  const discoverCalls = [];
+  const { botFactory } = makeBot({
+    extraUserIds: ['7'],
+    monitorCoordinator: { discoverGames: async userId => discoverCalls.push(String(userId)) },
+  });
+  const fetch = makeFetch([{ ok: true, result: {} }]);
+  const bot = botFactory(fetch);
+  const update = makeCallbackUpdate(7, 'menu:games');
+  update.callback_query.message.chat = { id: 8, type: 'private' };
+
+  await bot._dispatch(update);
+
+  assert.deepEqual(discoverCalls, []);
+  assert.equal(fetch.calls[0].method, 'answerCallbackQuery');
+});
+
 test('initialize registers the bot username from Telegram getMe', async () => {
   const { botFactory } = makeBot();
   const fetch = makeFetch([{ ok: true, result: { username: 'MhfcTestBot' } }]);
@@ -319,12 +413,12 @@ test('deregisterCallbackHandler cleans up timer', () => {
 
 // ── /stop and /status ───────────────────────────────────────────────────────
 
-test('/stop reports no active monitor when none running', async () => {
+test('/stop with no queued or active monitor redisplays the current menu', async () => {
   const { botFactory } = makeBot({ extraUserIds: ['5'] });
   const fetch = makeFetch([{ ok: true, result: {} }]);
   const bot = botFactory(fetch);
   await bot._dispatch(makeTextUpdate(5, '/stop'));
-  assert.match(fetch.calls[0].body.text, /אין ניטור/);
+  assert.match(fetch.calls[0].body.text, /מה תרצה לעשות/);
 });
 
 // ── poll loop stop ──────────────────────────────────────────────────────────
@@ -410,7 +504,7 @@ test('quantity callback reports queued monitoring accurately', async () => {
   assert.match(fetch.calls.at(-1).body.text, /בתור/);
 });
 
-test('free text cannot bypass section or quantity buttons', async () => {
+test('free text cannot bypass buttons and redisplays the current menu', async () => {
   const { botFactory } = makeBot({ extraUserIds: ['7'] });
   const fetch = makeFetch([{ ok: true, result: {} }, { ok: true, result: {} }]);
   const bot = botFactory(fetch);
@@ -418,10 +512,10 @@ test('free text cannot bypass section or quantity buttons', async () => {
   await bot._dispatch(makeTextUpdate(7, '999'));
   assert.equal(bot._getState('7').state, 'awaiting_sections');
   assert.deepEqual(bot._getState('7').data.sections, []);
-  assert.match(fetch.calls[0].body.text, /כפתורים/);
+  assert.match(fetch.calls[0].body.text, /מה תרצה לעשות/);
 
   bot._setState('7', 'awaiting_quantity', { gameUrl: 'u', sections: ['13'] });
   await bot._dispatch(makeTextUpdate(7, '4'));
   assert.equal(bot._getState('7').state, 'awaiting_quantity');
-  assert.match(fetch.calls[1].body.text, /כפתורים/);
+  assert.match(fetch.calls[1].body.text, /מה תרצה לעשות/);
 });
