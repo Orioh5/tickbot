@@ -64,72 +64,121 @@ function makeBot({ adminUserIds = [], extraUserIds = [], monitorCoordinator = nu
 
 // ── /start ─────────────────────────────────────────────────────────────────────
 
-test('/start prompts for invite code for unknown user', async () => {
+test('/start without an invite payload refuses an unknown user', async () => {
   const { botFactory } = makeBot();
   const fetch = makeFetch([{ ok: true, result: { message_id: 1 } }]);
   const bot = botFactory(fetch);
   await bot._dispatch(makeTextUpdate(100, '/start'));
   assert.equal(fetch.calls[0].method, 'sendMessage');
-  assert.match(fetch.calls[0].body.text, /קוד הזמנה/);
+  assert.match(fetch.calls[0].body.text, /קישור הזמנה/);
+  assert.equal(bot._getState('100').state, 'idle');
 });
 
-test('/start welcomes known user', async () => {
+test('/start shows the current menu for a known user', async () => {
   const { store, botFactory } = makeBot();
   store.createUser({ telegramUserId: '42' });
   const fetch = makeFetch([{ ok: true, result: {} }]);
   const bot = botFactory(fetch);
   await bot._dispatch(makeTextUpdate(42, '/start'));
-  assert.match(fetch.calls[0].body.text, /ברוך הבא/);
+  assert.match(fetch.calls[0].body.text, /התחבר/);
 });
 
-test('/start auto-registers admin and welcomes them', async () => {
+test('/start auto-registers admin and shows their menu', async () => {
   const { store, botFactory } = makeBot({ adminUserIds: ['77'] });
   const fetch = makeFetch([{ ok: true, result: {} }]);
   const bot = botFactory(fetch);
   await bot._dispatch(makeTextUpdate(77, '/start'));
   assert.ok(store.getUser('77'), 'admin should be auto-registered');
-  assert.match(fetch.calls[0].body.text, /אדמין/);
+  assert.match(fetch.calls[0].body.text, /התחבר/);
+});
+
+test('/start payload redeems invite without asking for text', async () => {
+  const { store, botFactory } = makeBot();
+  store.createInviteCode({ code: 'ABC', createdBy: '1', expiresAt: Date.now() + 60_000 });
+  const fetch = makeFetch([{ ok: true, result: {} }]);
+  const bot = botFactory(fetch);
+
+  await bot._dispatch(makeTextUpdate(2, '/start ABC'));
+
+  assert.ok(store.getUser('2'));
+  assert.equal(bot._getState('2').state, 'idle');
+  assert.match(fetch.calls.at(-1).body.text, /התחבר/);
 });
 
 // ── invite code flow ────────────────────────────────────────────────────────
 
-test('valid invite code registers user', async () => {
+test('valid invite link registers user', async () => {
   const { store, botFactory } = makeBot({ adminUserIds: ['1'] });
   store.createInviteCode({ code: 'DEAD', createdBy: '1' });
-  const fetch = makeFetch([
-    { ok: true, result: {} }, // /start → ask invite
-    { ok: true, result: {} }, // code accepted
-  ]);
+  const fetch = makeFetch([{ ok: true, result: {} }]);
   const bot = botFactory(fetch);
-  await bot._dispatch(makeTextUpdate(55, '/start', 1));
-  await bot._dispatch(makeTextUpdate(55, 'DEAD', 2));
+  await bot._dispatch(makeTextUpdate(55, '/start DEAD', 1));
   assert.ok(store.getUser('55'), 'user should be registered');
-  assert.match(fetch.calls[1].body.text, /הצטרפת/);
+  assert.match(fetch.calls[0].body.text, /התחבר/);
 });
 
-test('invalid invite code shows error and stays in state', async () => {
+test('invalid invite link shows an error without opening a text flow', async () => {
   const { botFactory } = makeBot();
-  const fetch = makeFetch([
-    { ok: true, result: {} },
-    { ok: true, result: {} },
-  ]);
+  const fetch = makeFetch([{ ok: true, result: {} }]);
   const bot = botFactory(fetch);
-  await bot._dispatch(makeTextUpdate(55, '/start', 1));
-  await bot._dispatch(makeTextUpdate(55, 'BADINVITE', 2));
-  assert.match(fetch.calls[1].body.text, /❌/);
-  assert.equal(bot._getState('55').state, 'awaiting_invite');
+  await bot._dispatch(makeTextUpdate(55, '/start BADINVITE', 1));
+  assert.match(fetch.calls[0].body.text, /❌/);
+  assert.equal(bot._getState('55').state, 'idle');
 });
 
 // ── /invite (admin) ─────────────────────────────────────────────────────────
 
-test('/invite creates invite code (admin only)', async () => {
+test('/invite creates a Telegram deep link for an admin', async () => {
   const { store, botFactory } = makeBot({ adminUserIds: ['1'] });
   store.createUser({ telegramUserId: '1' });
   const fetch = makeFetch([{ ok: true, result: {} }]);
   const bot = botFactory(fetch);
+  bot.setBotUsername('MhfcTestBot');
   await bot._dispatch(makeTextUpdate(1, '/invite'));
   const body = fetch.calls[0].body;
-  assert.match(body.text, /קוד הזמנה/);
+  assert.match(body.text, /https:\/\/t\.me\/MhfcTestBot\?start=/);
+});
+
+test('admin invite returns a Telegram deep link', async () => {
+  const { store, botFactory } = makeBot({ adminUserIds: ['1'] });
+  store.createUser({ telegramUserId: '1' });
+  const fetch = makeFetch([{ ok: true, result: {} }, { ok: true, result: {} }]);
+  const bot = botFactory(fetch);
+  bot.setBotUsername('MhfcTestBot');
+
+  await bot._dispatch(makeCallbackUpdate(1, 'admin:invite'));
+
+  assert.match(fetch.calls.at(-1).body.text, /https:\/\/t\.me\/MhfcTestBot\?start=/);
+});
+
+test('initialize registers the bot username from Telegram getMe', async () => {
+  const { botFactory } = makeBot();
+  const fetch = makeFetch([{ ok: true, result: { username: 'MhfcTestBot' } }]);
+  const bot = botFactory(fetch);
+
+  await bot.initialize();
+
+  assert.equal(bot.botUsername, 'MhfcTestBot');
+  assert.equal(fetch.calls[0].method, 'getMe');
+});
+
+test('initialize rejects a Telegram identity without a string username', async () => {
+  const { botFactory } = makeBot();
+  const bot = botFactory(makeFetch([{ ok: true, result: { username: { unexpected: true } } }]));
+
+  await assert.rejects(bot.initialize(), /bot username/);
+});
+
+test('invite creation waits for the initialized bot username', async () => {
+  const { store, botFactory } = makeBot({ adminUserIds: ['1'] });
+  store.createUser({ telegramUserId: '1' });
+  const fetch = makeFetch([{ ok: true, result: {} }]);
+  const bot = botFactory(fetch);
+
+  await bot._dispatch(makeTextUpdate(1, '/invite'));
+
+  assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM invite_codes').get().count, 0);
+  assert.match(fetch.calls[0].body.text, /זהות הבוט/);
 });
 
 test('/invite refuses to exceed the ten-user MVP limit', async () => {
@@ -137,6 +186,7 @@ test('/invite refuses to exceed the ten-user MVP limit', async () => {
   for (let id = 1; id <= 10; id++) store.createUser({ telegramUserId: String(id) });
   const fetch = makeFetch([{ ok: true, result: {} }]);
   const bot = botFactory(fetch);
+  bot.setBotUsername('MhfcTestBot');
   await bot._dispatch(makeTextUpdate(1, '/invite'));
   assert.match(fetch.calls[0].body.text, /מגבלת.*10/);
 });

@@ -1,6 +1,7 @@
 'use strict';
 
 const { DatabaseSync } = require('node:sqlite');
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
@@ -24,7 +25,8 @@ class UserStore {
         code        TEXT PRIMARY KEY,
         created_by  TEXT NOT NULL,
         used_by     TEXT,
-        created_at  INTEGER NOT NULL
+        created_at  INTEGER NOT NULL,
+        expires_at  INTEGER NOT NULL
       );
       CREATE TABLE IF NOT EXISTS login_tokens (
         token_hash TEXT PRIMARY KEY,
@@ -41,14 +43,34 @@ class UserStore {
       );
     `);
 
+    const inviteColumns = this.db.prepare('PRAGMA table_info(invite_codes)').all();
+    if (!inviteColumns.some(column => column.name === 'expires_at')) {
+      this.db.exec('ALTER TABLE invite_codes ADD COLUMN expires_at INTEGER');
+    }
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS schema_metadata (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+    `);
+    const hashMigration = this.db.prepare("SELECT value FROM schema_metadata WHERE key = 'invite_code_hashing'").get();
+    if (!hashMigration) {
+      const legacyInviteCodes = this.db.prepare('SELECT code FROM invite_codes').all();
+      const updateInviteCode = this.db.prepare('UPDATE invite_codes SET code = ? WHERE code = ?');
+      for (const invite of legacyInviteCodes) {
+        updateInviteCode.run(this._hashInviteCode(invite.code), invite.code);
+      }
+      this.db.prepare("INSERT INTO schema_metadata (key, value) VALUES ('invite_code_hashing', 'sha256')").run();
+    }
+
     this._stmts = {
       insertUser:         this.db.prepare('INSERT OR IGNORE INTO users (telegram_user_id, username, invited_by, created_at) VALUES (?, ?, ?, ?)'),
       getUser:            this.db.prepare('SELECT * FROM users WHERE telegram_user_id = ?'),
       revokeUser:         this.db.prepare('UPDATE users SET revoked = 1 WHERE telegram_user_id = ?'),
       listUsers:          this.db.prepare('SELECT * FROM users ORDER BY created_at ASC'),
-      insertInvite:       this.db.prepare('INSERT INTO invite_codes (code, created_by, created_at) VALUES (?, ?, ?)'),
+      insertInvite:       this.db.prepare('INSERT INTO invite_codes (code, created_by, created_at, expires_at) VALUES (?, ?, ?, ?)'),
       getInvite:          this.db.prepare('SELECT * FROM invite_codes WHERE code = ?'),
-      markInviteUsed:     this.db.prepare('UPDATE invite_codes SET used_by = ? WHERE code = ?'),
+      markInviteUsed:     this.db.prepare('UPDATE invite_codes SET used_by = ? WHERE code = ? AND used_by IS NULL AND expires_at >= ?'),
       insertToken:        this.db.prepare('INSERT INTO login_tokens (token_hash, user_id, expires_at) VALUES (?, ?, ?)'),
       getToken:           this.db.prepare('SELECT * FROM login_tokens WHERE token_hash = ?'),
       markTokenUsed:      this.db.prepare('UPDATE login_tokens SET used = 1 WHERE token_hash = ?'),
@@ -90,22 +112,42 @@ class UserStore {
 
   // ── Invite codes ───────────────────────────────────────────────────────────
 
-  createInviteCode({ code, createdBy, now = Date.now() }) {
-    this._stmts.insertInvite.run(code, String(createdBy), now);
+  createInviteCode({ code, createdBy, expiresAt, now = Date.now() }) {
+    const expiry = expiresAt ?? now + (24 * 60 * 60 * 1000);
+    this._stmts.insertInvite.run(this._hashInviteCode(code), String(createdBy), now, expiry);
   }
 
   getInviteCode(code) {
-    return this._stmts.getInvite.get(code) ?? null;
+    return this._stmts.getInvite.get(this._hashInviteCode(code)) ?? null;
   }
 
   redeemInviteCode({ code, userId, username = null, now = Date.now() }) {
-    const invite = this.getInviteCode(code);
-    if (!invite) throw new Error('Invalid invite code');
-    if (invite.used_by != null) throw new Error('Invite code already used');
     const uid = String(userId);
-    this._stmts.markInviteUsed.run(uid, code);
-    this.createUser({ telegramUserId: uid, username, invitedBy: invite.created_by, now });
-    return invite;
+    const codeHash = this._hashInviteCode(code);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const result = this._stmts.markInviteUsed.run(uid, codeHash, now);
+      if (result.changes !== 1) throw this._classifyInviteFailure(codeHash, now, true);
+      const invite = this._stmts.getInvite.get(codeHash);
+      this._stmts.insertUser.run(uid, username, invite.created_by, now);
+      this.db.exec('COMMIT');
+      return invite;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  _classifyInviteFailure(code, now, isHash = false) {
+    const invite = this._stmts.getInvite.get(isHash ? code : this._hashInviteCode(code));
+    if (!invite) return new Error('Invalid invite code');
+    if (invite.used_by != null) return new Error('Invite code already used');
+    if (invite.expires_at == null || invite.expires_at < now) return new Error('Invite code expired');
+    return new Error('Invalid invite code');
+  }
+
+  _hashInviteCode(code) {
+    return crypto.createHash('sha256').update(String(code)).digest('hex');
   }
 
   // ── Login tokens ───────────────────────────────────────────────────────────

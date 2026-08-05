@@ -2,11 +2,11 @@
 
 const POLL_TIMEOUT_S = 25; // long-poll seconds
 const STADIUM_CATALOG = require('./stadium-catalog');
+const BotMenu = require('./bot-menu');
 
 // Conversation states tracked per user
 const STATE = {
   IDLE: 'idle',
-  AWAITING_INVITE: 'awaiting_invite',
   AWAITING_GAME: 'awaiting_game',
   AWAITING_SECTIONS: 'awaiting_sections',
   AWAITING_QUANTITY: 'awaiting_quantity',
@@ -31,6 +31,7 @@ class TelegramBotService {
     this.userSessionStore = userSessionStore;
     this.fetchImpl = fetchImpl;
     this.now = now;
+    this.botUsername = null;
 
     this._offset = 0;
     this._running = false;
@@ -50,6 +51,18 @@ class TelegramBotService {
     this._running = true;
     this._stopController = new AbortController();
     this._loop(this._stopController.signal).catch(() => {});
+  }
+
+  async initialize() {
+    const identity = await this._call('getMe');
+    if (typeof identity?.username !== 'string' || !identity.username) {
+      throw new Error('Telegram getMe did not return a bot username');
+    }
+    this.setBotUsername(identity.username);
+  }
+
+  setBotUsername(username) {
+    this.botUsername = username;
   }
 
   async stop() {
@@ -144,8 +157,9 @@ class TelegramBotService {
     }
 
     // Routing: commands take priority over conversation state
-    if (text.startsWith('/start')) {
-      await this._cmdStart(userId, chatId, msg.from);
+    const startMatch = text.match(/^\/start(?:@\w+)?(?:\s+([A-Za-z0-9_-]+))?$/);
+    if (startMatch) {
+      await this._cmdStart(userId, chatId, msg.from, startMatch[1]);
       return;
     }
     if (text.startsWith('/login') && this._isUser(userId)) {
@@ -180,10 +194,6 @@ class TelegramBotService {
 
     // Conversation state handler
     const { state, data } = this._getState(userId);
-    if (state === STATE.AWAITING_INVITE) {
-      await this._handleInviteInput(userId, chatId, text, msg.from);
-      return;
-    }
     if (state === STATE.AWAITING_SECTIONS) {
       await this.sendMessage(chatId, 'בחר גושים באמצעות הכפתורים בהודעה האחרונה.');
       return;
@@ -201,19 +211,53 @@ class TelegramBotService {
 
   // ── Command handlers ───────────────────────────────────────────────────────
 
-  async _cmdStart(userId, chatId, fromUser) {
+  async _cmdStart(userId, chatId, fromUser, inviteCode) {
     const user = this.userStore.getUser(userId);
     if (user && !user.revoked) {
-      await this.sendMessage(chatId, `ברוך הבא! שלח /games לבחירת משחק, /login לחיבור חשבון, /status לסטטוס.`);
+      await this.showMainMenu(userId, chatId);
       return;
     }
     if (this._isAdmin(userId)) {
       this.userStore.createUser({ telegramUserId: userId, username: fromUser?.username });
-      await this.sendMessage(chatId, 'אדמין מחובר. שלח /invite ליצירת קוד הזמנה.');
+      await this.showMainMenu(userId, chatId);
       return;
     }
-    this._setState(userId, STATE.AWAITING_INVITE);
-    await this.sendMessage(chatId, 'שלום! הזן קוד הזמנה כדי להתחיל:');
+    if (!inviteCode) {
+      await this.showMainMenu(userId, chatId);
+      return;
+    }
+    try {
+      const activeUsers = this.userStore.listUsers().filter(candidate => !candidate.revoked).length;
+      if (activeUsers >= 10) throw new Error('המערכת הגיעה למגבלת 10 משתמשים פעילים');
+      this.userStore.redeemInviteCode({
+        code: inviteCode,
+        userId,
+        username: fromUser?.username,
+        now: this.now(),
+      });
+      this._clearState(userId);
+      await this.showMainMenu(userId, chatId);
+    } catch (error) {
+      this._clearState(userId);
+      await this.sendMessage(chatId, `❌ ${error.message}`);
+    }
+  }
+
+  async showMainMenu(userId, chatId) {
+    const user = this.userStore.getUser(userId);
+    const hasSession = Boolean(user && !user.revoked && this.userSessionStore?.load(userId));
+    const status = this.monitorCoordinator?.getStatus(userId);
+    const menu = BotMenu.main({
+      isRegistered: Boolean(user),
+      isRevoked: Boolean(user?.revoked),
+      isAdmin: this._isAdmin(userId),
+      hasSession,
+      monitorPhase: status?.phase ?? status?.status ?? null,
+    });
+    const text = !hasSession && user && !user.revoked
+      ? `${menu.text}\nלחץ על 🔐 התחבר כדי לחבר את החשבון שלך.`
+      : menu.text;
+    await this.sendMessage(chatId, text, { reply_markup: menu.reply_markup });
   }
 
   async _cmdLogin(userId, chatId) {
@@ -274,6 +318,10 @@ class TelegramBotService {
   }
 
   async _cmdInvite(userId, chatId) {
+    if (!this.botUsername) {
+      await this.sendMessage(chatId, 'שגיאה: זהות הבוט טרם אותחלה. נסה שוב בעוד רגע.');
+      return;
+    }
     const activeUsers = this.userStore.listUsers().filter(user => !user.revoked).length;
     if (activeUsers >= 10) {
       await this.sendMessage(chatId, 'הגעת למגבלת ה־MVP של 10 משתמשים פעילים.');
@@ -282,7 +330,8 @@ class TelegramBotService {
     const crypto = require('crypto');
     const code = crypto.randomBytes(4).toString('hex').toUpperCase();
     this.userStore.createInviteCode({ code, createdBy: userId });
-    await this.sendMessage(chatId, `קוד הזמנה חדש: \`${code}\`\n(שתף אותו עם המשתמש הרצוי)`, {
+    const deepLink = `https://t.me/${this.botUsername}?start=${code}`;
+    await this.sendMessage(chatId, `קישור הזמנה חדש: ${deepLink}\n(תקף ל־24 שעות ולשימוש אחד)`, {
       parse_mode: 'Markdown',
     });
   }
@@ -321,21 +370,6 @@ class TelegramBotService {
     await this.sendMessage(chatId, `✅ גישה בוטלה למשתמש ${targetId}.`);
   }
 
-  // ── Conversation input handlers ────────────────────────────────────────────
-
-  async _handleInviteInput(userId, chatId, text, fromUser) {
-    const code = text.trim().toUpperCase();
-    try {
-      const activeUsers = this.userStore.listUsers().filter(user => !user.revoked).length;
-      if (activeUsers >= 10) throw new Error('המערכת הגיעה למגבלת 10 משתמשים פעילים');
-      this.userStore.redeemInviteCode({ code, userId, username: fromUser?.username });
-      this._clearState(userId);
-      await this.sendMessage(chatId, '✅ הצטרפת בהצלחה! שלח /login לחיבור חשבון מכבי חיפה שלך.');
-    } catch (err) {
-      await this.sendMessage(chatId, `❌ ${err.message}. נסה שוב:`);
-    }
-  }
-
   async _startConfiguredMonitor(userId, chatId, data, quantity) {
     this._clearState(userId);
     this.userStore.setMonitoringConfig(userId, { gameUrl: data.gameUrl, sections: data.sections, quantity });
@@ -369,6 +403,11 @@ class TelegramBotService {
     await this._call('answerCallbackQuery', { callback_query_id: query.id }).catch(() => {});
 
     if (data === 'noop') return;
+
+    if (data === 'admin:invite' && this._isAdmin(userId)) {
+      await this._cmdInvite(userId, chatId);
+      return;
+    }
 
     // Game selection
     const gameMatch = data.match(/^game:(\d+)$/);

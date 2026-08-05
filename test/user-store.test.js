@@ -94,6 +94,27 @@ test('redeemInviteCode throws on already-used code', () => {
   assert.throws(() => store.redeemInviteCode({ code: 'X', userId: '2' }), /already used/);
 });
 
+test('expired invite cannot be redeemed', () => {
+  const store = makeStore();
+  store.createInviteCode({ code: 'ABC', createdBy: '1', expiresAt: 100 });
+  assert.throws(() => store.redeemInviteCode({ code: 'ABC', userId: '2', now: 101 }), /expired/i);
+  assert.equal(store.getUser('2'), null);
+});
+
+test('invite codes expire 24 hours after their creation by default', () => {
+  const store = makeStore();
+  store.createInviteCode({ code: 'DAY', createdBy: '1', now: 100 });
+  assert.equal(store.getInviteCode('DAY').expires_at, 100 + (24 * 60 * 60 * 1000));
+});
+
+test('invite code storage retains only a hash of the redeemable code', () => {
+  const store = makeStore();
+  store.createInviteCode({ code: 'SECRET-CODE', createdBy: '1' });
+  const stored = store.db.prepare('SELECT code FROM invite_codes').get();
+  assert.notEqual(stored.code, 'SECRET-CODE');
+  assert.equal(stored.code.length, 64);
+});
+
 // ── Login tokens ──────────────────────────────────────────────────────────────
 
 test('saveLoginToken and getLoginToken round-trip', () => {
