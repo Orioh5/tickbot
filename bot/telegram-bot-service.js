@@ -421,22 +421,18 @@ class TelegramBotService {
 
   async _startConfiguredMonitor(userId, chatId, data) {
     const { gameUrl, sections, quantity } = data;
-    this.userStore.setMonitoringConfig(userId, { gameUrl, sections, quantity });
     await this.sendMessage(chatId, `⏳ מתחיל ניטור: גושים ${sections.join(', ')}, ${quantity} כרטיסים...`);
-    try {
-      const result = await this.monitorCoordinator.startMonitor(userId, {
-        gameUrl,
-        sections,
-        quantity,
-        chatId,
-      });
-      this.userStore.setMonitoringActive(userId, true);
-      await this.sendMessage(chatId, result?.status === 'queued'
-        ? '🕒 המעקב נשמר ונמצא בתור. הוא יתחיל אוטומטית כשיתפנה דפדפן.'
-        : '✅ ניטור פעיל. תקבל התראה כשייפתחו כרטיסים.');
-    } catch (err) {
-      await this.sendMessage(chatId, `❌ שגיאה בהפעלת ניטור: ${err.message}`);
-    }
+    const result = await this.monitorCoordinator.startMonitor(userId, {
+      gameUrl,
+      sections,
+      quantity,
+      chatId,
+    });
+    this.userStore.setMonitoringConfig(userId, { gameUrl, sections, quantity });
+    this.userStore.setMonitoringActive(userId, true);
+    await this.sendMessage(chatId, result?.status === 'queued'
+      ? '🕒 המעקב נשמר ונמצא בתור. הוא יתחיל אוטומטית כשיתפנה דפדפן.'
+      : '✅ ניטור פעיל. תקבל התראה כשייפתחו כרטיסים.');
   }
 
   // ── Callback query handler ─────────────────────────────────────────────────
@@ -534,19 +530,7 @@ class TelegramBotService {
       }
       const confirmation = { ...current.data, quantity: Number(quantityMatch[1]) };
       this._setState(userId, STATE.AWAITING_CONFIRMATION, confirmation);
-      await this.sendMessage(chatId,
-        `סיכום הניטור:\n🎮 משחק: ${confirmation.gameName || 'המשחק שנבחר'}\n` +
-        `🪑 גושים: ${confirmation.sections.join(', ')}\n🎟 כמות: ${confirmation.quantity}\n\nלאשר התחלת ניטור?`,
-        {
-          reply_markup: { inline_keyboard: [
-            [{ text: '✅ אשר ניטור', callback_data: 'setup:confirm' }],
-            [
-              { text: '⬅️ חזור לכמות', callback_data: 'setup:back' },
-              { text: '✖️ ביטול', callback_data: 'setup:cancel' },
-            ],
-          ] },
-        }
-      );
+      await this._sendConfirmationPrompt(chatId, confirmation);
       return;
     }
 
@@ -558,7 +542,12 @@ class TelegramBotService {
       }
       // Claim this setup before awaiting the coordinator so repeat callbacks are stale.
       this._clearState(userId);
-      await this._startConfiguredMonitor(userId, chatId, current.data);
+      try {
+        await this._startConfiguredMonitor(userId, chatId, current.data);
+      } catch (_error) {
+        this._setState(userId, STATE.AWAITING_CONFIRMATION, current.data);
+        await this._sendConfirmationPrompt(chatId, current.data, '❌ לא ניתן היה להתחיל את המעקב. אפשר לנסות שוב.');
+      }
       return;
     }
 
@@ -652,6 +641,23 @@ class TelegramBotService {
         }))],
       },
     });
+  }
+
+  async _sendConfirmationPrompt(chatId, confirmation, notice = '') {
+    const prefix = notice ? `${notice}\n\n` : '';
+    await this.sendMessage(chatId,
+      `${prefix}סיכום הניטור:\n🎮 משחק: ${confirmation.gameName || 'המשחק שנבחר'}\n` +
+      `🪑 גושים: ${confirmation.sections.join(', ')}\n🎟 כמות: ${confirmation.quantity}\n\nלאשר התחלת ניטור?`,
+      {
+        reply_markup: { inline_keyboard: [
+          [{ text: '▶️ התחל מעקב', callback_data: 'setup:confirm' }],
+          [
+            { text: '⬅️ חזור', callback_data: 'setup:back' },
+            { text: '❌ ביטול', callback_data: 'setup:cancel' },
+          ],
+        ] },
+      }
+    );
   }
 
   async _call(method, body = {}, options = {}) {

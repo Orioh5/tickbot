@@ -533,6 +533,10 @@ test('quantity selection shows a sanitized confirmation summary without starting
     fetch.calls.at(-1).body.reply_markup.inline_keyboard.flat().map(button => button.callback_data),
     ['setup:confirm', 'setup:back', 'setup:cancel']
   );
+  assert.deepEqual(
+    fetch.calls.at(-1).body.reply_markup.inline_keyboard.flat().map(button => button.text),
+    ['▶️ התחל מעקב', '⬅️ חזור', '❌ ביטול']
+  );
   assert.deepEqual(bot._getState('7'), {
     state: 'awaiting_confirmation',
     data: {
@@ -579,6 +583,42 @@ test('setup confirmation claims the state before starting so a double click star
     active: 1,
   });
   assert.equal(bot._getState('7').state, 'idle');
+});
+
+test('a failed confirmation restores the same setup and a retry starts monitoring once', async () => {
+  let attempts = 0;
+  const coordinator = {
+    startMonitor: async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error('temporary startup failure');
+      return { status: 'queued' };
+    },
+  };
+  const { store, botFactory } = makeBot({ extraUserIds: ['7'], monitorCoordinator: coordinator });
+  const fetch = makeFetch(Array.from({ length: 8 }, () => ({ ok: true, result: {} })));
+  const bot = botFactory(fetch);
+  const setup = {
+    gameUrl: 'https://tickets.mhaifafc.com/game/1',
+    gameName: 'Game',
+    sections: ['13'],
+    quantity: 2,
+  };
+  bot._setState('7', 'awaiting_confirmation', setup);
+
+  await bot._dispatch(makeCallbackUpdate(7, 'setup:confirm'));
+
+  assert.deepEqual(bot._getState('7'), { state: 'awaiting_confirmation', data: setup });
+  assert.equal(store.getMonitoringConfig('7'), null);
+  assert.deepEqual(
+    fetch.calls.at(-1).body.reply_markup.inline_keyboard.flat().map(button => button.callback_data),
+    ['setup:confirm', 'setup:back', 'setup:cancel']
+  );
+
+  await bot._dispatch(makeCallbackUpdate(7, 'setup:confirm'));
+
+  assert.equal(attempts, 2);
+  assert.equal(bot._getState('7').state, 'idle');
+  assert.equal(store.getMonitoringConfig('7').active, 1);
 });
 
 test('setup back restores the quantity step without losing its selected game or sections', async () => {
