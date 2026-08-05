@@ -4,7 +4,7 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 
 ## What this project is
 
-A hosted web dashboard for monitoring ticket availability at Maccabi Haifa FC (מכבי חיפה) games at Sami Ofer Stadium. It uses Playwright to scan the ticketing site for available seats, and alerts via Telegram when tickets are found. Runs as a normal Node.js web app behind a login — no install or desktop app needed on the client side, just a browser.
+A hosted ticket monitor for Maccabi Haifa FC (מכבי חיפה) games at Sami Ofer Stadium. It uses Playwright to scan the ticketing site and provides two interfaces: a Telegram button workflow for invited users with separate Maccabi sessions and monitors, plus the existing shared-login web dashboard.
 
 ## Running the project
 
@@ -28,9 +28,9 @@ npm install playwright-extra playwright-extra-plugin-stealth
 
 ## Architecture
 
-Three core files:
+Core dashboard files:
 
-- **`server.js`** — Express HTTP server + WebSocket server. Serves the static frontend, exposes REST API (`/api/settings`, `/api/monitor/start`, `/api/monitor/stop`, `/api/status`, `/api/telegram/test`, `/api/login`, `/api/logout`), and forwards Monitor events to all connected browser clients via WebSocket. Everything except `/login.html` and `/api/login` requires a valid session cookie — see "Auth" below.
+- **`server.js`** — Express HTTP server + WebSocket server. Serves the static frontend, exposes the dashboard REST API and token-protected `/bot-login` flow, forwards Monitor events to dashboard clients, and starts the Telegram services. Dashboard routes require a valid session cookie; see "Auth" below for the public login exceptions.
 
 - **`monitor.js`** — `Monitor extends EventEmitter`. Manages the Playwright browser lifecycle (launch, login, monitoring loop). Emits: `log`, `status`, `sections`, `stats`, `alert`, `apiData` (raw JSON from intercepted XHR responses containing "availability", "SeatMap", "blocks", or "seats" in the URL). The `start()` method is async but `_runLoop()` runs detached (not awaited), so it doesn't block the HTTP response.
 
@@ -39,11 +39,20 @@ Three core files:
   - `style.css` — dark theme dashboard styles
   - `app.js` — WebSocket client, renders sections grid, handles settings form, controls
 
+Core Telegram files:
+
+- **`bot/bot-server.js`** — wires the Telegram service, encrypted per-user session store, game discovery, and monitor coordinator into `server.js`.
+- **`bot/telegram-bot-service.js`** — long polling, authorization, deep-link invitations, contextual inline-button menus, and per-user conversation state.
+- **`bot/monitor-coordinator.js`** — owns one monitor per user, enforces `BOT_MAX_BROWSERS`, queues excess work, restores active monitors, and isolates session-expiry cleanup.
+- **`bot/user-store.js`** — SQLite users, hash-only invite records, one-time login tokens, and persisted monitor configuration in `DATA_DIR/bot.db`.
+- **`bot/user-session-store.js`** — AES-256-GCM encrypted Playwright storage state in one `DATA_DIR/session-<telegram-user-id>.enc` file per user.
+
 ## Data flow
 
 ```
 Browser (dashboard)  ←──WebSocket──→  server.js  ←──events──  monitor.js
                      ←──REST API───→                         ──Playwright──→ mhaifafc.com
+Telegram user        ←──Bot API────→  bot services ──────────┘
 ```
 
 ## How availability detection works
@@ -85,19 +94,37 @@ The Live Log shows both: `Sections on page: [13 (id:1590), 14 (id:1591), 15 (id:
   - `proxyServer`, `proxyUsername`, `proxyPassword` — optional proxy
   - `autoPurchase` — attempt to auto-click section and confirm the quantity dialog when available
   - `desiredQuantity` — number of tickets to add to cart when auto-purchasing
-- `state.json` — Playwright `storageState` (cookies + localStorage). Created after first successful login. Required for the seat map to load on the event page — without it, the page redirects to the homepage.
+- `state.json` — legacy dashboard Playwright `storageState` (cookies + localStorage). It is not shared by Telegram users.
+- `DATA_DIR/bot.db` — Telegram registrations, hashed invite records, one-time login tokens, and monitor configurations.
+- `DATA_DIR/session-<telegram-user-id>.enc` — a separate encrypted Maccabi browser session for each Telegram user. Browser-login credentials are used for that login attempt only and are not persisted.
 - Login URL is hardcoded to `https://auth.mhaifafc.com/` — there is no editable field for it.
 
 ## Auth
 
-Single shared login for the whole site (not per-user accounts) — this monitors one Maccabi Haifa account for a small group of people sharing one dashboard.
+The web dashboard and Telegram bot have separate access models:
 
-- `APP_USERNAME` / `APP_PASSWORD` env vars gate access. Unset `APP_PASSWORD` = anyone can log in with a blank password — always set it in the hosting env.
+- The dashboard has one shared `APP_USERNAME` / `APP_PASSWORD` login. It is not a per-user web account system.
+- Telegram administrators listed in `BOT_ADMIN_IDS` can create single-use, 24-hour deep links. Invited users register by opening the link; they never type the invite code into chat.
+- Each Telegram user connects their own Maccabi account through a one-time browser-login link. Their encrypted session, selection state, and monitor lifecycle stay separate from other users.
+
+- `APP_USERNAME` / `APP_PASSWORD` env vars gate dashboard access. Always set a non-empty `APP_PASSWORD` in the hosting environment; login is unavailable when it is unset.
 - Session is an HMAC-signed cookie (`SESSION_SECRET` env var signs it), no server-side session store. Without `SESSION_SECRET` set, a random one is generated at boot, which invalidates all sessions on every restart/redeploy — set it explicitly in production.
-- `GET /login.html` and `POST /api/login` are the only routes reachable without a session; everything else (static files, all other `/api/*`, the WebSocket upgrade) is gated in `server.js`.
+- `GET /login.html`, `POST /api/login`, and the token-protected `GET`/`POST /bot-login` flow are reachable without a dashboard session; static dashboard files, all other `/api/*`, and the WebSocket upgrade are gated in `server.js`.
 - Secret settings fields (`telegramToken`, `loginPassword`, `proxyPassword`) are never returned by `GET /api/settings` — the response only carries `<field>Set` booleans. The Settings form leaves those inputs blank and only sends a new value if the user retypes it; omitting it on save keeps whatever's already stored.
 - "Send Test Message" hits `POST /api/telegram/test`, which reads the saved token server-side — the bot token never needs to reach the browser to test it.
-- If `ENCRYPTION_KEY` is set, secret fields are encrypted at rest in `settings.json` (AES-256-GCM). Without it they're stored in plaintext, same as before — this is defense for the file at rest, not what keeps the site private (the login gate does that).
+- `ENCRYPTION_KEY` is required at startup. It encrypts Telegram users' Playwright sessions and also encrypts secret dashboard settings at rest.
+
+## Telegram button workflow
+
+```text
+Admin /start → ➕ הזמן משתמש → copy deep link
+Invited user opens link → 🔐 התחבר
+Verified browser login → ⚽ בחר משחק
+Game → sections → quantity → summary → ▶️ התחל מעקב
+📊 סטטוס → ⏹ עצור or ⚙️ שנה בחירה
+```
+
+Buttons and legacy slash commands route through the same authorized actions. Registered-user arbitrary text only redisplays the contextual menu. Stale setup/change callbacks are state-checked so repeated old buttons cannot start a duplicate monitor or repeat a transition. When no games are available, the bot offers `🔄 בדוק שוב` and `🏠 תפריט ראשי`.
 
 ## Queue-it handling
 
@@ -115,16 +142,23 @@ The monitor detects Queue-it overlays (`#queueit_overlay`, `[id*="queueit"]`, or
 - `state.json` — saved Playwright browser session (cookies + localStorage)
 - `.env` — credentials
 - `settings.json` — saved dashboard settings (contains Telegram token + login credentials)
+- `data/` — Telegram SQLite state and encrypted per-user browser sessions
 
 ## Environment variables (`.env`)
 
-These pre-fill the settings on first run:
-- `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID`
+These pre-fill the legacy dashboard settings on first run:
+- `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID` (the token also starts the Telegram bot; the chat ID is the fallback administrator ID)
 - `LOGIN_USERNAME`, `LOGIN_PASSWORD`
 - `PORT` (default: 3000)
 
 Auth and hosting:
 - `APP_USERNAME` (default: `admin`), `APP_PASSWORD` (required — no default, set this)
 - `SESSION_SECRET` — signs session cookies; set this in production or every restart logs everyone out
-- `ENCRYPTION_KEY` — optional, encrypts secret settings fields at rest in `settings.json`
-- `DATA_DIR` — optional, redirects `settings.json`/`state.json` to a persistent volume/disk on the host instead of the app directory
+- `ENCRYPTION_KEY` — required; encrypts secret settings and per-user Telegram browser sessions
+- `DATA_DIR` — persistent directory for `settings.json`, `state.json`, `bot.db`, and encrypted per-user sessions
+- `BASE_URL` — externally reachable origin used in one-time `/bot-login` links; it must match the deployed server origin
+
+Telegram bot:
+- `BOT_TOKEN` — optional alias that takes precedence over `TELEGRAM_TOKEN`
+- `BOT_ADMIN_IDS` — comma-separated Telegram user IDs allowed to invite/list/revoke users; falls back to `TELEGRAM_CHAT_ID`
+- `BOT_MAX_BROWSERS` — maximum concurrent per-user monitor browsers; additional monitors queue
