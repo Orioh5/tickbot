@@ -134,6 +134,7 @@ function createApp({ botServices: injectedBotServices = botServices } = {}) {
 app.use(express.json());
 
 // Routes reachable without a session — must come before the auth gate.
+app.get('/health', (req, res) => res.status(200).json({ status: 'ok' }));
 app.get('/login.html', (req, res) => res.sendFile(path.join(__dirname, 'public', 'login.html')));
 
 // ── Bot login flow ─────────────────────────────────────────────────────────

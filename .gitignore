@@ -3,3 +3,4 @@ state.json
 settings.json
 data/
 node_modules/
+.worktrees/
