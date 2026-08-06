@@ -170,6 +170,26 @@ test('discoverEventMap reports partial when only clickable controls are exposed'
   assert.deepEqual(result.areas.map(area => area.label), ['22,24']);
 });
 
+test('discoverEventMap excludes numbered box captions from stadium areas', async () => {
+  const snapshot = {
+    venueName: null,
+    mapLoaded: true,
+    clickable: [{ id: '900', label: '22,24' }],
+    mapLabels: ['22,24', 'BOX1 | BOX2'],
+  };
+  const svc = new GameDiscoveryService({
+    userSessionStore: makeSessionStore(),
+    browserFactory: makeBrowser([makeSectionPage(snapshot)]),
+  });
+
+  const result = await svc.discoverEventMap('42', {
+    name: 'Away',
+    url: 'https://tickets.mhaifafc.com/Stadium/Index?eventId=7000',
+  });
+
+  assert.deepEqual(result.areas.map(area => area.label), ['22,24']);
+});
+
 test('discoverEventMap reports unknown when no areas can be read', async () => {
   const snapshot = { venueName: null, mapLoaded: false, clickable: [], mapLabels: [] };
   const svc = new GameDiscoveryService({

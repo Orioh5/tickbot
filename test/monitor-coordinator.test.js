@@ -62,6 +62,15 @@ class StubMonitor extends EventEmitter {
   }
 }
 
+class CapturingMonitor extends StubMonitor {
+  static lastSettings = null;
+
+  async start(settings) {
+    CapturingMonitor.lastSettings = settings;
+    await super.start(settings);
+  }
+}
+
 class DelayedStopMonitor extends EventEmitter {
   static instances = [];
   static activeBrowsers = 0;
@@ -208,6 +217,29 @@ test('coordinator persists dynamic event metadata for accepted monitoring', asyn
   assert.deepEqual(userStore.getMonitoringConfig('1').eventMetadata, {
     gameName: 'Away', venueName: 'Away Ground', confidence: 'complete', areas,
   });
+});
+
+test('coordinator passes discovered areas into monitor settings', async () => {
+  CapturingMonitor.lastSettings = null;
+  const areas = [{
+    id: '900', label: '22,24', components: ['22', '24'], available: false, source: 'svg',
+  }];
+  const coord = new MonitorCoordinator({
+    userStore: makeUserStore(),
+    userSessionStore: makeSessionStore(),
+    gameDiscovery: makeGameDiscovery(),
+    telegramBotService: makeBot(),
+    MonitorClass: CapturingMonitor,
+  });
+
+  await coord.startMonitor('1', {
+    gameUrl: 'u1', gameName: 'Away', venueName: 'Away Ground', confidence: 'complete',
+    areas, sections: ['22,24'], quantity: 2, chatId: '1',
+  });
+
+  assert.deepEqual(CapturingMonitor.lastSettings.areas, areas);
+  assert.equal(CapturingMonitor.lastSettings.gameName, 'Away');
+  assert.equal(CapturingMonitor.lastSettings.venueName, 'Away Ground');
 });
 
 test('persistence failure rejects before monitor or queue acceptance', async () => {

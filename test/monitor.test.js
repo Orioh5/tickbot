@@ -586,6 +586,33 @@ test('API polling refreshes the DOM before cart automation for a newly available
   assert.equal(notifications.length, 0);
 });
 
+test('API polling refreshes for a legacy component mapped to a combined area', async () => {
+  const monitor = new Monitor();
+  let reloads = 0;
+  let domChecks = 0;
+  monitor.running = true;
+  monitor.settings = settings({
+    sections: ['22'],
+    areas: [{
+      id: '900', label: '22,24', components: ['22', '24'], available: false, source: 'svg',
+    }],
+  });
+  monitor.sections = { 22: { status: 'unavailable' } };
+  monitor._initializeAreaMappings();
+  monitor._fetchApiAvailability = async () => ({
+    timestamp: null,
+    sectors: [{ id: '900', freeSeats: 1 }],
+  });
+  monitor.page = { reload: async () => { reloads++; } };
+  monitor._sleep = async () => {};
+  monitor._checkAvailability = async () => { domChecks++; };
+
+  await monitor._pollApiOrFallback();
+
+  assert.equal(reloads, 1);
+  assert.equal(domChecks, 1);
+});
+
 test('API polling refreshes the DOM once when an available internal ID is not mapped', async () => {
   const monitor = new Monitor();
   let reloads = 0;

@@ -115,7 +115,9 @@ class GameDiscoveryService {
           element.getAttribute('data-sector-label') ||
           element.getAttribute('data-sector-name') ||
           element.textContent
-        ).map(text => text?.trim()).filter(text => /\d/.test(text || '')),
+        ).map(text => text?.trim()).filter(text =>
+          /\d/.test(text || '') && !/[A-Za-z]/.test(text || '')
+        ),
       }));
 
       const clickable = Array.isArray(snapshot?.clickable)
@@ -126,11 +128,13 @@ class GameDiscoveryService {
         }))
         : [];
       const mapAreas = Array.isArray(snapshot?.mapLabels)
-        ? snapshot.mapLabels.map(label => makeSalesArea({
-          label,
-          available: false,
-          source: 'svg',
-        }))
+        ? snapshot.mapLabels
+          .filter(label => /\d/.test(label || '') && !/[A-Za-z]/.test(label || ''))
+          .map(label => makeSalesArea({
+            label,
+            available: false,
+            source: 'svg',
+          }))
         : [];
       const areas = mergeSalesAreas([...mapAreas, ...clickable]);
       const confidence = areas.length === 0

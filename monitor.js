@@ -6,6 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const TelegramOwnerSelector = require('./telegram-owner-selector');
 const ownerAssignment = require('./owner-assignment');
+const { normalizeAreaLabel, resolveAreaTarget } = require('./bot/sales-area');
 
 const STATE_PATH = process.env.DATA_DIR
   ? path.join(process.env.DATA_DIR, 'state.json')
@@ -20,8 +21,8 @@ function parseAvailableSections(candidates) {
     .map(({ onclick = '', text = '' }) => {
       const idMatch = onclick.match(/processSectorById\((\d+)\)/);
       if (!idMatch) return null;
-      const labelMatch = text.trim().match(/(\d+)/);
-      return { id: idMatch[1], label: labelMatch ? labelMatch[1] : idMatch[1] };
+      const label = normalizeAreaLabel(text);
+      return { id: idMatch[1], label: label || idMatch[1] };
     })
     .filter(Boolean);
 }
@@ -166,6 +167,7 @@ class Monitor extends EventEmitter {
     this._labelToOnclickId = {};
     this._onclickIdToLabel = {};
     this.settings = settings;
+    this._initializeAreaMappings();
     this._ownerSelectionAbort = ownerSelectionAbort;
     this._ownerSelector = ownerSelector;
     this._flowToken = flowToken;
@@ -210,6 +212,25 @@ class Monitor extends EventEmitter {
       await this._cleanupBrowser(this.browser, ownerSelectionAbort);
       this._finalizeFlow(flowToken);
       throw e;
+    }
+  }
+
+  _initializeAreaMappings() {
+    this._labelToOnclickId = {};
+    this._onclickIdToLabel = {};
+    const areas = Array.isArray(this.settings?.areas) ? this.settings.areas : [];
+    for (const area of areas) {
+      if (!area?.id || !area?.label) continue;
+      const id = String(area.id);
+      const label = normalizeAreaLabel(area.label) || id;
+      this._labelToOnclickId[label] = id;
+      this._labelToOnclickId[id] = id;
+      this._onclickIdToLabel[id] = label;
+    }
+    this._targetToAreaLabel = {};
+    for (const target of this.settings?.sections || []) {
+      const resolved = resolveAreaTarget(String(target), areas);
+      this._targetToAreaLabel[String(target)] = resolved?.label || String(target);
     }
   }
 
@@ -451,9 +472,12 @@ class Monitor extends EventEmitter {
     }));
 
     const newlyAvailableForPurchase = availableSections.some(sector => {
-      const watched = configured.has(sector.label) || configured.has(sector.id);
-      const previous = this.sections[sector.label] || this.sections[sector.id];
-      return watched && previous?.status !== 'available';
+      const watchedTargets = [...configured].filter(target => {
+        const canonical = this._targetToAreaLabel?.[target] || target;
+        return canonical === sector.label || canonical === sector.id ||
+          target === sector.label || target === sector.id;
+      });
+      return watchedTargets.some(target => this.sections[target]?.status !== 'available');
     });
     if (newlyAvailableForPurchase) {
       return this._refreshDomAvailability('API found tickets for auto-purchase.');
@@ -592,14 +616,14 @@ class Monitor extends EventEmitter {
     }
     this.emit('sections', this.getSections());
 
-    const availableLabels = new Set(availableSections.map(s => s.label));
-    const availableIds    = new Set(availableSections.map(s => s.id));
-
     for (const section of this.settings.sections) {
       const sec = String(section);
-      const match = availableSections.find(item => item.label === sec || item.id === sec);
+      const canonical = this._targetToAreaLabel?.[sec] || sec;
+      const match = availableSections.find(item =>
+        item.label === canonical || item.id === canonical || item.label === sec || item.id === sec
+      );
       this.sections[section] = {
-        status: (availableLabels.has(sec) || availableIds.has(sec)) ? 'available' : 'unavailable',
+        status: match ? 'available' : 'unavailable',
         ...(match && Number.isFinite(match.freeSeats) ? { freeSeats: match.freeSeats } : {}),
       };
     }
@@ -614,18 +638,23 @@ class Monitor extends EventEmitter {
     const wasAvailable   = new Set(Object.entries(prevSections).filter(([, v]) => v.status === 'available').map(([k]) => k));
     const newlyAvailable   = [...nowAvailable].filter(k => !wasAvailable.has(k));
     const newlyUnavailable = [...wasAvailable].filter(k => !nowAvailable.has(k));
+    const canonicalLabels = targets => [...new Set(targets.map(target =>
+      this._targetToAreaLabel?.[String(target)] || String(target)
+    ))];
+    const newlyAvailableAreas = canonicalLabels(newlyAvailable);
+    const newlyUnavailableAreas = canonicalLabels(newlyUnavailable);
 
-    if (newlyAvailable.length > 0) {
-      const purchaseResult = await this._tryAutoPurchase(newlyAvailable[0]);
+    if (newlyAvailableAreas.length > 0) {
+      const purchaseResult = await this._tryAutoPurchase(newlyAvailableAreas[0]);
 
       this.stats.alerts++;
       this.emit('stats', this.getStats());
       const manualRecovery = purchaseResult.assignments === 'manual';
       const msg = purchaseResult.cartReady
-        ? `🛒 Tickets added to cart! Section ${newlyAvailable[0]} — complete checkout now!`
+        ? `🛒 Tickets added to cart! Section ${newlyAvailableAreas[0]} — complete checkout now!`
         : (manualRecovery
           ? '⚠️ Cart contents could not be verified. Use the manual cart link to review it.'
-          : `🎟️ Tickets available in sections: ${newlyAvailable.join(', ')}!`);
+          : `🎟️ Tickets available in sections: ${newlyAvailableAreas.join(', ')}!`);
       this.log(msg, 'alert');
       this.emit('alert', msg);
       if (!purchaseResult.cartReady && !manualRecovery) {
@@ -637,9 +666,9 @@ class Monitor extends EventEmitter {
         this.running = false;
         this.emit('status', this.getStatus());
       }
-    } else if (newlyUnavailable.length > 0) {
+    } else if (newlyUnavailableAreas.length > 0) {
       // Tickets were available but are now gone — send one notification
-      const msg = `❌ Tickets no longer available in sections: ${newlyUnavailable.join(', ')}`;
+      const msg = `❌ Tickets no longer available in sections: ${newlyUnavailableAreas.join(', ')}`;
       this.log(msg, 'warning');
       this.emit('alert', msg);
       await this._notify(msg);

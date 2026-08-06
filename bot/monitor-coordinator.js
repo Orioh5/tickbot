@@ -339,7 +339,16 @@ class MonitorCoordinator {
     }
   }
 
-  async _startNow(uid, { gameUrl, sections, quantity = 1, chatId }, suppliedSession = null) {
+  async _startNow(uid, {
+    gameUrl,
+    gameName = null,
+    venueName = null,
+    confidence = 'unknown',
+    areas = [],
+    sections,
+    quantity = 1,
+    chatId,
+  }, suppliedSession = null) {
     const session = suppliedSession || this._loadSessionRecord(uid);
     if (!session) throw new Error('No saved session. Use /login first.');
     const { storageState, generation } = session;
@@ -388,6 +397,10 @@ class MonitorCoordinator {
 
     const settings = {
       url: gameUrl,
+      gameName,
+      venueName,
+      confidence,
+      areas,
       sections,
       desiredQuantity: quantity,
       intervalMs: 10_000,
