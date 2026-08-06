@@ -710,6 +710,36 @@ test('game selection discovers real sections and renders inline section buttons'
   assert.ok(keyboard.some(button => button.callback_data === 'sections_done'));
 });
 
+test('away map shows available and sold-out combined areas as selectable buttons', async () => {
+  const coordinator = {
+    discoverGames: async () => [{
+      name: 'משחק חוץ',
+      url: 'https://tickets.mhaifafc.com/Stadium/Index?eventId=7000',
+    }],
+    discoverEventMap: async (_userId, game) => ({
+      eventId: '7000',
+      gameName: game.name,
+      gameUrl: game.url,
+      venueName: 'Away Ground',
+      confidence: 'complete',
+      areas: [
+        { id: '900', label: '22,24', components: ['22', '24'], available: true, source: 'dom' },
+        { id: null, label: '27,28', components: ['27', '28'], available: false, source: 'svg' },
+      ],
+    }),
+  };
+  const { botFactory } = makeBot({ extraUserIds: ['7'], monitorCoordinator: coordinator });
+  const fetch = makeFetch(Array.from({ length: 8 }, () => ({ ok: true, result: {} })));
+  const bot = botFactory(fetch);
+
+  await bot._dispatch(makeTextUpdate(7, '/games'));
+  await bot._dispatch(makeCallbackUpdate(7, 'game:0'));
+
+  const keyboard = fetch.calls.at(-1).body.reply_markup.inline_keyboard.flat();
+  assert.ok(keyboard.some(button => button.text === '🟢 22,24' && button.callback_data === 'area:0'));
+  assert.ok(keyboard.some(button => button.text === '⚪ 27,28' && button.callback_data === 'area:1'));
+});
+
 test('section selection finishes with quantity buttons restricted to 1-4', async () => {
   const coordinator = {
     discoverGames: async () => [],
@@ -812,8 +842,46 @@ test('setup confirmation claims the state before starting so a double click star
     sections: ['13'],
     quantity: 2,
     active: 1,
+    eventMetadata: {
+      gameName: 'Game', venueName: null, confidence: 'unknown', areas: [],
+    },
   });
   assert.equal(bot._getState('7').state, 'idle');
+});
+
+test('setup confirmation carries and persists dynamic event metadata', async () => {
+  const startCalls = [];
+  const coordinator = {
+    getStatus: () => null,
+    startMonitor: async (...args) => {
+      startCalls.push(args);
+      return { status: 'started' };
+    },
+  };
+  const { store, botFactory } = makeBot({ extraUserIds: ['7'], monitorCoordinator: coordinator });
+  const fetch = makeFetch(Array.from({ length: 5 }, () => ({ ok: true, result: {} })));
+  const bot = botFactory(fetch);
+  const areas = [{
+    id: '900', label: '22,24', components: ['22', '24'], available: false, source: 'svg',
+  }];
+  bot._setState('7', 'awaiting_confirmation', {
+    gameUrl: 'https://tickets.mhaifafc.com/Stadium/Index?eventId=7000',
+    gameName: 'משחק חוץ',
+    venueName: 'Away Ground',
+    confidence: 'complete',
+    areas,
+    sections: ['22,24'],
+    quantity: 2,
+  });
+
+  await bot._dispatch(makeCallbackUpdate(7, 'setup:confirm'));
+
+  assert.deepEqual(startCalls[0][1].areas, areas);
+  assert.equal(startCalls[0][1].gameName, 'משחק חוץ');
+  assert.equal(startCalls[0][1].venueName, 'Away Ground');
+  assert.deepEqual(store.getMonitoringConfig('7').eventMetadata, {
+    gameName: 'משחק חוץ', venueName: 'Away Ground', confidence: 'complete', areas,
+  });
 });
 
 test('a failed confirmation restores the same setup and a retry starts monitoring once', async () => {
