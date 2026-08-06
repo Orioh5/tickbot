@@ -533,6 +533,7 @@ test('fetches sectors info for the event ID using the authenticated browser cont
   );
   assert.equal(requestedOptions.headers.Referer, monitor.settings.url);
   assert.equal(requestedOptions.headers.Origin, 'https://tickets.mhaifafc.com');
+  assert.equal(requestedOptions.data, '');
   assert.deepEqual(result.sectors, [{ id: '1648', freeSeats: 1 }]);
 });
 

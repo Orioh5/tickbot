@@ -397,6 +397,7 @@ class Monitor extends EventEmitter {
 
     const apiUrl = this._sectorsInfoUrl || buildSectorsInfoUrl(this.settings.url);
     const response = await this.context.request.post(apiUrl, {
+      data: '',
       headers: {
         Origin: new URL(this.settings.url).origin,
         Referer: this.settings.url,
