@@ -31,13 +31,13 @@ function makeTextUpdate(userId, text, updateId = 1) {
   };
 }
 
-function makeCallbackUpdate(userId, data, updateId = 2) {
+function makeCallbackUpdate(userId, data, updateId = 2, messageId = 77) {
   return {
     update_id: updateId,
     callback_query: {
       id: 'cq1',
       from: { id: userId },
-      message: { chat: { id: userId, type: 'private' } },
+      message: { message_id: messageId, chat: { id: userId, type: 'private' } },
       data,
     },
   };
@@ -740,6 +740,26 @@ test('away map shows available and sold-out combined areas as selectable buttons
   assert.ok(keyboard.some(button => button.text === '⚪ 27,28' && button.callback_data === 'area:1'));
 });
 
+test('game selection stores the section prompt message ID', async () => {
+  const coordinator = {
+    discoverSections: async () => [{ label: '13', id: '1590' }],
+  };
+  const { botFactory } = makeBot({ extraUserIds: ['7'], monitorCoordinator: coordinator });
+  const fetch = makeFetch([
+    { ok: true, result: {} },
+    { ok: true, result: { message_id: 88 } },
+  ]);
+  const bot = botFactory(fetch);
+  bot._setState('7', 'awaiting_game', {
+    games: [{ name: 'Game', url: 'https://tickets.mhaifafc.com/game/1' }],
+  });
+
+  await bot._dispatch(makeCallbackUpdate(7, 'game:0'));
+
+  assert.equal(bot._getState('7').state, 'awaiting_sections');
+  assert.equal(bot._getState('7').data.sectionMessageId, 88);
+});
+
 test('section selection finishes with quantity buttons restricted to 1-4', async () => {
   const coordinator = {
     discoverGames: async () => [],
@@ -757,6 +777,7 @@ test('section selection finishes with quantity buttons restricted to 1-4', async
     gameUrl: 'https://tickets.mhaifafc.com/game/1',
     availableSections: ['13', '14'],
     sections: [],
+    sectionMessageId: 77,
   });
 
   await bot._dispatch(makeCallbackUpdate(7, 'section:13'));
@@ -764,6 +785,130 @@ test('section selection finishes with quantity buttons restricted to 1-4', async
 
   const keyboard = fetch.calls.at(-1).body.reply_markup.inline_keyboard.flat();
   assert.deepEqual(keyboard.map(button => button.callback_data), ['quantity:1', 'quantity:2', 'quantity:3', 'quantity:4']);
+});
+
+test('section selection edits the original keyboard without sending a selection message', async () => {
+  const { botFactory } = makeBot({ extraUserIds: ['7'], monitorCoordinator: {} });
+  const fetch = makeFetch([
+    { ok: true, result: {} },
+    { ok: true, result: {} },
+    { ok: true, result: {} },
+    { ok: true, result: {} },
+  ]);
+  const bot = botFactory(fetch);
+  bot._setState('7', 'awaiting_sections', {
+    gameUrl: 'https://tickets.mhaifafc.com/game/1',
+    availableSections: ['13', '14'],
+    sections: [],
+    sectionMessageId: 77,
+  });
+
+  await bot._dispatch(makeCallbackUpdate(7, 'section:13'));
+
+  assert.deepEqual(fetch.calls.map(call => call.method), [
+    'answerCallbackQuery',
+    'editMessageReplyMarkup',
+  ]);
+  assert.equal(fetch.calls[1].body.chat_id, '7');
+  assert.equal(fetch.calls[1].body.message_id, 77);
+  const selectedButtons = fetch.calls[1].body.reply_markup.inline_keyboard.flat();
+  assert.equal(selectedButtons.find(button => button.callback_data === 'section:13').text, '✅ 13');
+  assert.equal(selectedButtons.find(button => button.callback_data === 'sections_done').text, '✅ סיימתי (1)');
+
+  await bot._dispatch(makeCallbackUpdate(7, 'section:13', 3));
+
+  assert.deepEqual(fetch.calls.map(call => call.method), [
+    'answerCallbackQuery',
+    'editMessageReplyMarkup',
+    'answerCallbackQuery',
+    'editMessageReplyMarkup',
+  ]);
+  const deselectedButtons = fetch.calls[3].body.reply_markup.inline_keyboard.flat();
+  assert.equal(deselectedButtons.find(button => button.callback_data === 'section:13').text, '13');
+  assert.equal(deselectedButtons.find(button => button.callback_data === 'sections_done').text, '✅ סיימתי (0)');
+});
+
+test('section keyboard edit failure preserves selection without a fallback message', async () => {
+  const { botFactory } = makeBot({ extraUserIds: ['7'], monitorCoordinator: {} });
+  const fetch = makeFetch([
+    { ok: true, result: {} },
+    { ok: false, description: 'message is not modified: sensitive-detail' },
+  ]);
+  const bot = botFactory(fetch);
+  bot._setState('7', 'awaiting_sections', {
+    gameUrl: 'https://tickets.mhaifafc.com/game/1',
+    availableSections: ['13'],
+    sections: [],
+    sectionMessageId: 77,
+  });
+
+  const captured = [];
+  const originalConsoleError = console.error;
+  console.error = (...parts) => { captured.push(parts.join(' ')); };
+  try {
+    await assert.doesNotReject(() => bot._dispatch(makeCallbackUpdate(7, 'section:13')));
+  } finally {
+    console.error = originalConsoleError;
+  }
+
+  assert.deepEqual(bot._getState('7').data.sections, ['13']);
+  assert.deepEqual(fetch.calls.map(call => call.method), [
+    'answerCallbackQuery',
+    'editMessageReplyMarkup',
+  ]);
+  assert.match(captured.join('\n'), /code=TELEGRAM_EDIT_FAILED/);
+  assert.doesNotMatch(captured.join('\n'), /message is not modified|sensitive-detail/);
+});
+
+test('stale section callbacks cannot mutate or advance the active selection', async () => {
+  const { botFactory } = makeBot({ extraUserIds: ['7'], monitorCoordinator: {} });
+  const toggleFetch = makeFetch([{ ok: true, result: {} }, { ok: true, result: {} }]);
+  const toggleBot = botFactory(toggleFetch);
+  toggleBot._setState('7', 'awaiting_sections', {
+    gameUrl: 'https://tickets.mhaifafc.com/game/1',
+    availableSections: ['13'],
+    sections: [],
+    sectionMessageId: 88,
+  });
+
+  await toggleBot._dispatch(makeCallbackUpdate(7, 'section:13', 2, 77));
+
+  assert.equal(toggleBot._getState('7').state, 'awaiting_sections');
+  assert.deepEqual(toggleBot._getState('7').data.sections, []);
+  assert.deepEqual(toggleFetch.calls.map(call => call.method), ['answerCallbackQuery', 'sendMessage']);
+
+  const doneFetch = makeFetch([{ ok: true, result: {} }, { ok: true, result: {} }]);
+  const doneBot = botFactory(doneFetch);
+  doneBot._setState('7', 'awaiting_sections', {
+    gameUrl: 'https://tickets.mhaifafc.com/game/1',
+    availableSections: ['13'],
+    sections: ['13'],
+    sectionMessageId: 88,
+  });
+
+  await doneBot._dispatch(makeCallbackUpdate(7, 'sections_done', 2, 77));
+
+  assert.equal(doneBot._getState('7').state, 'awaiting_sections');
+  assert.deepEqual(doneFetch.calls.map(call => call.method), ['answerCallbackQuery', 'sendMessage']);
+  assert.equal(doneFetch.calls[1].body.reply_markup.inline_keyboard.flat().some(button => button.callback_data.startsWith('quantity:')), false);
+});
+
+test('sections done with no selections keeps section selection active', async () => {
+  const { botFactory } = makeBot({ extraUserIds: ['7'], monitorCoordinator: {} });
+  const fetch = makeFetch([{ ok: true, result: {} }, { ok: true, result: {} }]);
+  const bot = botFactory(fetch);
+  bot._setState('7', 'awaiting_sections', {
+    gameUrl: 'https://tickets.mhaifafc.com/game/1',
+    availableSections: ['13'],
+    sections: [],
+    sectionMessageId: 77,
+  });
+
+  await bot._dispatch(makeCallbackUpdate(7, 'sections_done'));
+
+  assert.equal(bot._getState('7').state, 'awaiting_sections');
+  assert.match(fetch.calls[1].body.text, /בחר לפחות גוש אחד/);
+  assert.equal(fetch.calls.some(call => call.body.reply_markup?.inline_keyboard.flat().some(button => button.callback_data.startsWith('quantity:'))), false);
 });
 
 test('quantity selection shows a sanitized confirmation summary without starting monitoring', async () => {
