@@ -7,7 +7,14 @@
       "Bash(timeout 15 npx electron .)",
       "Bash(echo \"exit:$?\")",
       "Bash(pkill -f \"node_modules/electron/dist/Electron.app\")",
-      "Bash(npm uninstall *)"
+      "Bash(npm uninstall *)",
+      "Bash(git checkout *)",
+      "Bash(node --test test/telegram-owner-selector.test.js)",
+      "Bash(npm run *)",
+      "Bash(xargs -I{} sh -c 'echo ==={}; cat {}')",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)"
     ]
   }
 }
