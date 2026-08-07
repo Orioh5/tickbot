@@ -127,6 +127,14 @@ class TelegramBotService {
     return this._call('sendMessage', { chat_id: chatId, text, ...extra });
   }
 
+  async editMessageReplyMarkup(chatId, messageId, replyMarkup) {
+    return this._call('editMessageReplyMarkup', {
+      chat_id: chatId,
+      message_id: messageId,
+      reply_markup: replyMarkup,
+    });
+  }
+
   async sendMarkdown(chatId, text, extra = {}) {
     return this._call('sendMessage', { chat_id: chatId, text, parse_mode: 'Markdown', ...extra });
   }
@@ -720,8 +728,12 @@ class TelegramBotService {
       else selected.add(label);
       current.data.sections = [...selected];
       this._setState(userId, STATE.AWAITING_SECTIONS, current.data);
-      await this.sendMessage(chatId, `נבחרו ${selected.size} גושים:`, {
-        reply_markup: { inline_keyboard: this._buildSectionsKeyboard(current.data) },
+      await this.editMessageReplyMarkup(
+        chatId,
+        query.message?.message_id,
+        { inline_keyboard: this._buildSectionsKeyboard(current.data) }
+      ).catch(() => {
+        console.error('[TelegramBotService] section keyboard edit failed code=TELEGRAM_EDIT_FAILED.');
       });
       return;
     }
