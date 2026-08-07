@@ -12,6 +12,36 @@ function sessionExpiredError() {
   return Object.assign(new Error('Saved session expired'), { code: 'SESSION_EXPIRED' });
 }
 
+function extractGamesFromDocument(root = document) {
+  const selector = [
+    'a[href*="/Stadium/Index"][href*="eventId="]',
+    'a[href*="/event/"]',
+    'a[href*="/EventPage/"]',
+  ].join(', ');
+
+  return Array.from(root.querySelectorAll(selector))
+    .map(anchor => {
+      const url = anchor.href;
+      let eventId = null;
+      try {
+        eventId = new URL(url).searchParams.get('eventId');
+      } catch (_) {}
+
+      const card = anchor.closest?.('.event, .event-card, [data-event], .box');
+      const explicitName = anchor.querySelector?.('.event-name, .title, h3, h4')
+        ?.textContent?.trim()
+        || card?.querySelector?.('.event-name, .title, h3, h4')?.textContent?.trim();
+      const anchorText = anchor.textContent?.trim();
+      const genericBuyText = /^(?:add_shopping_cart)?\s*להזמנה$/i.test(anchorText || '');
+      const name = explicitName
+        || (!genericBuyText ? anchorText : null)
+        || (eventId ? `משחק ${eventId}` : null);
+
+      return { name, url };
+    })
+    .filter(game => game.name && game.url);
+}
+
 async function assertAuthenticated(page) {
   let redirectedToLogin = false;
   try {
@@ -45,15 +75,7 @@ class GameDiscoveryService {
       const page = await context.newPage();
       await page.goto(EVENTS_URL, NAV_OPTS);
       await assertAuthenticated(page);
-      const games = await page.evaluate(() => {
-        // Each event is a link with a title; selector may need refinement per site structure
-        return Array.from(document.querySelectorAll('a[href*="/event/"], a[href*="/EventPage/"]'))
-          .map(a => ({
-            name: a.querySelector('.event-name, .title, h3, h4')?.textContent?.trim() || a.textContent?.trim(),
-            url: a.href,
-          }))
-          .filter(g => g.name && g.url);
-      });
+      const games = await page.evaluate(extractGamesFromDocument);
       await context.close();
       return games;
     } finally {
@@ -162,3 +184,4 @@ class GameDiscoveryService {
 }
 
 module.exports = GameDiscoveryService;
+module.exports.extractGamesFromDocument = extractGamesFromDocument;

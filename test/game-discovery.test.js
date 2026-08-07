@@ -2,7 +2,9 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const vm = require('node:vm');
 const GameDiscoveryService = require('../bot/game-discovery');
+const { extractGamesFromDocument } = require('../bot/game-discovery');
 
 // Minimal stub for UserSessionStore
 function makeSessionStore(state = { cookies: [], origins: [] }) {
@@ -70,6 +72,43 @@ test('discoverGames returns scraped game list', async () => {
   });
   const games = await svc.discoverGames('42');
   assert.deepEqual(games, expected);
+});
+
+test('extractGamesFromDocument recognizes current Stadium event links without a text name', () => {
+  const anchor = {
+    href: 'https://tickets.mhaifafc.com/Stadium/Index?eventId=6154',
+    textContent: 'add_shopping_cartלהזמנה',
+    querySelector: () => null,
+    closest: () => null,
+  };
+  const document = {
+    querySelectorAll: selector => {
+      assert.match(selector, /Stadium\/Index/);
+      return [anchor];
+    },
+  };
+
+  assert.deepEqual(extractGamesFromDocument(document), [{
+    name: 'משחק 6154',
+    url: 'https://tickets.mhaifafc.com/Stadium/Index?eventId=6154',
+  }]);
+});
+
+test('extractGamesFromDocument uses the browser document when Playwright passes no argument', () => {
+  const anchor = {
+    href: 'https://tickets.mhaifafc.com/Stadium/Index?eventId=6154',
+    textContent: 'להזמנה',
+    querySelector: () => null,
+    closest: () => null,
+  };
+  const context = {
+    document: { querySelectorAll: () => [anchor] },
+    URL,
+  };
+
+  const games = vm.runInNewContext(`(${extractGamesFromDocument.toString()})()`, context);
+  assert.equal(games[0].name, 'משחק 6154');
+  assert.equal(games[0].url, anchor.href);
 });
 
 test('discoverGames throws when no session saved', async () => {
