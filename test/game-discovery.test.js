@@ -2,7 +2,9 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const vm = require('node:vm');
 const GameDiscoveryService = require('../bot/game-discovery');
+const { extractGamesFromDocument } = require('../bot/game-discovery');
 
 // Minimal stub for UserSessionStore
 function makeSessionStore(state = { cookies: [], origins: [] }) {
@@ -84,6 +86,43 @@ test('discoverGames returns scraped game list', async () => {
   assert.deepEqual(games, expected);
 });
 
+test('extractGamesFromDocument recognizes current Stadium event links without a text name', () => {
+  const anchor = {
+    href: 'https://tickets.mhaifafc.com/Stadium/Index?eventId=6154',
+    textContent: 'add_shopping_cartלהזמנה',
+    querySelector: () => null,
+    closest: () => null,
+  };
+  const document = {
+    querySelectorAll: selector => {
+      assert.match(selector, /Stadium\/Index/);
+      return [anchor];
+    },
+  };
+
+  assert.deepEqual(extractGamesFromDocument(document), [{
+    name: 'משחק 6154',
+    url: 'https://tickets.mhaifafc.com/Stadium/Index?eventId=6154',
+  }]);
+});
+
+test('extractGamesFromDocument uses the browser document when Playwright passes no argument', () => {
+  const anchor = {
+    href: 'https://tickets.mhaifafc.com/Stadium/Index?eventId=6154',
+    textContent: 'להזמנה',
+    querySelector: () => null,
+    closest: () => null,
+  };
+  const context = {
+    document: { querySelectorAll: () => [anchor] },
+    URL,
+  };
+
+  const games = vm.runInNewContext(`(${extractGamesFromDocument.toString()})()`, context);
+  assert.equal(games[0].name, 'משחק 6154');
+  assert.equal(games[0].url, anchor.href);
+});
+
 test('discoverGames displays the stadium title from each event page', async () => {
   const url = 'https://tickets.mhaifafc.com/Stadium/Index?eventId=6154';
   const page = makeGamePage([{ name: 'שם מקוצר', url }], {
@@ -150,6 +189,91 @@ test('discoverSections returns sections from game page', async () => {
   });
   const sections = await svc.discoverSections('42', 'https://tickets.mhaifafc.com/event/123');
   assert.deepEqual(sections, expected);
+});
+
+test('discoverEventMap preserves a combined clickable area and a sold-out map area', async () => {
+  const snapshot = {
+    venueName: 'Away Ground',
+    mapLoaded: true,
+    clickable: [{ id: '900', label: '22,24' }],
+    mapLabels: ['22,24', '27,28'],
+  };
+  const svc = new GameDiscoveryService({
+    userSessionStore: makeSessionStore(),
+    browserFactory: makeBrowser([makeSectionPage(snapshot)]),
+  });
+
+  const result = await svc.discoverEventMap('42', {
+    name: 'משחק חוץ',
+    url: 'https://tickets.mhaifafc.com/Stadium/Index?eventId=7000',
+  });
+
+  assert.equal(result.eventId, '7000');
+  assert.equal(result.gameName, 'משחק חוץ');
+  assert.equal(result.venueName, 'Away Ground');
+  assert.equal(result.confidence, 'complete');
+  assert.deepEqual(result.areas.map(({ id, label, available }) => ({ id, label, available })), [
+    { id: '900', label: '22,24', available: true },
+    { id: null, label: '27,28', available: false },
+  ]);
+});
+
+test('discoverEventMap reports partial when only clickable controls are exposed', async () => {
+  const snapshot = {
+    venueName: null,
+    mapLoaded: true,
+    clickable: [{ id: '900', label: '22,24' }],
+    mapLabels: [],
+  };
+  const svc = new GameDiscoveryService({
+    userSessionStore: makeSessionStore(),
+    browserFactory: makeBrowser([makeSectionPage(snapshot)]),
+  });
+
+  const result = await svc.discoverEventMap('42', {
+    name: 'Away',
+    url: 'https://tickets.mhaifafc.com/Stadium/Index?eventId=7000',
+  });
+
+  assert.equal(result.confidence, 'partial');
+  assert.deepEqual(result.areas.map(area => area.label), ['22,24']);
+});
+
+test('discoverEventMap excludes numbered box captions from stadium areas', async () => {
+  const snapshot = {
+    venueName: null,
+    mapLoaded: true,
+    clickable: [{ id: '900', label: '22,24' }],
+    mapLabels: ['22,24', 'BOX1 | BOX2'],
+  };
+  const svc = new GameDiscoveryService({
+    userSessionStore: makeSessionStore(),
+    browserFactory: makeBrowser([makeSectionPage(snapshot)]),
+  });
+
+  const result = await svc.discoverEventMap('42', {
+    name: 'Away',
+    url: 'https://tickets.mhaifafc.com/Stadium/Index?eventId=7000',
+  });
+
+  assert.deepEqual(result.areas.map(area => area.label), ['22,24']);
+});
+
+test('discoverEventMap reports unknown when no areas can be read', async () => {
+  const snapshot = { venueName: null, mapLoaded: false, clickable: [], mapLabels: [] };
+  const svc = new GameDiscoveryService({
+    userSessionStore: makeSessionStore(),
+    browserFactory: makeBrowser([makeSectionPage(snapshot)]),
+  });
+
+  const result = await svc.discoverEventMap('42', {
+    name: 'Away',
+    url: 'https://tickets.mhaifafc.com/event/away',
+  });
+
+  assert.equal(result.eventId, null);
+  assert.equal(result.confidence, 'unknown');
+  assert.deepEqual(result.areas, []);
 });
 
 test('discoverSections throws when no session saved', async () => {

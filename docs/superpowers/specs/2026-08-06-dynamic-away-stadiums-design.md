@@ -2,7 +2,7 @@
 
 ## Goal
 
-Support away matches sold on the existing Maccabi Haifa ticket site when their stadium map differs from Sami Ofer. Users must be able to monitor currently available areas and sold-out areas, enter an area manually when discovery is incomplete, and use the existing automatic add-to-cart flow when tickets appear.
+Support away matches sold on the existing Maccabi Haifa ticket site when their stadium map differs from Sami Ofer. Users must be able to monitor currently available areas and sold-out areas discovered from the map, and use the existing automatic add-to-cart flow when tickets appear.
 
 ## Scope
 
@@ -37,9 +37,7 @@ The existing Sami Ofer catalog may remain as optional display metadata, but it w
 
 Telegram will show one button per sales area. A combined area appears as one button, for example `22,24`.
 
-Users can also enter areas manually. Input is normalized so that `22`, `24`, or `22,24` can resolve to the combined `22,24` sales area when that mapping is known. If the mapping is unknown, the manual value is retained as an explicit monitoring target rather than silently discarded.
-
-Both available and sold-out discovered areas are selectable. Availability is shown as state, not used to filter the list. If discovery is partial, the bot explains that the list may be incomplete and offers manual entry.
+Both available and sold-out discovered areas are selectable. Availability is shown as state, not used to filter the list. If discovery is partial, the bot explains that the list may be incomplete. The Telegram flow does not accept manual area input.
 
 Persisted monitoring configuration will retain the event name, venue metadata, canonical sales-area targets, component labels, URL, and desired quantity. Status and alert messages will use the human-readable event and area labels.
 
@@ -55,7 +53,7 @@ The map and DOM will be refreshed when:
 
 Availability will be determined from clickability and API data, not from a hard-coded color such as red. Map colors are presentation details and may vary between stadiums or events.
 
-A manual component target matches a canonical combined area when the mapping says the component belongs to it. The monitor reports and purchases the canonical area once, preventing duplicate alerts or purchase attempts for `22` and `24`.
+The monitor reports and purchases each canonical area once, preventing duplicate alerts or purchase attempts for a combined area such as `22,24`.
 
 ## Add to Cart
 
@@ -74,15 +72,15 @@ If mapping, clicking, or cart verification fails, the bot sends an availability 
 ## Error Handling
 
 - Missing venue metadata does not block monitoring.
-- Partial discovery enables manual selection and is surfaced to the user.
-- An unrecognized map structure produces a safe manual-entry workflow rather than an empty dead end.
+- Partial discovery is surfaced to the user.
+- An unrecognized map structure produces a clear error and retry/home actions rather than an empty dead end.
 - Session expiry keeps the existing reconnect behavior.
 - Queue-it detection remains informational and does not attempt to bypass the queue.
 - A canonical area that cannot currently be clicked remains monitored and can become actionable on a later refresh.
 
 ## Compatibility and Migration
 
-Existing monitoring rows contain a URL, section strings, and quantity. They remain valid and are interpreted as manual targets when richer area metadata is absent. No destructive database migration is required.
+Existing monitoring rows contain a URL, section strings, and quantity. They remain valid as legacy targets when richer area metadata is absent. No destructive database migration is required.
 
 The legacy dashboard continues to accept manual section input. Dynamic event metadata is primarily required for the Telegram workflow and shared monitor logic; dashboard UI changes are limited to displaying canonical labels correctly.
 
@@ -93,7 +91,7 @@ Automated tests will cover:
 - Discovery of a single-block area.
 - Discovery and preservation of a combined `22,24` area.
 - Inclusion of sold-out/non-clickable areas when exposed by map data.
-- Partial discovery and manual-entry fallback.
+- Partial and unknown discovery states.
 - Normalization of `22`, `24`, and `22,24` to one canonical purchase target.
 - API ID-to-label mapping for home and away events.
 - Availability transitions without duplicate alerts.
@@ -103,4 +101,4 @@ Automated tests will cover:
 
 ## Success Criteria
 
-An invited Telegram user can select an away match, see every area the event page exposes (including unavailable ones), manually add a missing target, monitor that target, and have the requested quantity added to the cart when it becomes available. A combined map area is presented and purchased exactly once, and the bot never reports cart success without verification.
+An invited Telegram user can select an away match, see every area the event page exposes (including unavailable ones), monitor a discovered target, and have the requested quantity added to the cart when it becomes available. A combined map area is presented and purchased exactly once, and the bot never reports cart success without verification.

@@ -40,6 +40,7 @@ class UserStore {
         telegram_user_id TEXT PRIMARY KEY,
         game_url         TEXT,
         sections         TEXT,
+        event_metadata   TEXT,
         quantity         INTEGER NOT NULL DEFAULT 1,
         active           INTEGER NOT NULL DEFAULT 0
       );
@@ -54,6 +55,10 @@ class UserStore {
     // marker instead of hashing an already-migrated code a second time.
     this.db.exec('BEGIN IMMEDIATE');
     try {
+      const monitoringColumns = this.db.prepare('PRAGMA table_info(user_monitoring)').all();
+      if (!monitoringColumns.some(column => column.name === 'event_metadata')) {
+        this.db.exec('ALTER TABLE user_monitoring ADD COLUMN event_metadata TEXT');
+      }
       const inviteColumns = this.db.prepare('PRAGMA table_info(invite_codes)').all();
       if (!inviteColumns.some(column => column.name === 'expires_at')) {
         this.db.exec('ALTER TABLE invite_codes ADD COLUMN expires_at INTEGER');
@@ -102,12 +107,13 @@ class UserStore {
           )
       `),
       upsertMonitoring:   this.db.prepare(`
-        INSERT INTO user_monitoring (telegram_user_id, game_url, sections, quantity)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO user_monitoring (telegram_user_id, game_url, sections, quantity, event_metadata)
+        VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(telegram_user_id) DO UPDATE SET
           game_url = excluded.game_url,
           sections = excluded.sections,
-          quantity = excluded.quantity
+          quantity = excluded.quantity,
+          event_metadata = excluded.event_metadata
       `),
       getMonitoring:      this.db.prepare('SELECT * FROM user_monitoring WHERE telegram_user_id = ?'),
       listActiveMonitoring: this.db.prepare('SELECT * FROM user_monitoring WHERE active = 1 ORDER BY telegram_user_id'),
@@ -117,12 +123,14 @@ class UserStore {
         ON CONFLICT(telegram_user_id) DO UPDATE SET active = excluded.active
       `),
       upsertAcceptedMonitoring: this.db.prepare(`
-        INSERT INTO user_monitoring (telegram_user_id, game_url, sections, quantity, active)
-        VALUES (?, ?, ?, ?, 1)
+        INSERT INTO user_monitoring
+          (telegram_user_id, game_url, sections, quantity, event_metadata, active)
+        VALUES (?, ?, ?, ?, ?, 1)
         ON CONFLICT(telegram_user_id) DO UPDATE SET
           game_url = excluded.game_url,
           sections = excluded.sections,
           quantity = excluded.quantity,
+          event_metadata = excluded.event_metadata,
           active = 1
       `),
     };
@@ -245,21 +253,32 @@ class UserStore {
 
   // ── Monitoring config ──────────────────────────────────────────────────────
 
-  setMonitoringConfig(userId, { gameUrl, sections, quantity = 1 }) {
-    this._stmts.upsertMonitoring.run(String(userId), gameUrl, JSON.stringify(sections), quantity);
+  setMonitoringConfig(userId, { gameUrl, sections, quantity = 1, eventMetadata = null }) {
+    this._stmts.upsertMonitoring.run(
+      String(userId),
+      gameUrl,
+      JSON.stringify(sections),
+      quantity,
+      eventMetadata == null ? null : JSON.stringify(eventMetadata)
+    );
   }
 
   getMonitoringConfig(userId) {
     const row = this._stmts.getMonitoring.get(String(userId));
     if (!row) return null;
-    return { ...row, sections: JSON.parse(row.sections || '[]') };
+    const { event_metadata: eventMetadataJson, ...fields } = row;
+    return {
+      ...fields,
+      sections: JSON.parse(row.sections || '[]'),
+      ...(eventMetadataJson ? { eventMetadata: JSON.parse(eventMetadataJson) } : {}),
+    };
   }
 
   setMonitoringActive(userId, active) {
     this._stmts.setActiveFlag.run(String(userId), active ? 1 : 0);
   }
 
-  acceptMonitoring(userId, { gameUrl, sections, quantity = 1 }) {
+  acceptMonitoring(userId, { gameUrl, sections, quantity = 1, eventMetadata = null }) {
     const uid = String(userId);
     this.db.exec('BEGIN IMMEDIATE');
     try {
@@ -270,7 +289,8 @@ class UserStore {
         uid,
         gameUrl,
         JSON.stringify(sections),
-        quantity
+        quantity,
+        eventMetadata == null ? null : JSON.stringify(eventMetadata)
       );
       this.db.exec('COMMIT');
     } catch (error) {
@@ -280,10 +300,14 @@ class UserStore {
   }
 
   listActiveMonitoring() {
-    return this._stmts.listActiveMonitoring.all().map(row => ({
-      ...row,
-      sections: JSON.parse(row.sections || '[]'),
-    }));
+    return this._stmts.listActiveMonitoring.all().map(row => {
+      const { event_metadata: eventMetadataJson, ...fields } = row;
+      return {
+        ...fields,
+        sections: JSON.parse(row.sections || '[]'),
+        ...(eventMetadataJson ? { eventMetadata: JSON.parse(eventMetadataJson) } : {}),
+      };
+    });
   }
 }
 
