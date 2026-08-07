@@ -828,6 +828,34 @@ test('section selection edits the original keyboard without sending a selection 
   assert.equal(deselectedButtons.find(button => button.callback_data === 'sections_done').text, '✅ סיימתי (0)');
 });
 
+test('area selection edits the original keyboard without sending a selection message', async () => {
+  const { botFactory } = makeBot({ extraUserIds: ['7'], monitorCoordinator: {} });
+  const fetch = makeFetch([
+    { ok: true, result: {} },
+    { ok: true, result: {} },
+  ]);
+  const bot = botFactory(fetch);
+  bot._setState('7', 'awaiting_sections', {
+    gameUrl: 'https://tickets.mhaifafc.com/game/1',
+    areas: [{ id: '900', label: '22,24', components: ['22', '24'], available: true, source: 'dom' }],
+    availableSections: ['22,24'],
+    sections: [],
+    sectionMessageId: 77,
+  });
+
+  await bot._dispatch(makeCallbackUpdate(7, 'area:0'));
+
+  assert.deepEqual(fetch.calls.map(call => call.method), [
+    'answerCallbackQuery',
+    'editMessageReplyMarkup',
+  ]);
+  assert.equal(fetch.calls[1].body.chat_id, '7');
+  assert.equal(fetch.calls[1].body.message_id, 77);
+  const selectedButtons = fetch.calls[1].body.reply_markup.inline_keyboard.flat();
+  assert.equal(selectedButtons.find(button => button.callback_data === 'area:0').text, '🟢 ✅ 22,24');
+  assert.equal(selectedButtons.find(button => button.callback_data === 'sections_done').text, '✅ סיימתי (1)');
+});
+
 test('section keyboard edit failure preserves selection without a fallback message', async () => {
   const { botFactory } = makeBot({ extraUserIds: ['7'], monitorCoordinator: {} });
   const fetch = makeFetch([
@@ -852,6 +880,39 @@ test('section keyboard edit failure preserves selection without a fallback messa
   }
 
   assert.deepEqual(bot._getState('7').data.sections, ['13']);
+  assert.deepEqual(fetch.calls.map(call => call.method), [
+    'answerCallbackQuery',
+    'editMessageReplyMarkup',
+  ]);
+  assert.match(captured.join('\n'), /code=TELEGRAM_EDIT_FAILED/);
+  assert.doesNotMatch(captured.join('\n'), /message is not modified|sensitive-detail/);
+});
+
+test('area keyboard edit failure preserves selection without a fallback message', async () => {
+  const { botFactory } = makeBot({ extraUserIds: ['7'], monitorCoordinator: {} });
+  const fetch = makeFetch([
+    { ok: true, result: {} },
+    { ok: false, description: 'message is not modified: sensitive-detail' },
+  ]);
+  const bot = botFactory(fetch);
+  bot._setState('7', 'awaiting_sections', {
+    gameUrl: 'https://tickets.mhaifafc.com/game/1',
+    areas: [{ id: '900', label: '22,24', components: ['22', '24'], available: true, source: 'dom' }],
+    availableSections: ['22,24'],
+    sections: [],
+    sectionMessageId: 77,
+  });
+
+  const captured = [];
+  const originalConsoleError = console.error;
+  console.error = (...parts) => { captured.push(parts.join(' ')); };
+  try {
+    await assert.doesNotReject(() => bot._dispatch(makeCallbackUpdate(7, 'area:0')));
+  } finally {
+    console.error = originalConsoleError;
+  }
+
+  assert.deepEqual(bot._getState('7').data.sections, ['22,24']);
   assert.deepEqual(fetch.calls.map(call => call.method), [
     'answerCallbackQuery',
     'editMessageReplyMarkup',
@@ -891,6 +952,25 @@ test('stale section callbacks cannot mutate or advance the active selection', as
   assert.equal(doneBot._getState('7').state, 'awaiting_sections');
   assert.deepEqual(doneFetch.calls.map(call => call.method), ['answerCallbackQuery', 'sendMessage']);
   assert.equal(doneFetch.calls[1].body.reply_markup.inline_keyboard.flat().some(button => button.callback_data.startsWith('quantity:')), false);
+});
+
+test('stale area callbacks cannot mutate the active selection', async () => {
+  const { botFactory } = makeBot({ extraUserIds: ['7'], monitorCoordinator: {} });
+  const fetch = makeFetch([{ ok: true, result: {} }, { ok: true, result: {} }]);
+  const bot = botFactory(fetch);
+  bot._setState('7', 'awaiting_sections', {
+    gameUrl: 'https://tickets.mhaifafc.com/game/1',
+    areas: [{ id: '900', label: '22,24', components: ['22', '24'], available: true, source: 'dom' }],
+    availableSections: ['22,24'],
+    sections: [],
+    sectionMessageId: 88,
+  });
+
+  await bot._dispatch(makeCallbackUpdate(7, 'area:0', 2, 77));
+
+  assert.equal(bot._getState('7').state, 'awaiting_sections');
+  assert.deepEqual(bot._getState('7').data.sections, []);
+  assert.deepEqual(fetch.calls.map(call => call.method), ['answerCallbackQuery', 'sendMessage']);
 });
 
 test('sections done with no selections keeps section selection active', async () => {

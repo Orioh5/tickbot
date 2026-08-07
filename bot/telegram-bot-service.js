@@ -693,6 +693,10 @@ class TelegramBotService {
         await this.showMainMenu(userId, chatId);
         return;
       }
+      if (!Number.isInteger(current.data.sectionMessageId) || query.message?.message_id !== current.data.sectionMessageId) {
+        await this.showMainMenu(userId, chatId);
+        return;
+      }
       const area = current.data.areas?.[Number(areaMatch[1])];
       if (!area) {
         await this.showMainMenu(userId, chatId);
@@ -703,8 +707,12 @@ class TelegramBotService {
       else selected.add(area.label);
       current.data.sections = [...selected];
       this._setState(userId, STATE.AWAITING_SECTIONS, current.data);
-      await this.sendMessage(chatId, `נבחרו ${selected.size} גושים:`, {
-        reply_markup: { inline_keyboard: this._buildSectionsKeyboard(current.data) },
+      await this.editMessageReplyMarkup(
+        chatId,
+        query.message?.message_id,
+        { inline_keyboard: this._buildSectionsKeyboard(current.data) }
+      ).catch(() => {
+        console.error('[TelegramBotService] section keyboard edit failed code=TELEGRAM_EDIT_FAILED.');
       });
       return;
     }
