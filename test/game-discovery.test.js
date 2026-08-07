@@ -32,11 +32,23 @@ function makeEmptyPage() {
   };
 }
 
-function makeGamePage(games, { url = 'https://tickets.mhaifafc.com/', loginFormVisible = false } = {}) {
+function makeGamePage(games, {
+  url = 'https://tickets.mhaifafc.com/',
+  loginFormVisible = false,
+  stadiumTitles = {},
+} = {}) {
+  let currentUrl = url;
   return {
-    goto: async () => {},
-    url: () => url,
-    locator: () => ({ first: () => ({ isVisible: async () => loginFormVisible }) }),
+    goto: async target => {
+      if (!url.startsWith('https://auth.mhaifafc.com/')) currentUrl = target;
+    },
+    url: () => currentUrl,
+    locator: selector => ({
+      first: () => ({
+        isVisible: async () => selector.includes('input[type="password"]') && loginFormVisible,
+        textContent: async () => stadiumTitles[currentUrl] ?? null,
+      }),
+    }),
     evaluate: async () => games,
   };
 }
@@ -109,6 +121,24 @@ test('extractGamesFromDocument uses the browser document when Playwright passes 
   const games = vm.runInNewContext(`(${extractGamesFromDocument.toString()})()`, context);
   assert.equal(games[0].name, 'משחק 6154');
   assert.equal(games[0].url, anchor.href);
+});
+
+test('discoverGames displays the stadium title from each event page', async () => {
+  const url = 'https://tickets.mhaifafc.com/Stadium/Index?eventId=6154';
+  const page = makeGamePage([{ name: 'שם מקוצר', url }], {
+    stadiumTitles: { [url]: '  בני סכנין - מכבי חיפה 20:30 08/08/2026  ' },
+  });
+  const svc = new GameDiscoveryService({
+    userSessionStore: makeSessionStore(),
+    browserFactory: makeBrowser([page]),
+  });
+
+  const games = await svc.discoverGames('42');
+
+  assert.deepEqual(games, [{
+    name: 'בני סכנין - מכבי חיפה 20:30 08/08/2026',
+    url,
+  }]);
 });
 
 test('discoverGames throws when no session saved', async () => {
