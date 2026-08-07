@@ -674,9 +674,11 @@ class TelegramBotService {
         sections: [],
       };
       this._setState(userId, STATE.AWAITING_SECTIONS, stateData);
-      await this.sendMessage(chatId, `🎮 ${game.name}\nבחר גושים ולחץ ✅ סיימתי:`, {
+      const sectionPrompt = await this.sendMessage(chatId, `🎮 ${game.name}\nבחר גושים ולחץ ✅ סיימתי:`, {
         reply_markup: { inline_keyboard: this._buildSectionsKeyboard(stateData) },
       });
+      stateData.sectionMessageId = sectionPrompt?.message_id;
+      this._setState(userId, STATE.AWAITING_SECTIONS, stateData);
       return;
     }
 
@@ -718,6 +720,10 @@ class TelegramBotService {
         await this.showMainMenu(userId, chatId);
         return;
       }
+      if (!Number.isInteger(current.data.sectionMessageId) || query.message?.message_id !== current.data.sectionMessageId) {
+        await this.showMainMenu(userId, chatId);
+        return;
+      }
       const label = sectionMatch[1];
       if (!current.data.availableSections?.includes(label)) {
         await this.showMainMenu(userId, chatId);
@@ -745,6 +751,10 @@ class TelegramBotService {
       }
       const current = this._getState(userId);
       if (current.state !== STATE.AWAITING_SECTIONS) {
+        await this.showMainMenu(userId, chatId);
+        return;
+      }
+      if (!Number.isInteger(current.data.sectionMessageId) || query.message?.message_id !== current.data.sectionMessageId) {
         await this.showMainMenu(userId, chatId);
         return;
       }
