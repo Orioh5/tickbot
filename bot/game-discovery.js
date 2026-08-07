@@ -53,6 +53,17 @@ class GameDiscoveryService {
           }))
           .filter(g => g.name && g.url);
       });
+      for (const game of games) {
+        try {
+          await page.goto(game.url, NAV_OPTS);
+          await assertAuthenticated(page);
+          const stadiumTitle = await page.locator('.stadium-title').first().textContent({ timeout: 5_000 });
+          if (stadiumTitle?.trim()) game.name = stadiumTitle.trim();
+        } catch (err) {
+          if (err?.code === 'SESSION_EXPIRED') throw err;
+          // Keep the listing-page name when an event page has no stadium title.
+        }
+      }
       await context.close();
       return games;
     } finally {
