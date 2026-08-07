@@ -127,6 +127,14 @@ class TelegramBotService {
     return this._call('sendMessage', { chat_id: chatId, text, ...extra });
   }
 
+  async editMessageReplyMarkup(chatId, messageId, replyMarkup) {
+    return this._call('editMessageReplyMarkup', {
+      chat_id: chatId,
+      message_id: messageId,
+      reply_markup: replyMarkup,
+    });
+  }
+
   async sendMarkdown(chatId, text, extra = {}) {
     return this._call('sendMessage', { chat_id: chatId, text, parse_mode: 'Markdown', ...extra });
   }
@@ -666,9 +674,11 @@ class TelegramBotService {
         sections: [],
       };
       this._setState(userId, STATE.AWAITING_SECTIONS, stateData);
-      await this.sendMessage(chatId, `🎮 ${game.name}\nבחר גושים ולחץ ✅ סיימתי:`, {
+      const sectionPrompt = await this.sendMessage(chatId, `🎮 ${game.name}\nבחר גושים ולחץ ✅ סיימתי:`, {
         reply_markup: { inline_keyboard: this._buildSectionsKeyboard(stateData) },
       });
+      stateData.sectionMessageId = sectionPrompt?.message_id;
+      this._setState(userId, STATE.AWAITING_SECTIONS, stateData);
       return;
     }
 
@@ -710,6 +720,10 @@ class TelegramBotService {
         await this.showMainMenu(userId, chatId);
         return;
       }
+      if (!Number.isInteger(current.data.sectionMessageId) || query.message?.message_id !== current.data.sectionMessageId) {
+        await this.showMainMenu(userId, chatId);
+        return;
+      }
       const label = sectionMatch[1];
       if (!current.data.availableSections?.includes(label)) {
         await this.showMainMenu(userId, chatId);
@@ -720,8 +734,12 @@ class TelegramBotService {
       else selected.add(label);
       current.data.sections = [...selected];
       this._setState(userId, STATE.AWAITING_SECTIONS, current.data);
-      await this.sendMessage(chatId, `נבחרו ${selected.size} גושים:`, {
-        reply_markup: { inline_keyboard: this._buildSectionsKeyboard(current.data) },
+      await this.editMessageReplyMarkup(
+        chatId,
+        query.message?.message_id,
+        { inline_keyboard: this._buildSectionsKeyboard(current.data) }
+      ).catch(() => {
+        console.error('[TelegramBotService] section keyboard edit failed code=TELEGRAM_EDIT_FAILED.');
       });
       return;
     }
@@ -733,6 +751,10 @@ class TelegramBotService {
       }
       const current = this._getState(userId);
       if (current.state !== STATE.AWAITING_SECTIONS) {
+        await this.showMainMenu(userId, chatId);
+        return;
+      }
+      if (!Number.isInteger(current.data.sectionMessageId) || query.message?.message_id !== current.data.sectionMessageId) {
         await this.showMainMenu(userId, chatId);
         return;
       }
