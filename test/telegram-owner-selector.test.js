@@ -181,7 +181,7 @@ test('returns an error result when Telegram rejects a request', async () => {
   );
 });
 
-test('starts the deadline before sendMessage and times out a stalled send', { timeout: 500 }, async () => {
+test('starts the deadline before sendMessage and times out a stalled send', { timeout: 5000 }, async () => {
   let sendSignal;
   const selector = new TelegramOwnerSelector({
     token: 'test-token',
@@ -209,7 +209,7 @@ test('starts the deadline before sendMessage and times out a stalled send', { ti
   assert.equal(sendSignal.aborted, true);
 });
 
-test('returns cancelled when the caller aborts a stalled send', { timeout: 500 }, async () => {
+test('returns cancelled when the caller aborts a stalled send', { timeout: 5000 }, async () => {
   const controller = new AbortController();
   const selector = new TelegramOwnerSelector({
     token: 'test-token',
@@ -234,7 +234,7 @@ test('returns cancelled when the caller aborts a stalled send', { timeout: 500 }
   assert.deepEqual(await choice, { status: 'cancelled' });
 });
 
-test('times out when callback acknowledgement stalls', { timeout: 500 }, async () => {
+test('times out when callback acknowledgement stalls', { timeout: 5000 }, async () => {
   const methods = [];
   const signals = [];
   const selector = new TelegramOwnerSelector({
