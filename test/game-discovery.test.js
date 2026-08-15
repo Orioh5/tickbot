@@ -36,8 +36,10 @@ function makeGamePage(games, {
   url = 'https://tickets.mhaifafc.com/',
   loginFormVisible = false,
   stadiumTitles = {},
+  gamesAfterWait = null,
 } = {}) {
   let currentUrl = url;
+  let visibleGames = games;
   return {
     goto: async target => {
       if (!url.startsWith('https://auth.mhaifafc.com/')) currentUrl = target;
@@ -47,9 +49,10 @@ function makeGamePage(games, {
       first: () => ({
         isVisible: async () => selector.includes('input[type="password"]') && loginFormVisible,
         textContent: async () => stadiumTitles[currentUrl] ?? null,
+        waitFor: async () => { if (gamesAfterWait) visibleGames = gamesAfterWait; },
       }),
     }),
-    evaluate: async () => games,
+    evaluate: async () => visibleGames,
   };
 }
 
@@ -84,6 +87,19 @@ test('discoverGames returns scraped game list', async () => {
   });
   const games = await svc.discoverGames('42');
   assert.deepEqual(games, expected);
+});
+
+test('discoverGames waits for dynamically rendered event links', async () => {
+  const expected = [{
+    name: 'מכבי חיפה - הפועל ירושלים',
+    url: 'https://tickets.mhaifafc.com/Stadium/Index?eventId=6220',
+  }];
+  const svc = new GameDiscoveryService({
+    userSessionStore: makeSessionStore(),
+    browserFactory: makeBrowser([makeGamePage([], { gamesAfterWait: expected })]),
+  });
+
+  assert.deepEqual(await svc.discoverGames('42'), expected);
 });
 
 test('extractGamesFromDocument recognizes current Stadium event links without a text name', () => {

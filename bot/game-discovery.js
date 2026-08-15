@@ -75,6 +75,11 @@ class GameDiscoveryService {
       const page = await context.newPage();
       await page.goto(EVENTS_URL, NAV_OPTS);
       await assertAuthenticated(page);
+      await page.locator([
+        'a[href*="/Stadium/Index"][href*="eventId="]',
+        'a[href*="/event/"]',
+        'a[href*="/EventPage/"]',
+      ].join(', ')).first().waitFor({ state: 'attached', timeout: 10_000 }).catch(() => {});
       const games = await page.evaluate(extractGamesFromDocument);
       for (const game of games) {
         try {
