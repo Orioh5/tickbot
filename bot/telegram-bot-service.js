@@ -881,12 +881,25 @@ class TelegramBotService {
   _buildSectionsKeyboard({ availableSections = [], sections = [], areas = [] }) {
     const selected = new Set(sections);
     if (areas.length) {
+      const grouped = new Map();
+      areas.forEach((area, index) => {
+        const components = area.components?.length ? area.components : [area.label];
+        const stand = Object.entries(STADIUM_CATALOG)
+          .find(([, labels]) => components.some(component => labels.includes(component)))?.[0]
+          || 'גושים מהמפה';
+        if (!grouped.has(stand)) grouped.set(stand, []);
+        grouped.get(stand).push({ area, index });
+      });
+
       const keyboard = [];
-      for (let i = 0; i < areas.length; i += 2) {
-        keyboard.push(areas.slice(i, i + 2).map((area, offset) => ({
-          text: `${area.available ? '🟢' : '⚪'} ${selected.has(area.label) ? '✅ ' : ''}${area.label}`,
-          callback_data: `area:${i + offset}`,
-        })));
+      for (const [stand, entries] of grouped) {
+        keyboard.push([{ text: `— ${stand} —`, callback_data: 'noop' }]);
+        for (let i = 0; i < entries.length; i += 4) {
+          keyboard.push(entries.slice(i, i + 4).map(({ area, index }) => ({
+            text: `${selected.has(area.label) ? '✅ ' : ''}${area.label}`,
+            callback_data: `area:${index}`,
+          })));
+        }
       }
       keyboard.push([{ text: `✅ סיימתי (${selected.size})`, callback_data: 'sections_done' }]);
       return keyboard;

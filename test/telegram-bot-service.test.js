@@ -736,8 +736,39 @@ test('away map shows available and sold-out combined areas as selectable buttons
   await bot._dispatch(makeCallbackUpdate(7, 'game:0'));
 
   const keyboard = fetch.calls.at(-1).body.reply_markup.inline_keyboard.flat();
-  assert.ok(keyboard.some(button => button.text === '🟢 22,24' && button.callback_data === 'area:0'));
-  assert.ok(keyboard.some(button => button.text === '⚪ 27,28' && button.callback_data === 'area:1'));
+  assert.ok(keyboard.some(button => button.text === '22,24' && button.callback_data === 'area:0'));
+  assert.ok(keyboard.some(button => button.text === '27,28' && button.callback_data === 'area:1'));
+});
+
+test('dynamic section map uses the grouped four-column dev layout', async () => {
+  const coordinator = {
+    discoverGames: async () => [{ name: 'Game', url: 'https://tickets.mhaifafc.com/event/1' }],
+    discoverEventMap: async (_userId, game) => ({
+      gameName: game.name,
+      gameUrl: game.url,
+      areas: ['202', '203', '204', '205', '228'].map((label, index) => ({
+        id: String(index), label, components: [label], available: true, source: 'dom',
+      })),
+    }),
+  };
+  const { botFactory } = makeBot({ extraUserIds: ['7'], monitorCoordinator: coordinator });
+  const bot = botFactory(makeFetch(Array.from({ length: 8 }, () => ({ ok: true, result: {} }))));
+
+  await bot._dispatch(makeTextUpdate(7, '/games'));
+  await bot._dispatch(makeCallbackUpdate(7, 'game:0'));
+
+  const keyboard = bot.fetchImpl.calls.at(-1).body.reply_markup.inline_keyboard;
+  assert.deepEqual(keyboard.slice(0, 4), [
+    [{ text: '— Upper Avi Ran —', callback_data: 'noop' }],
+    [
+      { text: '202', callback_data: 'area:0' },
+      { text: '203', callback_data: 'area:1' },
+      { text: '204', callback_data: 'area:2' },
+      { text: '205', callback_data: 'area:3' },
+    ],
+    [{ text: '— South Upper —', callback_data: 'noop' }],
+    [{ text: '228', callback_data: 'area:4' }],
+  ]);
 });
 
 test('game selection stores the section prompt message ID', async () => {
@@ -852,7 +883,7 @@ test('area selection edits the original keyboard without sending a selection mes
   assert.equal(fetch.calls[1].body.chat_id, '7');
   assert.equal(fetch.calls[1].body.message_id, 77);
   const selectedButtons = fetch.calls[1].body.reply_markup.inline_keyboard.flat();
-  assert.equal(selectedButtons.find(button => button.callback_data === 'area:0').text, '🟢 ✅ 22,24');
+  assert.equal(selectedButtons.find(button => button.callback_data === 'area:0').text, '✅ 22,24');
   assert.equal(selectedButtons.find(button => button.callback_data === 'sections_done').text, '✅ סיימתי (1)');
 });
 
