@@ -6,10 +6,35 @@
 
 const EVENTS_URL = 'https://tickets.mhaifafc.com/';
 const NAV_OPTS = { waitUntil: 'networkidle', timeout: 45_000 };
+const EVENTS_NAV_OPTS = { ...NAV_OPTS, waitUntil: 'domcontentloaded' };
 const { makeSalesArea, mergeSalesAreas } = require('./sales-area');
 
 function sessionExpiredError() {
   return Object.assign(new Error('Saved session expired'), { code: 'SESSION_EXPIRED' });
+}
+
+function normalizeTeamName(value) {
+  return value.normalize('NFKC').replace(/[^\p{L}\p{N}]/gu, '').toLowerCase();
+}
+
+function formatOpponentName(name) {
+  const original = String(name || '').trim();
+  const withoutSchedule = original
+    .replace(/\b\d{1,2}:\d{2}\b/g, '')
+    .replace(/\b\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?\b/g, '')
+    .replace(/^חניה\s+(?=מכבי\s+חיפה(?:\s|$))/u, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const sides = withoutSchedule
+    .split(/\s+(?:[-–—]|נגד)\s+/u)
+    .map(side => side.trim())
+    .filter(Boolean);
+  if (sides.length !== 2) return original;
+
+  const maccabi = 'מכביחיפה';
+  const homeIndex = sides.findIndex(side => normalizeTeamName(side) === maccabi);
+  if (homeIndex === -1 || normalizeTeamName(sides[1 - homeIndex]) === maccabi) return original;
+  return sides[1 - homeIndex];
 }
 
 function extractGamesFromDocument(root = document) {
@@ -30,7 +55,9 @@ function extractGamesFromDocument(root = document) {
       const card = anchor.closest?.('.event, .event-card, [data-event], .box');
       const explicitName = anchor.querySelector?.('.event-name, .title, h3, h4')
         ?.textContent?.trim()
-        || card?.querySelector?.('.event-name, .title, h3, h4')?.textContent?.trim();
+        || card?.querySelector?.('.event-name, .title, h3, h4')?.textContent?.trim()
+        || card?.querySelector?.('[aria-label*="אירוע"]')?.getAttribute?.('aria-label')
+          ?.replace(/^(?:קנה כרטיס|מידע נוסף)\s+לאירוע\s+/u, '').trim();
       const anchorText = anchor.textContent?.trim();
       const genericBuyText = /^(?:add_shopping_cart)?\s*להזמנה$/i.test(anchorText || '');
       const name = explicitName
@@ -73,25 +100,17 @@ class GameDiscoveryService {
     try {
       const context = await browser.newContext({ storageState });
       const page = await context.newPage();
-      await page.goto(EVENTS_URL, NAV_OPTS);
+      await page.goto(EVENTS_URL, EVENTS_NAV_OPTS);
       await assertAuthenticated(page);
       await page.locator([
         'a[href*="/Stadium/Index"][href*="eventId="]',
         'a[href*="/event/"]',
         'a[href*="/EventPage/"]',
       ].join(', ')).first().waitFor({ state: 'attached', timeout: 10_000 }).catch(() => {});
-      const games = await page.evaluate(extractGamesFromDocument);
-      for (const game of games) {
-        try {
-          await page.goto(game.url, NAV_OPTS);
-          await assertAuthenticated(page);
-          const stadiumTitle = await page.locator('.stadium-title').first().textContent({ timeout: 5_000 });
-          if (stadiumTitle?.trim()) game.name = stadiumTitle.trim();
-        } catch (err) {
-          if (err?.code === 'SESSION_EXPIRED') throw err;
-          // Keep the listing-page name when an event page has no stadium title.
-        }
-      }
+      const games = (await page.evaluate(extractGamesFromDocument)).map(game => ({
+        ...game,
+        name: formatOpponentName(game.name),
+      }));
       await context.close();
       return games;
     } finally {

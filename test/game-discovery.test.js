@@ -35,7 +35,6 @@ function makeEmptyPage() {
 function makeGamePage(games, {
   url = 'https://tickets.mhaifafc.com/',
   loginFormVisible = false,
-  stadiumTitles = {},
   gamesAfterWait = null,
 } = {}) {
   let currentUrl = url;
@@ -48,7 +47,6 @@ function makeGamePage(games, {
     locator: selector => ({
       first: () => ({
         isVisible: async () => selector.includes('input[type="password"]') && loginFormVisible,
-        textContent: async () => stadiumTitles[currentUrl] ?? null,
         waitFor: async () => { if (gamesAfterWait) visibleGames = gamesAfterWait; },
       }),
     }),
@@ -77,16 +75,19 @@ test('discoverGames returns empty list when no games on page', async () => {
 });
 
 test('discoverGames returns scraped game list', async () => {
-  const expected = [
+  const listed = [
     { name: 'מכבי חיפה - הפועל ת"א', url: 'https://tickets.mhaifafc.com/event/123' },
     { name: 'מכבי חיפה - בית"ר ירושלים', url: 'https://tickets.mhaifafc.com/event/456' },
   ];
   const svc = new GameDiscoveryService({
     userSessionStore: makeSessionStore(),
-    browserFactory: makeBrowser([makeGamePage(expected)]),
+    browserFactory: makeBrowser([makeGamePage(listed)]),
   });
   const games = await svc.discoverGames('42');
-  assert.deepEqual(games, expected);
+  assert.deepEqual(games, [
+    { name: 'הפועל ת"א', url: listed[0].url },
+    { name: 'בית"ר ירושלים', url: listed[1].url },
+  ]);
 });
 
 test('discoverGames waits for dynamically rendered event links', async () => {
@@ -99,7 +100,10 @@ test('discoverGames waits for dynamically rendered event links', async () => {
     browserFactory: makeBrowser([makeGamePage([], { gamesAfterWait: expected })]),
   });
 
-  assert.deepEqual(await svc.discoverGames('42'), expected);
+  assert.deepEqual(await svc.discoverGames('42'), [{
+    name: 'הפועל ירושלים',
+    url: expected[0].url,
+  }]);
 });
 
 test('extractGamesFromDocument recognizes current Stadium event links without a text name', () => {
@@ -122,6 +126,27 @@ test('extractGamesFromDocument recognizes current Stadium event links without a 
   }]);
 });
 
+test('extractGamesFromDocument reads the fixture name from the card accessibility label', () => {
+  const card = {
+    querySelector: () => ({
+      getAttribute: name => name === 'aria-label'
+        ? 'קנה כרטיס לאירוע מכבי חיפה - הפועל רמת גן'
+        : null,
+    }),
+  };
+  const anchor = {
+    href: 'https://tickets.mhaifafc.com/Stadium/Index?eventId=6055',
+    textContent: 'add_shopping_cart להזמנה',
+    querySelector: () => null,
+    closest: () => card,
+  };
+
+  assert.deepEqual(extractGamesFromDocument({ querySelectorAll: () => [anchor] }), [{
+    name: 'מכבי חיפה - הפועל רמת גן',
+    url: anchor.href,
+  }]);
+});
+
 test('extractGamesFromDocument uses the browser document when Playwright passes no argument', () => {
   const anchor = {
     href: 'https://tickets.mhaifafc.com/Stadium/Index?eventId=6154',
@@ -139,11 +164,18 @@ test('extractGamesFromDocument uses the browser document when Playwright passes 
   assert.equal(games[0].url, anchor.href);
 });
 
-test('discoverGames displays the stadium title from each event page', async () => {
-  const url = 'https://tickets.mhaifafc.com/Stadium/Index?eventId=6154';
-  const page = makeGamePage([{ name: 'שם מקוצר', url }], {
-    stadiumTitles: { [url]: '  בני סכנין - מכבי חיפה 20:30 08/08/2026  ' },
-  });
+test('discoverGames uses only the listing page and returns opponent labels', async () => {
+  const listed = [
+    { name: 'מכבי חיפה - בני סכנין 08/08/2026 20:30', url: 'https://tickets.mhaifafc.com/event/1' },
+    { name: 'הפועל באר שבע – מכבי חיפה', url: 'https://tickets.mhaifafc.com/event/2' },
+  ];
+  const navigations = [];
+  const page = makeGamePage(listed);
+  const originalGoto = page.goto;
+  page.goto = async (url, options) => {
+    navigations.push({ url, waitUntil: options.waitUntil });
+    await originalGoto(url, options);
+  };
   const svc = new GameDiscoveryService({
     userSessionStore: makeSessionStore(),
     browserFactory: makeBrowser([page]),
@@ -151,10 +183,14 @@ test('discoverGames displays the stadium title from each event page', async () =
 
   const games = await svc.discoverGames('42');
 
-  assert.deepEqual(games, [{
-    name: 'בני סכנין - מכבי חיפה 20:30 08/08/2026',
-    url,
+  assert.deepEqual(navigations, [{
+    url: 'https://tickets.mhaifafc.com/',
+    waitUntil: 'domcontentloaded',
   }]);
+  assert.deepEqual(games, [
+    { name: 'בני סכנין', url: listed[0].url },
+    { name: 'הפועל באר שבע', url: listed[1].url },
+  ]);
 });
 
 test('discoverGames throws when no session saved', async () => {
