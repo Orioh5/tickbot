@@ -68,7 +68,7 @@ function buildNotificationText(settings, message, {
 }
 
 class Monitor extends EventEmitter {
-  constructor({ ownerSelectorFactory, ownerBrowser, notificationFetch } = {}) {
+  constructor({ ownerSelectorFactory, ownerBrowser, notificationFetch, browserLeaseFactory } = {}) {
     super();
     this.running = false;
     this.browser = null;
@@ -83,6 +83,9 @@ class Monitor extends EventEmitter {
     this._browserCleanupPromises = new WeakMap();
     this._queueDetected = false;
     this._sectorsInfoUrl = null;
+    this._sectorsInfoHeaders = null;
+    this._sectorsInfoReady = null;
+    this._resolveSectorsInfo = null;
     this._ownerSelectorFactory = ownerSelectorFactory || (settings =>
       new TelegramOwnerSelector({
         token: settings.telegramToken,
@@ -96,6 +99,8 @@ class Monitor extends EventEmitter {
     this._ownerSelector = null;
     this._ownerSelectionAbort = null;
     this._notificationFetch = notificationFetch || fetch;
+    this._browserLeaseFactory = browserLeaseFactory || null;
+    this._browserLease = null;
     this._phase = 'stopped';
     this._flowToken = null;
     this._loopPromise = null;
@@ -145,6 +150,7 @@ class Monitor extends EventEmitter {
     this.browser = null;
     this.context = null;
     this.page = null;
+    this._browserLease = null;
     this.emit('status', this.getStatus());
   }
 
@@ -162,6 +168,9 @@ class Monitor extends EventEmitter {
     this._stopRequested = false;
     this._queueDetected = false;
     this._sectorsInfoUrl = null;
+    this._sectorsInfoHeaders = null;
+    this._sectorsInfoReady = null;
+    this._resolveSectorsInfo = null;
     this._sessionExpiryReported = false;
     this._labelToOnclickId = {};
     this._onclickIdToLabel = {};
@@ -238,17 +247,25 @@ class Monitor extends EventEmitter {
     ownerSelectionAbort?.abort();
     if (!browser) return;
 
+    const ownsCurrentBrowser = this.browser === browser;
+    const context = ownsCurrentBrowser ? this.context : null;
+    const lease = ownsCurrentBrowser ? this._browserLease : null;
+
     // Only clear the shared references if they still belong to this browser. This
     // prevents an old loop finishing from clearing a newly-started browser.
-    if (this.browser === browser) {
+    if (ownsCurrentBrowser) {
       this.browser = null;
       this.context = null;
       this.page = null;
+      this._browserLease = null;
     }
 
     let cleanup = this._browserCleanupPromises.get(browser);
     if (!cleanup) {
-      cleanup = Promise.resolve().then(() => browser.close()).catch(() => {});
+      cleanup = Promise.resolve()
+        .then(() => context?.close?.())
+        .then(() => lease ? lease.release() : browser.close())
+        .catch(() => {});
       this._browserCleanupPromises.set(browser, cleanup);
     }
     await cleanup;
@@ -290,7 +307,12 @@ class Monitor extends EventEmitter {
       };
     }
 
-    this.browser = await pw.chromium.launch(launchOpts);
+    if (this._browserLeaseFactory) {
+      this._browserLease = await this._browserLeaseFactory();
+      this.browser = this._browserLease.browser;
+    } else {
+      this.browser = await pw.chromium.launch(launchOpts);
+    }
 
     const ctxOpts = {
       viewport: { width: 1366, height: 768 },
@@ -320,12 +342,21 @@ class Monitor extends EventEmitter {
     });
 
     this.page = await this.context.newPage();
+    this._sectorsInfoReady = new Promise(resolve => { this._resolveSectorsInfo = resolve; });
 
     // Intercept API responses for availability data
     this.page.on('response', async response => {
       const url = response.url();
       if (url.includes('/Stadium/GetWGLSectorsInfo?')) {
         this._sectorsInfoUrl = url;
+        const headers = response.request?.().headers?.() || {};
+        this._sectorsInfoHeaders = {
+          ...(headers.accept && { Accept: headers.accept }),
+          ...(headers['x-theme-id'] && { 'X-Theme-Id': headers['x-theme-id'] }),
+          ...(headers['x-color-id'] && { 'X-Color-Id': headers['x-color-id'] }),
+        };
+        this._resolveSectorsInfo?.();
+        this._resolveSectorsInfo = null;
       }
       if (url.includes('availability') || url.includes('SeatMap') || url.includes('blocks') || url.includes('seats')) {
         try {
@@ -377,6 +408,7 @@ class Monitor extends EventEmitter {
     const apiUrl = this._sectorsInfoUrl || buildSectorsInfoUrl(this.settings.url);
     const response = await this.context.request.post(apiUrl, {
       headers: {
+        ...(this._sectorsInfoHeaders || {}),
         Origin: new URL(this.settings.url).origin,
         Referer: this.settings.url,
         'X-Requested-With': 'XMLHttpRequest',
@@ -424,10 +456,32 @@ class Monitor extends EventEmitter {
 
   async _refreshDomAvailability(reason) {
     this.log(`${reason} Refreshing the event page once...`, 'warning');
-    await this.page.reload({ waitUntil: 'networkidle', timeout: 45000 });
-    await this._sleep(2000);
+    await this.page.reload({ waitUntil: 'domcontentloaded', timeout: 45000 });
+    await this._waitForSeatMapOrLogin();
     await this._assertSessionActive();
     return this._checkAvailability();
+  }
+
+  async _waitForSeatMapOrLogin() {
+    if (this._sectorsInfoReady) {
+      if (typeof this.page?.waitForSelector !== 'function') {
+        await this._sectorsInfoReady;
+        return;
+      }
+      await Promise.race([
+        this._sectorsInfoReady,
+        this.page.waitForSelector(
+          '#queueit_overlay, [id*="queueit"], form:has(input[type="password"])',
+          { state: 'attached', timeout: 15_000 }
+        ).catch(() => null),
+      ]);
+      return;
+    }
+    if (typeof this.page?.waitForSelector !== 'function') return;
+    await this.page.waitForSelector(
+      '#mainStadium canvas, [onclick*="processSectorById"], form:has(input[type="password"])',
+      { state: 'attached', timeout: 15_000 }
+    );
   }
 
   async _pollApiAvailability() {
@@ -488,8 +542,8 @@ class Monitor extends EventEmitter {
         try {
           if (!navigated) {
             this.log('Loading event page...', 'info');
-            await this.page.goto(this.settings.url, { waitUntil: 'networkidle', timeout: 45000 });
-            await this._sleep(2000);
+            await this.page.goto(this.settings.url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+            await this._waitForSeatMapOrLogin();
             await this._assertSessionActive();
             await this._checkAvailability();
             navigated = true;
@@ -554,7 +608,7 @@ class Monitor extends EventEmitter {
     // numbers (e.g. 13) on the map and in the element text ("גוש 13"). Users type visual numbers,
     // so we compare against labels; onclick IDs are kept as a fallback for advanced users.
     const snapshot = await this.page.evaluate(() => ({
-      mapLoaded: !!document.querySelector('svg'),
+      mapLoaded: !!document.querySelector('#mainStadium canvas'),
       candidates: Array.from(document.querySelectorAll('[onclick*="processSectorById"]'))
         .map(el => ({
           onclick: el.getAttribute('onclick') || '',

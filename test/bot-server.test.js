@@ -46,7 +46,7 @@ test('BOT_MAX_BROWSERS accepts only a positive bounded integer', () => {
   }
 });
 
-test('restored monitors start only after bot identity and polling are operational', async () => {
+test('restored monitors start only after bot identity and webhook registration', async () => {
   const order = [];
   let releaseIdentity;
   const identityReady = new Promise(resolve => { releaseIdentity = resolve; });
@@ -55,17 +55,26 @@ test('restored monitors start only after bot identity and polling are operationa
       order.push('identity');
       await identityReady;
     },
-    start: () => { order.push('polling'); },
+    startWebhook: async options => { order.push(['webhook', options]); },
   };
   const monitorCoordinator = {
     restoreActiveMonitors: async () => { order.push('restore'); },
   };
 
-  const startup = startOperationalBot({ bot, monitorCoordinator });
+  const startup = startOperationalBot({
+    bot,
+    monitorCoordinator,
+    webhookUrl: 'https://bot.example/telegram/webhook',
+    webhookSecret: 'secret',
+  });
   await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual(order, ['identity']);
 
   releaseIdentity();
   await startup;
-  assert.deepEqual(order, ['identity', 'polling', 'restore']);
+  assert.deepEqual(order, [
+    'identity',
+    ['webhook', { url: 'https://bot.example/telegram/webhook', secret: 'secret' }],
+    'restore',
+  ]);
 });

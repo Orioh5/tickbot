@@ -649,44 +649,62 @@ test('stale login, games, retry, and setup callbacks cannot mutate any busy life
 
 // ── poll loop stop ──────────────────────────────────────────────────────────
 
-test('start() begins polling and stop() halts it', async () => {
-  let pollCount = 0;
-  const fetch = async (url, opts = {}) => {
-    pollCount++;
-    // Stall until signal aborted
-    return new Promise((resolve, reject) => {
-      if (opts.signal?.aborted) return reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
-      opts.signal?.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })), { once: true });
-    });
-  };
+test('startWebhook registers the public endpoint and accepted update types', async () => {
+  const fetch = makeFetch([{ ok: true, result: true }]);
   const { botFactory } = makeBot();
   const bot = botFactory(fetch);
-  bot.start();
-  await new Promise(r => setTimeout(r, 50));
-  assert.ok(pollCount >= 1);
-  await bot.stop();
+
+  await bot.startWebhook({ url: 'https://bot.example/telegram/webhook', secret: 'secret' });
+
+  assert.deepEqual(fetch.calls, [{
+    method: 'setWebhook',
+    body: {
+      url: 'https://bot.example/telegram/webhook',
+      secret_token: 'secret',
+      allowed_updates: ['message', 'callback_query'],
+    },
+  }]);
 });
 
 test('dispatch logs expose only a stable error code, never exception secrets', async () => {
   const { botFactory } = makeBot();
   const bot = botFactory(makeFetch([]));
-  bot._running = true;
-  bot._call = async () => [{ update_id: 1 }];
   bot._dispatch = async () => {
-    bot._running = false;
     throw new Error('https://user:password@example.test/?token=secret-token');
   };
   const captured = [];
   const originalConsoleError = console.error;
   console.error = (...parts) => { captured.push(parts.join(' ')); };
   try {
-    await bot._loop(new AbortController().signal);
+    await bot.handleUpdate({ update_id: 1 });
   } finally {
     console.error = originalConsoleError;
   }
 
   assert.match(captured.join('\n'), /code=DISPATCH_FAILED/);
   assert.doesNotMatch(captured.join('\n'), /password|example\.test|secret-token/);
+});
+
+test('webhook updates are dispatched in arrival order without overlapping state changes', async () => {
+  const { botFactory } = makeBot();
+  const bot = botFactory(makeFetch([]));
+  const order = [];
+  let releaseFirst;
+  const firstPending = new Promise(resolve => { releaseFirst = resolve; });
+  bot._dispatch = async update => {
+    order.push(`start:${update.update_id}`);
+    if (update.update_id === 1) await firstPending;
+    order.push(`end:${update.update_id}`);
+  };
+
+  const first = bot.handleUpdate({ update_id: 1 });
+  const second = bot.handleUpdate({ update_id: 2 });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(order, ['start:1']);
+
+  releaseFirst();
+  await Promise.all([first, second]);
+  assert.deepEqual(order, ['start:1', 'end:1', 'start:2', 'end:2']);
 });
 
 test('game selection discovers real sections and renders inline section buttons', async () => {

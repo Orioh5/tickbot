@@ -100,6 +100,28 @@ test('does not mark sections sold out when the seat map has not loaded', async (
   assert.equal(monitor.stats.checks, 0);
 });
 
+test('does not treat an unrelated page SVG as a loaded seat map', async () => {
+  const monitor = new Monitor();
+  const previousDocument = global.document;
+  const previousWindow = global.window;
+  monitor.running = true;
+  monitor.settings = { sections: ['202'], pauseOnHit: false };
+  monitor.sections = { 202: { status: 'pending' } };
+  global.document = {
+    querySelector: selector => selector === 'svg' ? {} : null,
+    querySelectorAll: () => [],
+  };
+  global.window = { location: { href: '' } };
+  monitor.page = { evaluate: async callback => callback() };
+
+  try {
+    await assert.rejects(monitor._checkAvailability(), /seat map/i);
+  } finally {
+    global.document = previousDocument;
+    global.window = previousWindow;
+  }
+});
+
 test('notifies only once while a section remains available', async () => {
   const monitor = new Monitor();
   const notifications = [];

@@ -4,6 +4,7 @@
 // Called from server.js after the Express app is ready.
 
 const path = require('path');
+const crypto = require('crypto');
 const UserStore = require('./user-store');
 const SecureLoginService = require('./secure-login-service');
 const UserSessionStore = require('./user-session-store');
@@ -11,6 +12,7 @@ const GameDiscoveryService = require('./game-discovery');
 const MonitorCoordinator = require('./monitor-coordinator');
 const TelegramBotService = require('./telegram-bot-service');
 const MaccabiAuthenticator = require('./maccabi-authenticator');
+const BrowserPool = require('./browser-pool');
 
 const DEFAULT_MAX_BROWSERS = 3;
 const MAX_BROWSER_LIMIT = 32;
@@ -28,9 +30,9 @@ function parseBotMaxBrowsers(value) {
   return parsed;
 }
 
-async function startOperationalBot({ bot, monitorCoordinator }) {
+async function startOperationalBot({ bot, monitorCoordinator, webhookUrl, webhookSecret }) {
   await bot.initializeWithRetry();
-  bot.start();
+  await bot.startWebhook({ url: webhookUrl, secret: webhookSecret });
   await monitorCoordinator.restoreActiveMonitors();
 }
 
@@ -71,6 +73,17 @@ function start({ botServices, baseUrl, env = process.env }) {
   const maccabiAuthenticator = new MaccabiAuthenticator();
 
   const { chromium } = require('playwright');
+  const monitoringBrowserPool = new BrowserPool({
+    launch: () => chromium.launch({
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-blink-features=AutomationControlled',
+        '--disable-dev-shm-usage',
+      ],
+    }),
+  });
   const browserFactory = async (storageState) => {
     const browser = await chromium.launch({ headless: true });
     return browser;
@@ -94,6 +107,7 @@ function start({ botServices, baseUrl, env = process.env }) {
       deregisterCallbackHandler: (...args) => bot?.deregisterCallbackHandler(...args),
     },
     maxConcurrent,
+    browserPool: monitoringBrowserPool,
   });
 
   bot = new TelegramBotService({
@@ -110,14 +124,28 @@ function start({ botServices, baseUrl, env = process.env }) {
   botServices.userSessionStore   = userSessionStore;
   botServices.maccabiAuthenticator = maccabiAuthenticator;
   botServices.loginNotifier = createLoginNotifier(bot);
+  const webhookSecret = crypto.createHash('sha256').update(token).digest('hex');
+  const webhookUrl = `${baseUrl.replace(/\/+$/, '')}/telegram/webhook`;
+  botServices.telegramWebhook = {
+    secret: webhookSecret,
+    handleUpdate: update => bot.handleUpdate(update),
+  };
+  botServices.createOwnerSelector = (userId, chatId) =>
+    monitorCoordinator._makeOwnerSelector(userId, chatId);
 
-  const startupPromise = startOperationalBot({ bot, monitorCoordinator }).then(() => {
+  const startupPromise = startOperationalBot({
+    bot,
+    monitorCoordinator,
+    webhookUrl,
+    webhookSecret,
+  }).then(() => {
     console.log('🤖  Telegram bot started');
   }).catch(() => {
     console.error('[TelegramBotService] startup failed code=BOT_STARTUP_FAILED.');
   });
   // Expose a handled promise for deterministic startup tests and diagnostics.
   bot.startupPromise = startupPromise;
+  bot.monitoringBrowserPool = monitoringBrowserPool;
   return bot;
 }
 

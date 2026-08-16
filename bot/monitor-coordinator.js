@@ -11,6 +11,7 @@ class MonitorCoordinator {
     telegramBotService,
     maxConcurrent = 3,
     MonitorClass = Monitor,
+    browserPool = null,
   }) {
     this.userStore = userStore;
     this.userSessionStore = userSessionStore;
@@ -18,6 +19,7 @@ class MonitorCoordinator {
     this.telegramBotService = telegramBotService;
     this.maxConcurrent = maxConcurrent;
     this.MonitorClass = MonitorClass;
+    this.browserPool = browserPool;
     this.ownsPersistence = true;
 
     // userId → Monitor instance
@@ -301,13 +303,14 @@ class MonitorCoordinator {
 
     const monitor = new this.MonitorClass({
       ownerSelectorFactory: (settings) => this._makeOwnerSelector(uid, chatId, settings),
+      ...(this.browserPool && { browserLeaseFactory: () => this.browserPool.acquire() }),
     });
 
     monitor.on('alert', message => {
       this.telegramBotService?.sendMessage(chatId, message).catch(() => {});
     });
     monitor.on('log', (message, level) => {
-      if (level === 'error') {
+      if (level === 'error' && message.includes('code=MONITOR_POLL_FAILED')) {
         Promise.resolve(this.telegramBotService?.sendMessage(
           chatId,
           '⚠️ אירעה שגיאה זמנית במעקב. המערכת תנסה שוב אוטומטית.'

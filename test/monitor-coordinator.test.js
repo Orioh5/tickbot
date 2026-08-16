@@ -143,6 +143,32 @@ test('startMonitor launches monitor and increments count', async () => {
   assert.equal(coord.getStatus('1').running, true);
 });
 
+test('coordinator gives every monitor a lease from its shared browser pool', async () => {
+  let capturedOptions;
+  class CapturingMonitor extends StubMonitor {
+    constructor(options) {
+      super();
+      capturedOptions = options;
+    }
+  }
+  const expectedLease = { browser: {}, release: async () => {} };
+  const browserPool = { acquire: async () => expectedLease };
+  const coord = new MonitorCoordinator({
+    userStore: makeUserStore(),
+    userSessionStore: makeSessionStore(),
+    gameDiscovery: makeGameDiscovery(),
+    telegramBotService: makeBot(),
+    MonitorClass: CapturingMonitor,
+    browserPool,
+  });
+
+  await coord.startMonitor('1', {
+    gameUrl: 'https://example.com', sections: ['13'], quantity: 1, chatId: '1',
+  });
+
+  assert.equal(await capturedOptions.browserLeaseFactory(), expectedLease);
+});
+
 test('startMonitor throws MONITOR_BUSY on second start for same user', async () => {
   const coord = makeCoord();
   await coord.startMonitor('1', { gameUrl: 'https://x.com', sections: ['1'], chatId: '1' });
@@ -297,7 +323,7 @@ test('secret-bearing monitor errors are replaced with stable Telegram text', asy
 
   coord._monitors.get('1').emit(
     'log',
-    'Playwright failed at https://user:password@example.test/?token=secret-token',
+    'Monitoring check failed code=MONITOR_POLL_FAILED at https://user:password@example.test/?token=secret-token',
     'error'
   );
   await new Promise(resolve => setImmediate(resolve));
@@ -305,6 +331,23 @@ test('secret-bearing monitor errors are replaced with stable Telegram text', asy
   const outgoing = bot.sent.map(message => message.text).join('\n');
   assert.match(outgoing, /שגיאה זמנית/);
   assert.doesNotMatch(outgoing, /password|example\.test|secret-token|Playwright/);
+});
+
+test('handled cart errors do not send a temporary monitoring warning', async () => {
+  const bot = makeBot();
+  const coord = new MonitorCoordinator({
+    userStore: makeUserStore(),
+    userSessionStore: makeSessionStore(),
+    gameDiscovery: makeGameDiscovery(),
+    telegramBotService: bot,
+    MonitorClass: StubMonitor,
+  });
+  await coord.startMonitor('1', { gameUrl: 'u', sections: [], chatId: 'chat1' });
+
+  coord._monitors.get('1').emit('log', 'Cart automation failed code=CART_AUTOMATION_FAILED.', 'error');
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.equal(bot.sent.some(message => /שגיאה זמנית/.test(message.text)), false);
 });
 
 test('discoverGames delegates to gameDiscovery', async () => {

@@ -5,18 +5,85 @@
 // on a specific game page.
 
 const EVENTS_URL = 'https://tickets.mhaifafc.com/';
-const NAV_OPTS = { waitUntil: 'networkidle', timeout: 45_000 };
+const NAV_OPTS = { waitUntil: 'domcontentloaded', timeout: 45_000 };
+const GAMES_CACHE_TTL_MS = 30_000;
+const { makeSalesArea, mergeSalesAreas } = require('./sales-area');
+
+function cloneGames(games) {
+  return games.map(game => ({ ...game }));
+}
 
 function sessionExpiredError() {
   return Object.assign(new Error('Saved session expired'), { code: 'SESSION_EXPIRED' });
+}
+
+function normalizeTeamName(value) {
+  return value.normalize('NFKC').replace(/[^\p{L}\p{N}]/gu, '').toLowerCase();
+}
+
+function formatOpponentName(name) {
+  const original = String(name || '').trim();
+  const withoutSchedule = original
+    .replace(/\b\d{1,2}:\d{2}\b/g, '')
+    .replace(/\b\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?\b/g, '')
+    .replace(/^חניה\s+(?=מכבי\s+חיפה(?:\s|$))/u, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const sides = withoutSchedule
+    .split(/\s+(?:[-–—]|נגד)\s+/u)
+    .map(side => side.trim())
+    .filter(Boolean);
+  if (sides.length !== 2) return original;
+
+  const maccabi = 'מכביחיפה';
+  const homeIndex = sides.findIndex(side => normalizeTeamName(side) === maccabi);
+  if (homeIndex === -1 || normalizeTeamName(sides[1 - homeIndex]) === maccabi) {
+    return original;
+  }
+  return sides[1 - homeIndex];
+}
+
+function extractGamesFromDocument(root = document) {
+  const selector = [
+    'a[href*="/Stadium/Index"][href*="eventId="]',
+    'a[href*="/event/"]',
+    'a[href*="/EventPage/"]',
+  ].join(', ');
+
+  return Array.from(root.querySelectorAll(selector))
+    .map(anchor => {
+      const url = anchor.href;
+      let eventId = null;
+      try {
+        eventId = new URL(url).searchParams.get('eventId');
+      } catch (_) {}
+
+      const card = anchor.closest?.('.event, .event-card, [data-event], .box');
+      const explicitName = anchor.querySelector?.('.event-name, .title, h3, h4')
+        ?.textContent?.trim()
+        || card?.querySelector?.('.event-name, .title, h3, h4')?.textContent?.trim()
+        || card?.querySelector?.('[aria-label*="אירוע"]')?.getAttribute?.('aria-label')
+          ?.replace(/^(?:קנה כרטיס|מידע נוסף)\s+לאירוע\s+/u, '').trim();
+      const anchorText = anchor.textContent?.trim();
+      const genericBuyText = /^(?:add_shopping_cart)?\s*להזמנה$/i.test(anchorText || '');
+      const name = explicitName
+        || (!genericBuyText ? anchorText : null)
+        || (eventId ? `משחק ${eventId}` : null);
+
+      return { name, url };
+    })
+    .filter(game => game.name && game.url);
 }
 
 async function assertAuthenticated(page) {
   let redirectedToLogin = false;
   try {
     const currentUrl = new URL(page.url());
-    redirectedToLogin = currentUrl.hostname === 'auth.mhaifafc.com'
-      && /^\/login(?:\/|$)/i.test(currentUrl.pathname);
+    redirectedToLogin = (currentUrl.hostname === 'auth.mhaifafc.com'
+      && /^\/login(?:\/|$)/i.test(currentUrl.pathname))
+      || (currentUrl.hostname === 'tickets.mhaifafc.com'
+        && /^\/Home\/Index\/?$/i.test(currentUrl.pathname)
+        && /^\/Stadium\/Index(?:\?|$)/i.test(currentUrl.searchParams.get('returnUrl') || ''));
   } catch (_) {
     // A malformed or unavailable URL is not proof that authentication was lost.
   }
@@ -33,39 +100,38 @@ class GameDiscoveryService {
     this.userSessionStore = userSessionStore;
     // browserFactory(storageState) → Playwright browser or compatible stub
     this.browserFactory = browserFactory;
+    this._gamesCache = new Map();
   }
 
   async discoverGames(userId) {
     const storageState = this.userSessionStore.load(userId);
     if (!storageState) throw new Error('No saved session. Use /login first.');
+    const cacheKey = String(userId);
+    const cached = this._gamesCache.get(cacheKey);
+    if (cached?.expiresAt > Date.now()) return cloneGames(cached.games);
     const browser = await this.browserFactory(storageState);
     try {
       const context = await browser.newContext({ storageState });
       const page = await context.newPage();
       await page.goto(EVENTS_URL, NAV_OPTS);
       await assertAuthenticated(page);
-      const games = await page.evaluate(() => {
-        // Each event is a link with a title; selector may need refinement per site structure
-        return Array.from(document.querySelectorAll('a[href*="/event/"], a[href*="/EventPage/"]'))
-          .map(a => ({
-            name: a.querySelector('.event-name, .title, h3, h4')?.textContent?.trim() || a.textContent?.trim(),
-            url: a.href,
-          }))
-          .filter(g => g.name && g.url);
-      });
-      for (const game of games) {
-        try {
-          await page.goto(game.url, NAV_OPTS);
-          await assertAuthenticated(page);
-          const stadiumTitle = await page.locator('.stadium-title').first().textContent({ timeout: 5_000 });
-          if (stadiumTitle?.trim()) game.name = stadiumTitle.trim();
-        } catch (err) {
-          if (err?.code === 'SESSION_EXPIRED') throw err;
-          // Keep the listing-page name when an event page has no stadium title.
-        }
-      }
+      await page.locator([
+        'a[href*="/Stadium/Index"][href*="eventId="]',
+        'a[href*="/event/"]',
+        'a[href*="/EventPage/"]',
+      ].join(', ')).first().waitFor({ state: 'attached', timeout: 5_000 }).catch(() => {});
+      const games = (await page.evaluate(extractGamesFromDocument)).map(game => ({
+        ...game,
+        name: formatOpponentName(game.name),
+      }));
       await context.close();
-      return games;
+      if (games.length > 0) {
+        this._gamesCache.set(cacheKey, {
+          expiresAt: Date.now() + GAMES_CACHE_TTL_MS,
+          games: cloneGames(games),
+        });
+      }
+      return cloneGames(games);
     } finally {
       await browser.close();
     }
@@ -80,6 +146,9 @@ class GameDiscoveryService {
       const page = await context.newPage();
       await page.goto(gameUrl, NAV_OPTS);
       await assertAuthenticated(page);
+      await page.locator(
+        '[onclick*="processSectorById"], form:has(input[type="password"])'
+      ).first().waitFor({ state: 'attached', timeout: 5_000 }).catch(() => {});
       // Uses same extraction logic as monitor._checkAvailability
       const sections = await page.evaluate(() =>
         Array.from(document.querySelectorAll('[onclick*="processSectorById"]'))
@@ -97,6 +166,80 @@ class GameDiscoveryService {
       await browser.close();
     }
   }
+
+  async discoverEventMap(userId, game) {
+    const storageState = this.userSessionStore.load(userId);
+    if (!storageState) throw new Error('No saved session. Use /login first.');
+    const browser = await this.browserFactory(storageState);
+    try {
+      const context = await browser.newContext({ storageState });
+      const page = await context.newPage();
+      await page.goto(game.url, NAV_OPTS);
+      await assertAuthenticated(page);
+      const snapshot = await page.evaluate(() => ({
+        venueName: document
+          .querySelector('[data-venue], .venue, .stadium-name')
+          ?.textContent?.trim() || null,
+        mapLoaded: Boolean(document.querySelector('svg')),
+        clickable: Array.from(
+          document.querySelectorAll('[onclick*="processSectorById"]')
+        ).map(element => ({
+          id: (element.getAttribute('onclick') || '')
+            .match(/processSectorById\((\d+)\)/)?.[1] || null,
+          label: element.textContent.trim(),
+        })).filter(area => area.id && /\d/.test(area.label)),
+        mapLabels: Array.from(document.querySelectorAll(
+          'svg text, svg [data-sector-label], svg [data-sector-name], [data-sector-label], [data-sector-name]'
+        )).map(element =>
+          element.getAttribute('data-sector-label') ||
+          element.getAttribute('data-sector-name') ||
+          element.textContent
+        ).map(text => text?.trim()).filter(text =>
+          /\d/.test(text || '') && !/[A-Za-z]/.test(text || '')
+        ),
+      }));
+
+      const clickable = Array.isArray(snapshot?.clickable)
+        ? snapshot.clickable.map(area => makeSalesArea({
+          ...area,
+          available: true,
+          source: 'dom',
+        }))
+        : [];
+      const mapAreas = Array.isArray(snapshot?.mapLabels)
+        ? snapshot.mapLabels
+          .filter(label => /\d/.test(label || '') && !/[A-Za-z]/.test(label || ''))
+          .map(label => makeSalesArea({
+            label,
+            available: false,
+            source: 'svg',
+          }))
+        : [];
+      const areas = mergeSalesAreas([...mapAreas, ...clickable]);
+      const confidence = areas.length === 0
+        ? 'unknown'
+        : (mapAreas.length > 0 ? 'complete' : 'partial');
+      let eventId = null;
+      try {
+        const parsed = new URL(game.url);
+        eventId = parsed.searchParams.get('eventId');
+      } catch (_) {}
+
+      await context.close();
+      return {
+        eventId,
+        gameName: game.name,
+        gameUrl: game.url,
+        venueName: snapshot?.venueName || null,
+        confidence,
+        areas,
+      };
+    } finally {
+      await browser.close();
+    }
+  }
 }
 
 module.exports = GameDiscoveryService;
+module.exports.extractGamesFromDocument = extractGamesFromDocument;
+module.exports.formatOpponentName = formatOpponentName;
