@@ -57,12 +57,14 @@ Telegram user        ←──Bot API────→  bot services ────�
 
 ## How availability detection works
 
-The ticketing site (`tickets.mhaifafc.com`) renders a seat map SVG. Available sections appear as `li.collection-item` elements with an `onclick` attribute calling `stadium.processSectorById(sectorId)`. Their text content contains the Hebrew "גוש X" (Block X) where X is the visual section number.
+The ticketing site (`tickets.mhaifafc.com`) renders a seat map SVG. Available sales areas appear as elements with an `onclick` attribute calling `stadium.processSectorById(sectorId)`. Their text contains the visual area label.
 
-**Key insight:** Sold-out sections are *absent* from this list — no element exists for them at all. So detection is: read which section numbers appear in the list → present = available, absent = unavailable.
+**Key insight:** Clickable elements define current availability, but they do not define every area that can be monitored. Sold-out areas can be absent from the clickable list while their labels remain in the SVG/map. Game discovery combines both sources: clickable areas are available and map-only areas are unavailable. The sectors API is then used for efficient polling.
+
+Away-stadium maps can group multiple blocks into one purchase target. A label such as `22,24` has one internal sector ID, one quantity dialog, and must remain one canonical sales area throughout selection, monitoring, alerts, and cart automation. Do not split it into independent purchases for `22` and `24`.
 
 **Two different IDs exist per section:**
-- **Visual label** — the small integer shown on the map and in the element text (e.g. `13`, `14`, `15`). This is what users type in the Manual Section Override field.
+- **Visual label** — the label shown on the map and in the element text (e.g. `13` or the combined `22,24`). Dashboard users can enter it in the Manual Section Override field; Telegram users select discovered areas only.
 - **Internal onclick ID** — a large integer used in `processSectorById()` (e.g. `1590`, `1591`, `1592`). This changes per event and is NOT the number to configure.
 
 The monitor extracts both and compares against the visual label (primary), with onclick ID as a fallback:
@@ -73,15 +75,15 @@ Array.from(document.querySelectorAll('[onclick*="processSectorById"]'))
   .map(el => {
     const m = (el.getAttribute('onclick') || '').match(/processSectorById\((\d+)\)/);
     if (!m) return null;
-    const labelMatch = el.textContent.trim().match(/(\d+)/);
-    return { id: m[1], label: labelMatch ? labelMatch[1] : m[1] };
+    const label = normalizeAreaLabel(el.textContent);
+    return { id: m[1], label: label || m[1] };
   })
   .filter(Boolean);
 ```
 
-The Live Log shows both: `Sections on page: [13 (id:1590), 14 (id:1591), 15 (id:1592)]`
+The Live Log shows both: `Sections on page: [13 (id:1590), 22,24 (id:1900)]`
 
-**Section numbers** to configure are the small integers visible on the map (e.g. 13, 14, 15), NOT the large onclick IDs, and NOT the 3-digit numbers in the `STADIUM_ZONES` object in `app.js` (those are fake display numbers for the zone picker UI). Use the **Manual Section Override** field with the visual map numbers.
+**Section labels** to configure are the labels visible on the map (e.g. `13` or `22,24`), NOT the large onclick IDs, and NOT the 3-digit numbers in the `STADIUM_ZONES` object in `app.js` (those are display numbers for the legacy zone picker UI). Dashboard users can use **Manual Section Override**; the Telegram workflow uses the dynamically discovered map areas.
 
 ## Settings and state
 

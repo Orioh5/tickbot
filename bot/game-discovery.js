@@ -5,7 +5,8 @@
 // on a specific game page.
 
 const EVENTS_URL = 'https://tickets.mhaifafc.com/';
-const NAV_OPTS = { waitUntil: 'domcontentloaded', timeout: 45_000 };
+const NAV_OPTS = { waitUntil: 'networkidle', timeout: 45_000 };
+const EVENTS_NAV_OPTS = { ...NAV_OPTS, waitUntil: 'domcontentloaded' };
 const GAMES_CACHE_TTL_MS = 30_000;
 const { makeSalesArea, mergeSalesAreas } = require('./sales-area');
 
@@ -113,13 +114,13 @@ class GameDiscoveryService {
     try {
       const context = await browser.newContext({ storageState });
       const page = await context.newPage();
-      await page.goto(EVENTS_URL, NAV_OPTS);
+      await page.goto(EVENTS_URL, EVENTS_NAV_OPTS);
       await assertAuthenticated(page);
       await page.locator([
         'a[href*="/Stadium/Index"][href*="eventId="]',
         'a[href*="/event/"]',
         'a[href*="/EventPage/"]',
-      ].join(', ')).first().waitFor({ state: 'attached', timeout: 5_000 }).catch(() => {});
+      ].join(', ')).first().waitFor({ state: 'attached', timeout: 10_000 }).catch(() => {});
       const games = (await page.evaluate(extractGamesFromDocument)).map(game => ({
         ...game,
         name: formatOpponentName(game.name),

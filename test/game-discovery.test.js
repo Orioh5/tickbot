@@ -315,7 +315,6 @@ test('discoverSections waits for dynamically rendered section controls', async (
     expected
   );
 });
-
 test('discoverEventMap preserves a combined clickable area and a sold-out map area', async () => {
   const snapshot = {
     venueName: 'Away Ground',

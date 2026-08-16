@@ -422,6 +422,59 @@ test('setMonitoringConfig and getMonitoringConfig round-trip', () => {
   assert.equal(cfg.quantity, 2);
 });
 
+test('monitoring config persists structured event metadata', () => {
+  const store = makeStore();
+  const eventMetadata = {
+    gameName: 'משחק חוץ',
+    venueName: 'Away Ground',
+    confidence: 'complete',
+    areas: [{
+      id: '900',
+      label: '22,24',
+      components: ['22', '24'],
+      available: false,
+      source: 'svg',
+    }],
+  };
+
+  store.setMonitoringConfig('42', {
+    gameUrl: 'https://tickets.mhaifafc.com/Stadium/Index?eventId=7000',
+    sections: ['22,24'],
+    quantity: 2,
+    eventMetadata,
+  });
+
+  assert.deepEqual(store.getMonitoringConfig('42').eventMetadata, eventMetadata);
+});
+
+test('migrates a legacy monitoring table and keeps old rows readable', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mhfc-monitoring-migration-'));
+  const dbPath = path.join(root, 'bot.db');
+  try {
+    const legacy = new DatabaseSync(dbPath);
+    legacy.exec(`
+      CREATE TABLE user_monitoring (
+        telegram_user_id TEXT PRIMARY KEY,
+        game_url TEXT,
+        sections TEXT,
+        quantity INTEGER NOT NULL DEFAULT 1,
+        active INTEGER NOT NULL DEFAULT 0
+      );
+      INSERT INTO user_monitoring
+        (telegram_user_id, game_url, sections, quantity, active)
+      VALUES ('42', 'https://example.com/game', '["13"]', 1, 1);
+    `);
+    legacy.close();
+
+    const store = new UserStore({ dbPath });
+    const columns = store.db.prepare('PRAGMA table_info(user_monitoring)').all();
+    assert.ok(columns.some(column => column.name === 'event_metadata'));
+    assert.equal(store.getMonitoringConfig('42').eventMetadata, undefined);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('setMonitoringConfig upserts on second call', () => {
   const store = makeStore();
   store.setMonitoringConfig('1', { gameUrl: 'https://a.com', sections: ['1'] });

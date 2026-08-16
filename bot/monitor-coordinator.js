@@ -56,6 +56,10 @@ class MonitorCoordinator {
     return this._runDiscovery(userId, () => this.gameDiscovery.discoverSections(userId, gameUrl));
   }
 
+  async discoverEventMap(userId, game) {
+    return this._runDiscovery(userId, () => this.gameDiscovery.discoverEventMap(userId, game));
+  }
+
   async _runDiscovery(userId, operation) {
     const uid = String(userId);
     const expiredGeneration = this._loadSessionRecord(uid)?.generation ?? null;
@@ -247,6 +251,7 @@ class MonitorCoordinator {
           sections: row.sections,
           quantity: row.quantity,
           chatId: uid,
+          ...(row.eventMetadata || {}),
         });
       } catch (error) {
         this.userStore.setMonitoringActive?.(uid, false);
@@ -254,7 +259,16 @@ class MonitorCoordinator {
     }
   }
 
-  async startMonitor(userId, { gameUrl, sections, quantity = 1, chatId }) {
+  async startMonitor(userId, {
+    gameUrl,
+    gameName = null,
+    venueName = null,
+    confidence = 'unknown',
+    areas = [],
+    sections,
+    quantity = 1,
+    chatId,
+  }) {
     const uid = String(userId);
     if (this._monitors.has(uid)) {
       throw Object.assign(new Error('Monitor already running for this user'), { code: 'MONITOR_BUSY' });
@@ -266,7 +280,16 @@ class MonitorCoordinator {
     const session = this._loadSessionRecord(uid);
     if (!session) throw new Error('No saved session. Use /login first.');
 
-    const args = { gameUrl, sections, quantity, chatId };
+    const args = {
+      gameUrl,
+      gameName,
+      venueName,
+      confidence,
+      areas,
+      sections,
+      quantity,
+      chatId,
+    };
     this._persistAcceptedMonitoring(uid, args);
     if (this._monitors.size >= this.maxConcurrent) {
       this._queue.push({ userId: uid, args });
@@ -282,21 +305,52 @@ class MonitorCoordinator {
     return { status: 'started' };
   }
 
-  _persistAcceptedMonitoring(uid, { gameUrl, sections, quantity }) {
+  _persistAcceptedMonitoring(uid, {
+    gameUrl,
+    gameName,
+    venueName,
+    confidence,
+    areas,
+    sections,
+    quantity,
+  }) {
+    const hasEventMetadata = Boolean(gameName || venueName || areas?.length);
+    const eventMetadata = hasEventMetadata
+      ? { gameName, venueName, confidence, areas }
+      : null;
     if (typeof this.userStore.acceptMonitoring === 'function') {
-      this.userStore.acceptMonitoring(uid, { gameUrl, sections, quantity });
+      this.userStore.acceptMonitoring(uid, {
+        gameUrl,
+        sections,
+        quantity,
+        eventMetadata,
+      });
       return;
     }
     // Compatibility for narrow stores. Production UserStore uses the atomic
     // acceptMonitoring transaction above.
     if (typeof this.userStore.setMonitoringConfig === 'function' &&
         typeof this.userStore.setMonitoringActive === 'function') {
-      this.userStore.setMonitoringConfig(uid, { gameUrl, sections, quantity });
+      this.userStore.setMonitoringConfig(uid, {
+        gameUrl,
+        sections,
+        quantity,
+        eventMetadata,
+      });
       this.userStore.setMonitoringActive(uid, true);
     }
   }
 
-  async _startNow(uid, { gameUrl, sections, quantity = 1, chatId }, suppliedSession = null) {
+  async _startNow(uid, {
+    gameUrl,
+    gameName = null,
+    venueName = null,
+    confidence = 'unknown',
+    areas = [],
+    sections,
+    quantity = 1,
+    chatId,
+  }, suppliedSession = null) {
     const session = suppliedSession || this._loadSessionRecord(uid);
     if (!session) throw new Error('No saved session. Use /login first.');
     const { storageState, generation } = session;
@@ -346,6 +400,10 @@ class MonitorCoordinator {
 
     const settings = {
       url: gameUrl,
+      gameName,
+      venueName,
+      confidence,
+      areas,
       sections,
       desiredQuantity: quantity,
       intervalMs: 10_000,

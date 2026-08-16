@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Let Telegram users discover, manually select, monitor, and automatically purchase single or combined sales areas on away-stadium maps hosted by the existing Maccabi ticket site.
+**Goal:** Let Telegram users discover, select, monitor, and automatically purchase single or combined sales areas on away-stadium maps hosted by the existing Maccabi ticket site.
 
-**Architecture:** Add a pure `sales-area` module that owns label parsing, canonicalization, and target resolution. Game discovery will return a structured event map assembled in the browser from clickable sector controls and non-clickable SVG/map labels; Telegram and the coordinator will carry that structure into `Monitor`, which will resolve API IDs and manual component labels to one canonical purchase area.
+**Architecture:** Add a pure `sales-area` module that owns label parsing, canonicalization, and target resolution. Game discovery will return a structured event map assembled in the browser from clickable sector controls and non-clickable SVG/map labels; Telegram and the coordinator will carry that structure into `Monitor`, which will resolve API IDs and legacy component labels to one canonical purchase area.
 
 **Tech Stack:** Node.js 24 CommonJS, `node:test`, Playwright 1.57, SQLite (`node:sqlite`), Telegram Bot API.
 
@@ -12,7 +12,8 @@
 
 - Only support events hosted on `tickets.mhaifafc.com`; do not add external ticket vendors.
 - Treat a combined label such as `22,24` as one purchase target.
-- Allow both discovered sold-out areas and manual area input.
+- Allow both available and sold-out areas discovered from the event map.
+- Do not add manual area input to the Telegram flow.
 - Determine availability from API data and clickability, never from a hard-coded map color.
 - Send “added to cart” only after the existing reservation and cart verification succeeds.
 - Preserve compatibility with existing rows that contain only URL, section strings, and quantity.
@@ -26,7 +27,7 @@
 - Modify `bot/game-discovery.js`: extract event metadata and complete/partial sales-area maps from the event page.
 - Modify `bot/user-store.js`: persist optional structured event metadata in a backward-compatible JSON column.
 - Modify `bot/monitor-coordinator.js`: pass structured event and area metadata into monitor settings while remaining compatible with section-only rows.
-- Modify `bot/telegram-bot-service.js`: render dynamic areas, accept manual input, and preserve canonical targets through confirmation.
+- Modify `bot/telegram-bot-service.js`: render dynamic areas and preserve canonical targets through confirmation.
 - Modify `monitor.js`: map API/DOM availability to canonical combined areas and click the canonical sector once.
 - Modify `test/game-discovery.test.js`, `test/telegram-bot-service.test.js`, `test/monitor-coordinator.test.js`, and `test/availability.test.js`: cover the new behavior at each boundary.
 - Modify `test/user-store.test.js`: cover schema migration and structured metadata round-trips.
@@ -56,7 +57,7 @@ test('normalizes one combined sales area without splitting its purchase identity
   });
 });
 
-test('resolves a component or combined manual target to one canonical area', () => {
+test('resolves a component or combined legacy target to one canonical area', () => {
   const areas = [makeSalesArea({ id: 900, label: '22,24', available: false, source: 'svg' })];
   assert.equal(resolveAreaTarget('22', areas).label, '22,24');
   assert.equal(resolveAreaTarget('24', areas).label, '22,24');
@@ -229,7 +230,7 @@ git add bot/game-discovery.js test/game-discovery.test.js
 git commit -m "feat: discover dynamic away stadium maps"
 ```
 
-### Task 3: Telegram dynamic selection and manual fallback
+### Task 3: Telegram dynamic selection and metadata persistence
 
 **Files:**
 - Modify: `bot/user-store.js`
@@ -270,40 +271,13 @@ test('away map shows available and sold-out combined areas as selectable buttons
   const labels = fetch.calls.at(-1).body.reply_markup.inline_keyboard.flat().map(button => button.text);
   assert.ok(labels.includes('🟢 22,24'));
   assert.ok(labels.includes('⚪ 27,28'));
-  assert.ok(labels.includes('✍️ הזנה ידנית'));
-});
-```
-
-```js
-test('manual component input resolves to the canonical combined area', async () => {
-  const { botFactory } = makeBot({ extraUserIds: ['7'], monitorCoordinator: {} });
-  const fetch = makeFetch(Array.from({ length: 4 }, () => ({ ok: true, result: {} })));
-  const bot = botFactory(fetch);
-  bot._setState('7', 'awaiting_manual_area', {
-    gameUrl: 'https://tickets.mhaifafc.com/Stadium/Index?eventId=7000',
-    areas: [{ id: '900', label: '22,24', components: ['22', '24'], available: false, source: 'svg' }],
-    sections: [],
-  });
-  await bot._dispatch(makeTextUpdate(7, '24'));
-  assert.deepEqual(bot._getState('7').data.sections, ['22,24']);
-});
-
-test('unknown manual area is retained as a monitoring target', async () => {
-  const { botFactory } = makeBot({ extraUserIds: ['7'], monitorCoordinator: {} });
-  const fetch = makeFetch(Array.from({ length: 4 }, () => ({ ok: true, result: {} })));
-  const bot = botFactory(fetch);
-  bot._setState('7', 'awaiting_manual_area', { gameUrl: 'https://tickets.mhaifafc.com/',
-    areas: [], sections: [], confidence: 'partial' });
-  await bot._dispatch(makeTextUpdate(7, '31'));
-  assert.deepEqual(bot._getState('7').data.sections, ['31']);
-  assert.match(fetch.calls.at(-1).body.text, /מיפוי חלקי|ידנית/);
 });
 ```
 
 - [ ] **Step 2: Run focused tests and verify failure**
 
 Run: `node --test test/telegram-bot-service.test.js test/monitor-coordinator.test.js`
-Expected: FAIL because the structured discovery method and manual-area state do not exist.
+Expected: FAIL because the structured discovery method and dynamic-area callbacks do not exist.
 
 - [ ] **Step 3: Add backward-compatible event metadata persistence**
 
@@ -340,16 +314,16 @@ text: `${area.available ? '🟢' : '⚪'} ${selected.has(area.label) ? '✅ ' : 
 callback_data: `area:${index}`,
 ```
 
-Add `manual_area` callback state and accept the next registered-user text as a label. Resolve it with `resolveAreaTarget`; append the canonical label when found or the normalized manual label otherwise. Continue requiring at least one selected target before quantity selection.
+Continue requiring at least one discovered target before quantity selection. When discovery returns no areas, show a clear failure with retry and home actions.
 
 - [ ] **Step 6: Carry event metadata through start and status**
 
-Pass `gameName`, `venueName`, and `areas` to `startMonitor`. Persist them through `eventMetadata`. When restoring active rows, expand `row.eventMetadata || {}` into the start arguments; legacy rows have no areas and therefore behave as manual targets.
+Pass `gameName`, `venueName`, and `areas` to `startMonitor`. Persist them through `eventMetadata`. When restoring active rows, expand `row.eventMetadata || {}` into the start arguments; legacy rows keep their existing section targets.
 
 - [ ] **Step 7: Run focused tests**
 
 Run: `node --test test/user-store.test.js test/telegram-bot-service.test.js test/monitor-coordinator.test.js`
-Expected: PASS for home flows, combined labels, sold-out selection, manual entry, session expiry, and queue lifecycle.
+Expected: PASS for home flows, combined labels, sold-out selection, unknown-map handling, session expiry, and queue lifecycle.
 
 - [ ] **Step 8: Commit Telegram flow**
 

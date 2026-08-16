@@ -62,6 +62,15 @@ class StubMonitor extends EventEmitter {
   }
 }
 
+class CapturingMonitor extends StubMonitor {
+  static lastSettings = null;
+
+  async start(settings) {
+    CapturingMonitor.lastSettings = settings;
+    await super.start(settings);
+  }
+}
+
 class DelayedStopMonitor extends EventEmitter {
   static instances = [];
   static activeBrowsers = 0;
@@ -212,6 +221,53 @@ test('coordinator atomically owns durable configuration for accepted active and 
   assert.equal(coord.getStatus('2').phase, 'queued');
 });
 
+test('coordinator persists dynamic event metadata for accepted monitoring', async () => {
+  const userStore = new UserStore();
+  userStore.createUser({ telegramUserId: '1' });
+  const coord = new MonitorCoordinator({
+    userStore,
+    userSessionStore: makeSessionStore(),
+    gameDiscovery: makeGameDiscovery(),
+    telegramBotService: makeBot(),
+    MonitorClass: StubMonitor,
+  });
+  const areas = [{
+    id: '900', label: '22,24', components: ['22', '24'], available: false, source: 'svg',
+  }];
+
+  await coord.startMonitor('1', {
+    gameUrl: 'u1', gameName: 'Away', venueName: 'Away Ground', confidence: 'complete',
+    areas, sections: ['22,24'], quantity: 2, chatId: '1',
+  });
+
+  assert.deepEqual(userStore.getMonitoringConfig('1').eventMetadata, {
+    gameName: 'Away', venueName: 'Away Ground', confidence: 'complete', areas,
+  });
+});
+
+test('coordinator passes discovered areas into monitor settings', async () => {
+  CapturingMonitor.lastSettings = null;
+  const areas = [{
+    id: '900', label: '22,24', components: ['22', '24'], available: false, source: 'svg',
+  }];
+  const coord = new MonitorCoordinator({
+    userStore: makeUserStore(),
+    userSessionStore: makeSessionStore(),
+    gameDiscovery: makeGameDiscovery(),
+    telegramBotService: makeBot(),
+    MonitorClass: CapturingMonitor,
+  });
+
+  await coord.startMonitor('1', {
+    gameUrl: 'u1', gameName: 'Away', venueName: 'Away Ground', confidence: 'complete',
+    areas, sections: ['22,24'], quantity: 2, chatId: '1',
+  });
+
+  assert.deepEqual(CapturingMonitor.lastSettings.areas, areas);
+  assert.equal(CapturingMonitor.lastSettings.gameName, 'Away');
+  assert.equal(CapturingMonitor.lastSettings.venueName, 'Away Ground');
+});
+
 test('persistence failure rejects before monitor or queue acceptance', async () => {
   const coord = new MonitorCoordinator({
     userStore: {
@@ -354,6 +410,34 @@ test('discoverGames delegates to gameDiscovery', async () => {
   const coord = makeCoord({ gameList: [{ name: 'Game A', url: 'https://x.com/1' }] });
   const games = await coord.discoverGames('1');
   assert.deepEqual(games, [{ name: 'Game A', url: 'https://x.com/1' }]);
+});
+
+test('discoverEventMap delegates the complete game object', async () => {
+  const calls = [];
+  const eventMap = {
+    eventId: '7000',
+    gameName: 'Away',
+    gameUrl: 'https://tickets.mhaifafc.com/Stadium/Index?eventId=7000',
+    venueName: 'Away Ground',
+    confidence: 'complete',
+    areas: [],
+  };
+  const coord = new MonitorCoordinator({
+    userStore: makeUserStore(),
+    userSessionStore: makeSessionStore(),
+    gameDiscovery: {
+      discoverEventMap: async (userId, game) => {
+        calls.push({ userId, game });
+        return eventMap;
+      },
+    },
+    telegramBotService: makeBot(),
+    MonitorClass: StubMonitor,
+  });
+  const game = { name: 'Away', url: eventMap.gameUrl };
+
+  assert.equal(await coord.discoverEventMap('1', game), eventMap);
+  assert.deepEqual(calls, [{ userId: '1', game }]);
 });
 
 test('session expiry stops and removes only the affected active user and offers reconnect', async () => {

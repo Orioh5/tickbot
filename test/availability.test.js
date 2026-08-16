@@ -80,6 +80,74 @@ test('parses visual section labels and internal onclick IDs from page candidates
   ]);
 });
 
+test('preserves a combined sales-area label from a clickable sector', () => {
+  assert.deepEqual(Monitor.parseAvailableSections([
+    { onclick: 'stadium.processSectorById(900)', text: 'גושים 22,24' },
+  ]), [{ id: '900', label: '22,24' }]);
+});
+
+test('initializes the API ID mapping from discovered sold-out area metadata', () => {
+  const monitor = new Monitor();
+  monitor.settings = {
+    sections: ['22,24'],
+    areas: [{
+      id: '900', label: '22,24', components: ['22', '24'], available: false, source: 'svg',
+    }],
+  };
+
+  monitor._initializeAreaMappings();
+
+  assert.equal(monitor._onclickIdToLabel['900'], '22,24');
+  assert.equal(monitor._labelToOnclickId['22,24'], '900');
+});
+
+test('combined area availability triggers one purchase using its canonical label', async () => {
+  const monitor = new Monitor();
+  const purchases = [];
+  monitor.settings = {
+    sections: ['22,24'],
+    pauseOnHit: false,
+    areas: [{
+      id: '900', label: '22,24', components: ['22', '24'], available: false, source: 'svg',
+    }],
+  };
+  monitor.sections = { '22,24': { status: 'pending' } };
+  monitor._notify = async () => {};
+  monitor._tryAutoPurchase = async label => {
+    purchases.push(label);
+    return { cartReady: false, assignments: 'failed' };
+  };
+
+  await monitor._applyAvailability([{ id: '900', label: '22,24' }]);
+
+  assert.deepEqual(purchases, ['22,24']);
+  assert.equal(monitor.sections['22,24'].status, 'available');
+});
+
+test('legacy component target resolves to the canonical combined purchase area', async () => {
+  const monitor = new Monitor();
+  const purchases = [];
+  monitor.settings = {
+    sections: ['22'],
+    pauseOnHit: false,
+    areas: [{
+      id: '900', label: '22,24', components: ['22', '24'], available: false, source: 'svg',
+    }],
+  };
+  monitor.sections = { 22: { status: 'pending' } };
+  monitor._initializeAreaMappings();
+  monitor._notify = async () => {};
+  monitor._tryAutoPurchase = async label => {
+    purchases.push(label);
+    return { cartReady: false, assignments: 'failed' };
+  };
+
+  await monitor._applyAvailability([{ id: '900', label: '22,24' }]);
+
+  assert.deepEqual(purchases, ['22,24']);
+  assert.equal(monitor.sections['22'].status, 'available');
+});
+
 test('does not mark sections sold out when the seat map has not loaded', async () => {
   const monitor = new Monitor();
   let evaluations = 0;

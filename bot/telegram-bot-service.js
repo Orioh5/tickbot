@@ -119,6 +119,14 @@ class TelegramBotService {
     return this._call('sendMessage', { chat_id: chatId, text, ...extra });
   }
 
+  async editMessageReplyMarkup(chatId, messageId, replyMarkup) {
+    return this._call('editMessageReplyMarkup', {
+      chat_id: chatId,
+      message_id: messageId,
+      reply_markup: replyMarkup,
+    });
+  }
+
   async sendMarkdown(chatId, text, extra = {}) {
     return this._call('sendMessage', { chat_id: chatId, text, parse_mode: 'Markdown', ...extra });
   }
@@ -481,7 +489,16 @@ class TelegramBotService {
   }
 
   async _startConfiguredMonitor(userId, chatId, data) {
-    const { gameUrl, sections, quantity } = data;
+    const {
+      gameUrl,
+      gameName = null,
+      venueName = null,
+      confidence = 'unknown',
+      areas = [],
+      sections,
+      quantity,
+    } = data;
+    const eventMetadata = { gameName, venueName, confidence, areas };
     await this.sendMessage(
       chatId,
       `⏳ מתחיל ניטור: גושים ${sections.join(', ')}, ${quantity} כרטיסים...`
@@ -490,13 +507,22 @@ class TelegramBotService {
     });
     const result = await this.monitorCoordinator.startMonitor(userId, {
       gameUrl,
+      gameName,
+      venueName,
+      confidence,
+      areas,
       sections,
       quantity,
       chatId,
     });
     if (!this.monitorCoordinator.ownsPersistence) {
       try {
-        this.userStore.setMonitoringConfig(userId, { gameUrl, sections, quantity });
+        this.userStore.setMonitoringConfig(userId, {
+          gameUrl,
+          sections,
+          quantity,
+          eventMetadata,
+        });
         this.userStore.setMonitoringActive(userId, true);
       } catch (error) {
         try { await this.monitorCoordinator.stopMonitor(userId); } catch (_) {}
@@ -578,9 +604,29 @@ class TelegramBotService {
         await this.showMainMenu(userId, chatId);
         return;
       }
-      let discovered;
+      let eventMap;
+      let dynamicMap = false;
       try {
-        discovered = await this.monitorCoordinator.discoverSections(userId, game.url);
+        if (typeof this.monitorCoordinator.discoverEventMap === 'function') {
+          dynamicMap = true;
+          eventMap = await this.monitorCoordinator.discoverEventMap(userId, game);
+        } else {
+          const discovered = await this.monitorCoordinator.discoverSections(userId, game.url);
+          eventMap = {
+            eventId: null,
+            gameName: game.name,
+            gameUrl: game.url,
+            venueName: null,
+            confidence: 'partial',
+            areas: discovered.map(section => ({
+              ...section,
+              label: String(section.label),
+              components: [String(section.label)],
+              available: true,
+              source: 'dom',
+            })),
+          };
+        }
       } catch (error) {
         if (error?.code === 'SESSION_EXPIRED') return;
         await this.sendMessage(chatId, 'לא ניתן היה לטעון את מפת הגושים כרגע.', {
@@ -590,16 +636,60 @@ class TelegramBotService {
         });
         return;
       }
-      const availableSections = [...new Set(discovered.map(section => String(section.label)))];
-      if (!availableSections.length) {
+      const areas = eventMap.areas || [];
+      if (!areas.length) {
         await this.sendMessage(chatId, `🎮 ${game.name}\nלא נמצאו גושים במפת המשחק כרגע.`);
         return;
       }
-      const stateData = { gameUrl: game.url, availableSections, sections: [] };
-      stateData.gameName = game.name;
+      const stateData = {
+        gameUrl: eventMap.gameUrl || game.url,
+        gameName: eventMap.gameName || game.name,
+        venueName: eventMap.venueName || null,
+        confidence: eventMap.confidence || 'partial',
+        areas: dynamicMap ? areas : [],
+        availableSections: areas.map(area => String(area.label)),
+        sections: [],
+      };
       this._setState(userId, STATE.AWAITING_SECTIONS, stateData);
-      await this.sendMessage(chatId, `🎮 ${game.name}\nבחר גושים ולחץ ✅ סיימתי:`, {
+      const sectionPrompt = await this.sendMessage(chatId, `🎮 ${game.name}\nבחר גושים ולחץ ✅ סיימתי:`, {
         reply_markup: { inline_keyboard: this._buildSectionsKeyboard(stateData) },
+      });
+      stateData.sectionMessageId = sectionPrompt?.message_id;
+      this._setState(userId, STATE.AWAITING_SECTIONS, stateData);
+      return;
+    }
+
+    const areaMatch = data.match(/^area:(\d+)$/);
+    if (areaMatch) {
+      if (!this._configurationLifecycleIsIdle(userId)) {
+        await this.showMainMenu(userId, chatId);
+        return;
+      }
+      const current = this._getState(userId);
+      if (current.state !== STATE.AWAITING_SECTIONS) {
+        await this.showMainMenu(userId, chatId);
+        return;
+      }
+      if (!Number.isInteger(current.data.sectionMessageId) || query.message?.message_id !== current.data.sectionMessageId) {
+        await this.showMainMenu(userId, chatId);
+        return;
+      }
+      const area = current.data.areas?.[Number(areaMatch[1])];
+      if (!area) {
+        await this.showMainMenu(userId, chatId);
+        return;
+      }
+      const selected = new Set(current.data.sections || []);
+      if (selected.has(area.label)) selected.delete(area.label);
+      else selected.add(area.label);
+      current.data.sections = [...selected];
+      this._setState(userId, STATE.AWAITING_SECTIONS, current.data);
+      await this.editMessageReplyMarkup(
+        chatId,
+        query.message?.message_id,
+        { inline_keyboard: this._buildSectionsKeyboard(current.data) }
+      ).catch(() => {
+        console.error('[TelegramBotService] section keyboard edit failed code=TELEGRAM_EDIT_FAILED.');
       });
       return;
     }
@@ -615,6 +705,10 @@ class TelegramBotService {
         await this.showMainMenu(userId, chatId);
         return;
       }
+      if (!Number.isInteger(current.data.sectionMessageId) || query.message?.message_id !== current.data.sectionMessageId) {
+        await this.showMainMenu(userId, chatId);
+        return;
+      }
       const label = sectionMatch[1];
       if (!current.data.availableSections?.includes(label)) {
         await this.showMainMenu(userId, chatId);
@@ -625,8 +719,12 @@ class TelegramBotService {
       else selected.add(label);
       current.data.sections = [...selected];
       this._setState(userId, STATE.AWAITING_SECTIONS, current.data);
-      await this.sendMessage(chatId, `נבחרו ${selected.size} גושים:`, {
-        reply_markup: { inline_keyboard: this._buildSectionsKeyboard(current.data) },
+      await this.editMessageReplyMarkup(
+        chatId,
+        query.message?.message_id,
+        { inline_keyboard: this._buildSectionsKeyboard(current.data) }
+      ).catch(() => {
+        console.error('[TelegramBotService] section keyboard edit failed code=TELEGRAM_EDIT_FAILED.');
       });
       return;
     }
@@ -638,6 +736,10 @@ class TelegramBotService {
       }
       const current = this._getState(userId);
       if (current.state !== STATE.AWAITING_SECTIONS) {
+        await this.showMainMenu(userId, chatId);
+        return;
+      }
+      if (!Number.isInteger(current.data.sectionMessageId) || query.message?.message_id !== current.data.sectionMessageId) {
         await this.showMainMenu(userId, chatId);
         return;
       }
@@ -753,8 +855,32 @@ class TelegramBotService {
     return this._getMenuSnapshot(userId).lifecycle === 'idle';
   }
 
-  _buildSectionsKeyboard({ availableSections = [], sections = [] }) {
+  _buildSectionsKeyboard({ availableSections = [], sections = [], areas = [] }) {
     const selected = new Set(sections);
+    if (areas.length) {
+      const grouped = new Map();
+      areas.forEach((area, index) => {
+        const components = area.components?.length ? area.components : [area.label];
+        const stand = Object.entries(STADIUM_CATALOG)
+          .find(([, labels]) => components.some(component => labels.includes(component)))?.[0]
+          || 'גושים מהמפה';
+        if (!grouped.has(stand)) grouped.set(stand, []);
+        grouped.get(stand).push({ area, index });
+      });
+
+      const keyboard = [];
+      for (const [stand, entries] of grouped) {
+        keyboard.push([{ text: `— ${stand} —`, callback_data: 'noop' }]);
+        for (let i = 0; i < entries.length; i += 4) {
+          keyboard.push(entries.slice(i, i + 4).map(({ area, index }) => ({
+            text: `${selected.has(area.label) ? '✅ ' : ''}${area.label}`,
+            callback_data: `area:${index}`,
+          })));
+        }
+      }
+      keyboard.push([{ text: `✅ סיימתי (${selected.size})`, callback_data: 'sections_done' }]);
+      return keyboard;
+    }
     const grouped = new Map();
     for (const label of availableSections) {
       const stand = Object.entries(STADIUM_CATALOG)
