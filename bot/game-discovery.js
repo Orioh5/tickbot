@@ -7,7 +7,12 @@
 const EVENTS_URL = 'https://tickets.mhaifafc.com/';
 const NAV_OPTS = { waitUntil: 'networkidle', timeout: 45_000 };
 const EVENTS_NAV_OPTS = { ...NAV_OPTS, waitUntil: 'domcontentloaded' };
+const GAMES_CACHE_TTL_MS = 30_000;
 const { makeSalesArea, mergeSalesAreas } = require('./sales-area');
+
+function cloneGames(games) {
+  return games.map(game => ({ ...game }));
+}
 
 function sessionExpiredError() {
   return Object.assign(new Error('Saved session expired'), { code: 'SESSION_EXPIRED' });
@@ -33,7 +38,9 @@ function formatOpponentName(name) {
 
   const maccabi = 'מכביחיפה';
   const homeIndex = sides.findIndex(side => normalizeTeamName(side) === maccabi);
-  if (homeIndex === -1 || normalizeTeamName(sides[1 - homeIndex]) === maccabi) return original;
+  if (homeIndex === -1 || normalizeTeamName(sides[1 - homeIndex]) === maccabi) {
+    return original;
+  }
   return sides[1 - homeIndex];
 }
 
@@ -73,8 +80,11 @@ async function assertAuthenticated(page) {
   let redirectedToLogin = false;
   try {
     const currentUrl = new URL(page.url());
-    redirectedToLogin = currentUrl.hostname === 'auth.mhaifafc.com'
-      && /^\/login(?:\/|$)/i.test(currentUrl.pathname);
+    redirectedToLogin = (currentUrl.hostname === 'auth.mhaifafc.com'
+      && /^\/login(?:\/|$)/i.test(currentUrl.pathname))
+      || (currentUrl.hostname === 'tickets.mhaifafc.com'
+        && /^\/Home\/Index\/?$/i.test(currentUrl.pathname)
+        && /^\/Stadium\/Index(?:\?|$)/i.test(currentUrl.searchParams.get('returnUrl') || ''));
   } catch (_) {
     // A malformed or unavailable URL is not proof that authentication was lost.
   }
@@ -91,11 +101,15 @@ class GameDiscoveryService {
     this.userSessionStore = userSessionStore;
     // browserFactory(storageState) → Playwright browser or compatible stub
     this.browserFactory = browserFactory;
+    this._gamesCache = new Map();
   }
 
   async discoverGames(userId) {
     const storageState = this.userSessionStore.load(userId);
     if (!storageState) throw new Error('No saved session. Use /login first.');
+    const cacheKey = String(userId);
+    const cached = this._gamesCache.get(cacheKey);
+    if (cached?.expiresAt > Date.now()) return cloneGames(cached.games);
     const browser = await this.browserFactory(storageState);
     try {
       const context = await browser.newContext({ storageState });
@@ -112,7 +126,13 @@ class GameDiscoveryService {
         name: formatOpponentName(game.name),
       }));
       await context.close();
-      return games;
+      if (games.length > 0) {
+        this._gamesCache.set(cacheKey, {
+          expiresAt: Date.now() + GAMES_CACHE_TTL_MS,
+          games: cloneGames(games),
+        });
+      }
+      return cloneGames(games);
     } finally {
       await browser.close();
     }
@@ -127,6 +147,9 @@ class GameDiscoveryService {
       const page = await context.newPage();
       await page.goto(gameUrl, NAV_OPTS);
       await assertAuthenticated(page);
+      await page.locator(
+        '[onclick*="processSectorById"], form:has(input[type="password"])'
+      ).first().waitFor({ state: 'attached', timeout: 5_000 }).catch(() => {});
       // Uses same extraction logic as monitor._checkAvailability
       const sections = await page.evaluate(() =>
         Array.from(document.querySelectorAll('[onclick*="processSectorById"]'))
@@ -220,3 +243,4 @@ class GameDiscoveryService {
 
 module.exports = GameDiscoveryService;
 module.exports.extractGamesFromDocument = extractGamesFromDocument;
+module.exports.formatOpponentName = formatOpponentName;

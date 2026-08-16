@@ -14,7 +14,8 @@
       "Bash(xargs -I{} sh -c 'echo ==={}; cat {}')",
       "Bash(git add *)",
       "Bash(git commit -m ' *)",
-      "Bash(git push *)"
+      "Bash(git push *)",
+      "Bash(gh pr *)"
     ]
   }
 }

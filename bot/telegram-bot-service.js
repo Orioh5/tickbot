@@ -1,6 +1,5 @@
 'use strict';
 
-const POLL_TIMEOUT_S = 25; // long-poll seconds
 const STADIUM_CATALOG = require('./stadium-catalog');
 const BotMenu = require('./bot-menu');
 
@@ -63,10 +62,7 @@ class TelegramBotService {
     this.fetchImpl = fetchImpl;
     this.now = now;
     this.botUsername = null;
-
-    this._offset = 0;
-    this._running = false;
-    this._stopController = null;
+    this._updateQueue = Promise.resolve();
 
     // nonce → { userId, handler, timer }
     this._callbackHandlers = new Map();
@@ -77,11 +73,12 @@ class TelegramBotService {
 
   // ── Lifecycle ───────────────────────────────────────────────────────────────
 
-  start() {
-    if (this._running) return;
-    this._running = true;
-    this._stopController = new AbortController();
-    this._loop(this._stopController.signal).catch(() => {});
+  async startWebhook({ url, secret }) {
+    await this._call('setWebhook', {
+      url,
+      secret_token: secret,
+      allowed_updates: ['message', 'callback_query'],
+    });
   }
 
   async initialize() {
@@ -114,11 +111,6 @@ class TelegramBotService {
 
   setBotUsername(username) {
     this.botUsername = username;
-  }
-
-  async stop() {
-    this._running = false;
-    this._stopController?.abort();
   }
 
   // ── Public: send and callbacks ─────────────────────────────────────────────
@@ -176,28 +168,13 @@ class TelegramBotService {
 
   // ── Poll loop ──────────────────────────────────────────────────────────────
 
-  async _loop(signal) {
-    while (this._running && !signal.aborted) {
-      try {
-        const updates = await this._call('getUpdates', {
-          offset: this._offset,
-          timeout: POLL_TIMEOUT_S,
-          allowed_updates: ['message', 'callback_query'],
-        }, { signal });
-        for (const update of updates) {
-          this._offset = Math.max(this._offset, update.update_id + 1);
-          await this._dispatch(update).catch(err => {
-            console.error(
-              `[TelegramBotService] dispatch failed code=${safeErrorCode(err, 'DISPATCH_FAILED')}.`
-            );
-          });
-        }
-      } catch (err) {
-        if (signal.aborted || err.name === 'AbortError') break;
-        // Brief back-off on network errors
-        await new Promise(r => setTimeout(r, 3000));
-      }
-    }
+  handleUpdate(update) {
+    this._updateQueue = this._updateQueue.then(() => this._dispatch(update)).catch(err => {
+      console.error(
+        `[TelegramBotService] dispatch failed code=${safeErrorCode(err, 'DISPATCH_FAILED')}.`
+      );
+    });
+    return this._updateQueue;
   }
 
   async _dispatch(update) {

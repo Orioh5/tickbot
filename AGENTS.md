@@ -42,7 +42,7 @@ Core dashboard files:
 Core Telegram files:
 
 - **`bot/bot-server.js`** — wires the Telegram service, encrypted per-user session store, game discovery, and monitor coordinator into `server.js`.
-- **`bot/telegram-bot-service.js`** — long polling, authorization, deep-link invitations, contextual inline-button menus, and per-user conversation state.
+- **`bot/telegram-bot-service.js`** — Telegram webhook handling, authorization, deep-link invitations, contextual inline-button menus, and per-user conversation state.
 - **`bot/monitor-coordinator.js`** — owns one monitor per user, enforces `BOT_MAX_BROWSERS`, queues excess work, restores active monitors, and isolates session-expiry cleanup.
 - **`bot/user-store.js`** — SQLite users, hash-only invite records, one-time login tokens, and persisted monitor configuration in `DATA_DIR/bot.db`.
 - **`bot/user-session-store.js`** — AES-256-GCM encrypted Playwright storage state in one `DATA_DIR/session-<telegram-user-id>.enc` file per user.
@@ -158,7 +158,7 @@ Auth and hosting:
 - `SESSION_SECRET` — signs session cookies; set this in production or every restart logs everyone out
 - `ENCRYPTION_KEY` — required; encrypts secret settings and per-user Telegram browser sessions
 - `DATA_DIR` — persistent directory for `settings.json`, `state.json`, `bot.db`, and encrypted per-user sessions
-- `BASE_URL` — externally reachable origin used in one-time `/bot-login` links; it must match the deployed server origin
+- `BASE_URL` — externally reachable HTTPS origin used for Telegram webhooks and one-time `/bot-login` links; it must match the deployed server origin
 
 Telegram bot:
 - `BOT_TOKEN` — optional alias that takes precedence over `TELEGRAM_TOKEN`

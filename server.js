@@ -22,6 +22,8 @@ const botServices = {
   userSessionStore: null,
   maccabiAuthenticator: null,
   loginNotifier: null,
+  telegramWebhook: null,
+  createOwnerSelector: null,
 };
 
 let server = null;
@@ -116,7 +118,16 @@ function broadcast(data) {
 
 // ── Monitor setup ─────────────────────────────────────────────────────────
 
-const monitor = new Monitor();
+function createDashboardOwnerSelector(services, settings) {
+  const chatId = String(settings.telegramChatId);
+  return typeof services.createOwnerSelector === 'function'
+    ? services.createOwnerSelector(chatId, chatId)
+    : { chooseOwner: async () => ({ status: 'error', message: 'Telegram bot unavailable' }) };
+}
+
+const monitor = new Monitor({
+  ownerSelectorFactory: settings => createDashboardOwnerSelector(botServices, settings),
+});
 
 monitor.on('log',      (message, level) => broadcast({ type: 'log', message, level, timestamp: new Date().toISOString() }));
 monitor.on('status',   status           => broadcast({ type: 'status', status }));
@@ -136,6 +147,17 @@ app.use(express.json());
 // Routes reachable without a session — must come before the auth gate.
 app.get('/health', (req, res) => res.status(200).json({ status: 'ok' }));
 app.get('/login.html', (req, res) => res.sendFile(path.join(__dirname, 'public', 'login.html')));
+app.post('/telegram/webhook', (req, res) => {
+  const webhook = injectedBotServices.telegramWebhook;
+  if (!webhook) return res.sendStatus(503);
+  if (!timingSafeEqualStr(req.get('X-Telegram-Bot-Api-Secret-Token') || '', webhook.secret)) {
+    return res.sendStatus(403);
+  }
+  res.sendStatus(200);
+  Promise.resolve().then(() => webhook.handleUpdate(req.body)).catch(() => {
+    console.error('[TelegramBotService] webhook dispatch failed code=WEBHOOK_DISPATCH_FAILED.');
+  });
+});
 
 // ── Bot login flow ─────────────────────────────────────────────────────────
 // GET: show a login form (after validating the one-time token without consuming it).
@@ -406,6 +428,7 @@ if (require.main === module) {
 module.exports = {
   createApp,
   startServer,
+  createDashboardOwnerSelector,
   PORT,
   botServices,
   get server() { return server; },

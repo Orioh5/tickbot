@@ -30,6 +30,73 @@ test('launch uses the per-user storageState supplied in settings', async () => {
   }
 });
 
+test('an injected browser lease closes only its context when the monitor stops', async () => {
+  let contextCloses = 0;
+  let releases = 0;
+  let browserCloses = 0;
+  const context = {
+    route: async () => {},
+    newPage: async () => ({ on: () => {} }),
+    close: async () => { contextCloses++; },
+  };
+  const browser = {
+    newContext: async () => context,
+    close: async () => { browserCloses++; },
+  };
+  const monitor = new Monitor({
+    browserLeaseFactory: async () => ({
+      browser,
+      release: async () => { releases++; },
+    }),
+  });
+  monitor.settings = { headful: false, storageState: { cookies: [], origins: [] } };
+
+  await monitor._launch();
+  await monitor._cleanupBrowser(browser);
+
+  assert.equal(contextCloses, 1);
+  assert.equal(releases, 1);
+  assert.equal(browserCloses, 0);
+});
+
+test('launch captures the ticket-site headers required for sectors polling', async () => {
+  let onResponse;
+  const context = {
+    route: async () => {},
+    newPage: async () => ({
+      on: (event, handler) => { if (event === 'response') onResponse = handler; },
+    }),
+  };
+  const monitor = new Monitor({
+    browserLeaseFactory: async () => ({
+      browser: { newContext: async () => context },
+      release: async () => {},
+    }),
+  });
+  monitor.settings = { headful: false, storageState: { cookies: [], origins: [] } };
+
+  await monitor._launch();
+  let ready = false;
+  const wait = monitor._waitForSeatMapOrLogin().then(() => { ready = true; });
+  await Promise.resolve();
+  assert.equal(ready, false);
+  await onResponse({
+    url: () => 'https://tickets.mhaifafc.com/Stadium/GetWGLSectorsInfo?eventId=6055',
+    request: () => ({ headers: () => ({
+      accept: 'application/json, text/plain, */*',
+      'x-theme-id': 'theme',
+      'x-color-id': 'color',
+    }) }),
+  });
+  await wait;
+
+  assert.deepEqual(monitor._sectorsInfoHeaders, {
+    Accept: 'application/json, text/plain, */*',
+    'X-Theme-Id': 'theme',
+    'X-Color-Id': 'color',
+  });
+});
+
 function settings(overrides = {}) {
   return {
     url: 'https://tickets.mhaifafc.com/event',
@@ -489,6 +556,32 @@ test('monitor uses one initial page load and then polls the API without reloadin
   assert.equal(reloads, 0);
 });
 
+test('initial navigation waits for the seat map instead of network idle or a fixed delay', async () => {
+  const monitor = new Monitor();
+  let gotoOptions;
+  let waitedFor;
+  let waitOptions;
+  const sleeps = [];
+  monitor.running = true;
+  monitor.settings = settings();
+  monitor.page = {
+    goto: async (_url, options) => { gotoOptions = options; },
+    waitForSelector: async (selector, options) => {
+      waitedFor = selector;
+      waitOptions = options;
+    },
+  };
+  monitor._sleep = async duration => { sleeps.push(duration); };
+  monitor._checkAvailability = async () => { monitor.running = false; };
+
+  await monitor._runLoop();
+
+  assert.equal(gotoOptions.waitUntil, 'domcontentloaded');
+  assert.match(waitedFor, /mainStadium/);
+  assert.equal(waitOptions.state, 'attached');
+  assert.deepEqual(sleeps, []);
+});
+
 test('fetches sectors info for the event ID using the authenticated browser context', async () => {
   const monitor = new Monitor();
   let requestedUrl;
@@ -497,6 +590,11 @@ test('fetches sectors info for the event ID using the authenticated browser cont
   monitor.settings = settings({
     url: 'https://tickets.mhaifafc.com/Stadium/Index?eventId=6121',
   });
+  monitor._sectorsInfoHeaders = {
+    Accept: 'application/json, text/plain, */*',
+    'X-Theme-Id': 'theme',
+    'X-Color-Id': 'color',
+  };
   monitor.context = {
     request: {
       post: async (url, options) => {
@@ -533,6 +631,8 @@ test('fetches sectors info for the event ID using the authenticated browser cont
   );
   assert.equal(requestedOptions.headers.Referer, monitor.settings.url);
   assert.equal(requestedOptions.headers.Origin, 'https://tickets.mhaifafc.com');
+  assert.equal(requestedOptions.headers['X-Theme-Id'], 'theme');
+  assert.equal(requestedOptions.headers['X-Color-Id'], 'color');
   assert.equal(requestedOptions.data, '');
   assert.deepEqual(result.sectors, [{ id: '1648', freeSeats: 1 }]);
 });
