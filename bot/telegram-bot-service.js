@@ -2,12 +2,14 @@
 
 const STADIUM_CATALOG = require('./stadium-catalog');
 const BotMenu = require('./bot-menu');
+const { normalizeAreaLabel } = require('./sales-area');
 
 // Conversation states tracked per user
 const STATE = {
   IDLE: 'idle',
   AWAITING_GAME: 'awaiting_game',
   AWAITING_SECTIONS: 'awaiting_sections',
+  AWAITING_MANUAL_SECTIONS: 'awaiting_manual_sections',
   AWAITING_QUANTITY: 'awaiting_quantity',
   AWAITING_CONFIRMATION: 'awaiting_confirmation',
   AWAITING_CHANGE_CONFIRMATION: 'awaiting_change_confirmation',
@@ -220,6 +222,21 @@ class TelegramBotService {
     }
 
     if (this._isUser(userId)) {
+      const current = this._getState(userId);
+      if (current.state === STATE.AWAITING_MANUAL_SECTIONS) {
+        const parts = text.split(/[\s,;]+/).filter(Boolean);
+        if (!parts.length || parts.length > 50 ||
+            parts.some(part => !/^\d{1,6}(?:\/\d{1,6})*$/.test(part))) {
+          await this.sendMessage(chatId,
+            'שלח רק מספרי גושים. הפרד גושים ברווח או בפסיק, ואזור משולב בלוכסן. לדוגמה: 13 14 22/24'
+          );
+          return;
+        }
+        current.data.sections = [...new Set(parts.map(normalizeAreaLabel))];
+        this._setState(userId, STATE.AWAITING_QUANTITY, current.data);
+        await this._sendQuantityPrompt(chatId);
+        return;
+      }
       await this.showMainMenu(userId, chatId);
       return;
     }
@@ -638,7 +655,18 @@ class TelegramBotService {
       }
       const areas = eventMap.areas || [];
       if (!areas.length) {
-        await this.sendMessage(chatId, `🎮 ${game.name}\nלא נמצאו גושים במפת המשחק כרגע.`);
+        this._setState(userId, STATE.AWAITING_MANUAL_SECTIONS, {
+          gameUrl: eventMap.gameUrl || game.url,
+          gameName: eventMap.gameName || game.name,
+          venueName: eventMap.venueName || null,
+          confidence: eventMap.confidence || 'unknown',
+          areas: [],
+          sections: [],
+        });
+        await this.sendMessage(chatId,
+          `🎮 ${game.name}\nאין גושים זמינים כרגע. שלח את מספרי הגושים שברצונך לנטר.\n` +
+          `הפרד גושים ברווח או בפסיק; לאזור משולב השתמש בלוכסן. לדוגמה: 13 14 22/24`
+        );
         return;
       }
       const stateData = {
