@@ -809,6 +809,68 @@ test('game selection stores the section prompt message ID', async () => {
   assert.equal(bot._getState('7').data.sectionMessageId, 88);
 });
 
+test('sold-out game accepts manual sections and continues to quantity selection', async () => {
+  const coordinator = {
+    discoverEventMap: async (_userId, game) => ({
+      gameUrl: game.url,
+      gameName: game.name,
+      venueName: 'Away Ground',
+      confidence: 'unknown',
+      areas: [],
+    }),
+    getStatus: () => null,
+  };
+  const { botFactory } = makeBot({ extraUserIds: ['7'], monitorCoordinator: coordinator });
+  const fetch = makeFetch(Array.from({ length: 4 }, () => ({ ok: true, result: {} })));
+  const bot = botFactory(fetch);
+  bot._setState('7', 'awaiting_game', {
+    games: [{ name: 'Game', url: 'https://tickets.mhaifafc.com/game/1' }],
+  });
+
+  await bot._dispatch(makeCallbackUpdate(7, 'game:0'));
+
+  assert.equal(bot._getState('7').state, 'awaiting_manual_sections');
+  assert.match(fetch.calls.at(-1).body.text, /שלח את מספרי הגושים/);
+
+  await bot._dispatch(makeTextUpdate(7, '13, 14 13'));
+
+  assert.equal(bot._getState('7').state, 'awaiting_quantity');
+  assert.deepEqual(bot._getState('7').data.sections, ['13', '14']);
+  assert.equal(bot._getState('7').data.venueName, 'Away Ground');
+  assert.equal(bot._getState('7').data.confidence, 'unknown');
+  assert.deepEqual(
+    fetch.calls.at(-1).body.reply_markup.inline_keyboard.flat().map(button => button.callback_data),
+    ['quantity:1', 'quantity:2', 'quantity:3', 'quantity:4']
+  );
+});
+
+test('manual section input rejects non-numeric values without advancing', async () => {
+  const { botFactory } = makeBot({ extraUserIds: ['7'] });
+  const fetch = makeFetch([{ ok: true, result: {} }]);
+  const bot = botFactory(fetch);
+  bot._setState('7', 'awaiting_manual_sections', {
+    gameUrl: 'https://tickets.mhaifafc.com/game/1', gameName: 'Game', sections: [],
+  });
+
+  await bot._dispatch(makeTextUpdate(7, '13, hello'));
+
+  assert.equal(bot._getState('7').state, 'awaiting_manual_sections');
+  assert.match(fetch.calls.at(-1).body.text, /רק מספרי גושים/);
+});
+
+test('manual section input supports mixed separators and keeps combined areas intact', async () => {
+  const { botFactory } = makeBot({ extraUserIds: ['7'] });
+  const bot = botFactory(makeFetch([{ ok: true, result: {} }]));
+  bot._setState('7', 'awaiting_manual_sections', {
+    gameUrl: 'https://tickets.mhaifafc.com/game/1', gameName: 'Game', sections: [],
+  });
+
+  await bot._dispatch(makeTextUpdate(7, '13,22/24;27/28'));
+
+  assert.equal(bot._getState('7').state, 'awaiting_quantity');
+  assert.deepEqual(bot._getState('7').data.sections, ['13', '22,24', '27,28']);
+});
+
 test('section selection finishes with quantity buttons restricted to 1-4', async () => {
   const coordinator = {
     discoverGames: async () => [],
